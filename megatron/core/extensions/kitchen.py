@@ -31,7 +31,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.experts import (
     GroupedMLP,
@@ -1820,6 +1820,6 @@ class KitchenSpecProvider(BackendSpecProvider):
                 linear_fc1=KitchenColumnParallelLinear, linear_fc2=KitchenRowParallelLinear
             )
 
-    def activation_func(self) -> type:
+    def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
         return self.fallback.activation_func()
