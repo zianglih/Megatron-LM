@@ -32,7 +32,12 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.experts import (
+    GroupedMLP,
+    SequentialMLP,
+    TEGroupedMLP,
+    TEGroupedMLPSubmodules,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func, make_sharded_tensors_for_checkpoint
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, log_single_rank
@@ -1784,13 +1789,17 @@ class KitchenSpecProvider(BackendSpecProvider):
 
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> Tuple[type, Optional[MLPSubmodules]]:
+    ) -> (
+        tuple[type[TEGroupedMLP], TEGroupedMLPSubmodules]
+        | tuple[type[GroupedMLP], None]
+        | tuple[type[SequentialMLP], MLPSubmodules]
+    ):
         """Which module and submodules to use for grouped mlp"""
         if moe_use_grouped_gemm and not moe_use_legacy_grouped_gemm:
             # NOTE: TEGroupedMLP is a bit of a misnomer.
             # It doesn't strictly require TE except for the GroupedLinear,
             # which Kitchen also provides an implementation of.
-            return TEGroupedMLP, MLPSubmodules(
+            return TEGroupedMLP, TEGroupedMLPSubmodules(
                 linear_fc1=KitchenColumnParallelGroupedLinear,
                 linear_fc2=KitchenRowParallelGroupedLinear,
             )
