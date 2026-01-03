@@ -1146,9 +1146,9 @@ class KitchenRowParallelGroupedLinear(KitchenGroupedLinear):
         bias: bool,
         skip_bias_add: bool,
         is_expert: bool,
-        tp_comm_buffer_name: Optional[str] = None,
-        layer_number: Optional[int] = None,
-        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_comm_buffer_name: str | None = None,
+        layer_number: int | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
     ):
         if not HAVE_KITCHEN:
             raise ImportError(
@@ -1168,7 +1168,7 @@ class KitchenRowParallelGroupedLinear(KitchenGroupedLinear):
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
             layer_number=layer_number,
-            tp_group=tp_group,
+            tp_group=pg_collection.tp if pg_collection else None,
         )
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
