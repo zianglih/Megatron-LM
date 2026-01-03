@@ -1,11 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+from __future__ import annotations
 
 import logging
 import math
 import warnings
 from dataclasses import dataclass, fields
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import torch
 from torch import Tensor
@@ -656,7 +657,7 @@ class KitchenLinear(nvidia_kitchen.Linear):
         del self.stashed_tp_group
         self.init_finished = True
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         assert self.init_finished
         _is_first_microbatch = (
@@ -705,12 +706,17 @@ class KitchenColumnParallelLinear(KitchenLinear):
         tp_comm_buffer_name: Optional[str] = None,
         layer_number: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        stride: int = 1,
     ):
         if not HAVE_KITCHEN:
             raise ImportError(
                 "Kitchen extension requires the nvidia_kitchen package. "
                 "Please install it with `pip install nvidia-kitchen`."
             )
+        if stride != 1:
+            # TODO(@yashaswikarnati): Who should look into fixing this?
+            # Context: https://github.com/NVIDIA/Megatron-LM/pull/2708
+            raise ValueError("Kitchen linear layers do not support stride != 1")
 
         if gather_output:
             raise ValueError("Kitchen linear layers do not support gather_output = True")
@@ -977,7 +983,7 @@ class KitchenGroupedLinear(nvidia_kitchen.GroupedLinear):
         del self.stashed_tp_group
         self.init_finished = True
 
-    def forward(self, x, m_splits):
+    def forward(self, x: torch.Tensor, m_splits: int) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         assert self.init_finished
         _is_first_microbatch = (
@@ -1303,7 +1309,7 @@ class KitchenLayerNormColumnParallelLinear(nvidia_kitchen.LayerNormLinear):
         del self.stashed_tp_group
         self.init_finished = True
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         assert self.init_finished
         _is_first_microbatch = (
