@@ -86,7 +86,7 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
     spec.submodules.mlp = ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=not_none(TEColumnParallelLinear), linear_fc2=TERowParallelLinear
+            linear_fc1=not_none(TEColumnParallelLinear), linear_fc2=not_none(TERowParallelLinear)
         ),
     )
     return spec
