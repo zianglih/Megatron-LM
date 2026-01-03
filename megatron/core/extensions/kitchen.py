@@ -33,6 +33,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func, make_sharded_tensors_for_checkpoint
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, log_single_rank
@@ -1748,7 +1749,7 @@ class KitchenSpecProvider(BackendSpecProvider):
         """Which module for sequential layernorm and linear"""
         return KitchenLayerNormColumnParallelLinear
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
+    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> LayerNormBuilder:
         """Which module to use for layer norm"""
         return self.fallback.layer_norm(rms_norm=rms_norm, for_qk=for_qk)
 
