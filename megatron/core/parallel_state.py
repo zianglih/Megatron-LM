@@ -60,6 +60,7 @@ _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = None
 # Expert data parallel group
 _EXPERT_DATA_PARALLEL_GROUP = None
 _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
+_EXPERT_DATA_PARALLEL_GROUP_AG = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
@@ -1207,6 +1208,10 @@ def initialize_model_parallel(
     assert _EXPERT_DATA_PARALLEL_GROUP is None, "Expert data group is already initialized"
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     assert _EXPERT_DATA_PARALLEL_GROUP_GLOO is None, "Expert data group-gloo is already initialized"
+    global _EXPERT_DATA_PARALLEL_GROUP_AG
+    assert (
+        _EXPERT_DATA_PARALLEL_GROUP_AG is None
+    ), "Expert data parallel group with AG is already initialized"
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     assert (
         _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is None
@@ -1240,10 +1245,20 @@ def initialize_model_parallel(
             )
         else:
             group_gloo = None
+        # Create separate all-gather group for expert data parallelism to enable overlap
+        if create_all_gather_group:
+            group_ag = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
+                group_desc="EXPERT_DATA_PARALLEL_GROUP_AG",
+            )
+        else:
+            group_ag = None
         if rank in ranks:
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
-
+            _EXPERT_DATA_PARALLEL_GROUP_AG = group_ag
         if num_distributed_optimizer_instances > 1:
             # Create groups for Partial DistOpt, one for intra-partial DP domain
             # Another for inter-partial DP domain
@@ -1365,7 +1380,9 @@ def get_pipeline_model_parallel_group(check_initialized=True):
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
-def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False, independent_all_gather=False):
+def get_data_parallel_group(
+    with_context_parallel=False, partial_data_parallel=False, independent_all_gather=False
+):
     """Get the data-parallel group the caller rank belongs to."""
     if with_context_parallel:
         if partial_data_parallel:
@@ -1390,11 +1407,20 @@ def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=F
 
 def has_separate_all_gather_group() -> bool:
     """Check if a separate all-gather process group has been created.
-    
+
     Returns True if a dedicated all-gather process group exists for improved
     communication overlap, False otherwise.
     """
     return _DATA_PARALLEL_GROUP_WITH_CP_AG is not None
+
+
+def has_separate_expert_all_gather_group() -> bool:
+    """Check if a separate all-gather process group for experts has been created.
+
+    Returns True if a dedicated all-gather process group for expert parallelism exists
+    for improved communication overlap, False otherwise.
+    """
+    return _EXPERT_DATA_PARALLEL_GROUP_AG is not None
 
 
 def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False):
@@ -1886,8 +1912,16 @@ def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True):
     return _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
 
 
-def get_expert_data_parallel_group(check_initialized=True, partial_expert_data_parallel=False):
+def get_expert_data_parallel_group(
+    check_initialized=True, partial_expert_data_parallel=False, independent_all_gather=False
+):
     """Get expert data parallel group."""
+    if independent_all_gather:
+        if check_initialized:
+            assert (
+                _EXPERT_DATA_PARALLEL_GROUP_AG is not None
+            ), "Expert data parallel group with AG is not initialized"
+        return _EXPERT_DATA_PARALLEL_GROUP_AG
     if partial_expert_data_parallel:
         if check_initialized:
             assert (
@@ -2154,6 +2188,9 @@ def destroy_model_parallel():
     ):
         torch.distributed.destroy_process_group(_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
+
+    global _EXPERT_DATA_PARALLEL_GROUP_AG
+    _EXPERT_DATA_PARALLEL_GROUP_AG = None
 
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
