@@ -1607,20 +1607,6 @@ def megatron_rl_inference_mode(
 
         inference_interface = get_inference_interface(args, loop, model)
 
-        with nvtx_range("onload-kv-cache-before-inference"):
-            if offload_kv_cache_during_training:
-                assert (
-                    reset_cuda_graphs
-                ), "reset_cuda_graphs must be True when offloading kv cache during training"
-                logger.debug(
-                    f"[{dist.get_rank()}] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
-                )
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cuda()
-            elif remove_kv_cache_during_training:
-                if inference_interface._inference_engine.context.memory_buffer is None:
-                    inference_interface._inference_engine.context.build_memory_buffer()
-
         # TODO: Improve this if statement once a change is made to CUDA graph handling.
         cuda_graph_exists = len(_CudagraphGlobalRecord.cudagraph_inference_record) != 0
         if cuda_graph_impl != "none" and not cuda_graph_exists:
@@ -1639,16 +1625,6 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
-
-        with nvtx_range("offload-kv-cache-after-inference"):
-            if offload_kv_cache_during_training:
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
-                logger.debug(
-                    f"[{dist.get_rank()}] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
-                )
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
-            elif remove_kv_cache_during_training:
-                inference_interface._inference_engine.context.memory_buffer = None
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:

@@ -286,6 +286,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
+        offload_deallocated_tensors: Optional[bool] = False,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -408,6 +409,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Unified memory.
         self.unified_memory_level = unified_memory_level
         self.persist_cuda_graphs = persist_cuda_graphs
+        self.offload_deallocated_tensors = offload_deallocated_tensors
         if unified_memory_level > 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()
@@ -584,6 +586,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
         self.is_tensor_state_allocated = True
 
+        if self.offload_deallocated_tensors and not is_init:
+            # Move any existing CPU tensors back to GPU.
+            keys = list(vars(self).keys())
+            for key in keys:
+                value = getattr(self, key)
+                if isinstance(value, torch.Tensor):
+                    value_gpu = value.to(torch.cuda.current_device())
+                    setattr(self, key, value_gpu)
+            return
+
         # Validate no tensors allocated prior to this method.
         for key in vars(self).keys():
             value = getattr(self, key)
@@ -717,13 +729,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
         self.is_tensor_state_allocated = False
 
-        # Delete all tensor attributes.
+        # Delete or offload all tensor attributes.
         # TODO(@lmcafee): check that device == 'cuda'?
         keys = list(vars(self).keys())
         for key in keys:
             value = getattr(self, key)
             if isinstance(value, torch.Tensor):
-                delattr(self, key)
+                if self.offload_deallocated_tensors:
+                    value_cpu = value.to("cpu")
+                    setattr(self, key, value_cpu)
+                else:
+                    delattr(self, key)
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
