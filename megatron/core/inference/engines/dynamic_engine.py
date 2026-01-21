@@ -700,6 +700,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate = (
                 request.sampling_params.num_tokens_total - len(request.prompt_tokens)
             )
+            request.sampling_params.num_tokens_total = None
         if request.sampling_params.num_tokens_to_generate is None:
             request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
                 request.prompt_tokens
