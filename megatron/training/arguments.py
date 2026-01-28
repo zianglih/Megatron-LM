@@ -1449,6 +1449,9 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--no-fp8-wgrad', action='store_false',
                        help='Execute wgrad in higher precision even for FP8 runs',
                        dest='fp8_wgrad')
+    group.add_argument('--keep-backward-unquantized', action='store_true',
+                       help='Execute backward GEMMs in higher precision even for FP8 runs',
+                       dest='keep_backward_unquantized')
     group.add_argument('--transformer-impl', default='transformer_engine',
                        choices=['local', 'transformer_engine', 'inference_optimized'],
                        help='Which Transformer implementation to use.')

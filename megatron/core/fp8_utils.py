@@ -590,6 +590,8 @@ if HAVE_TE:
                 fp8_format=fp8_format,
                 override_linear_precision=(False, False, not config.fp8_wgrad),
             )
+        if fp8_recipe is not None and config.keep_backward_unquantized:
+            fp8_recipe.fp8_bwd = False
         return fp8_recipe
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):

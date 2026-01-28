@@ -464,6 +464,10 @@ class TransformerConfig(ModelParallelConfig):
     """When set to False, override FP8 config options and do the wgrad computation
     in higher precision."""
 
+    keep_backward_unquantized: bool = False
+    """When set to True, override FP8 config options and do the backward GEMMs
+    (dgrad/wgrad) in higher precision."""
+
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
 
