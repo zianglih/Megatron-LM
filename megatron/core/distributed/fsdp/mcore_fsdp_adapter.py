@@ -45,7 +45,11 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import log_single_rank
 
 try:
-    from megatron.core.distributed.fsdp.src.megatron_fsdp import FSDPDistributedIndex, MegatronFSDP
+    from megatron.core.distributed.fsdp.src.megatron_fsdp import (
+        FSDPDistributedIndex,
+        MegatronFSDP,
+        MixedPrecisionPolicy,
+    )
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -64,6 +68,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self,
         config: TransformerConfig,
         ddp_config: DistributedDataParallelConfig,
+        mp_policy: MixedPrecisionPolicy,
         module: torch.nn.Module,
         fsdp_unit_modules: Optional[List[torch.nn.Module]] = None,
         disable_bucketing: bool = False,
@@ -77,6 +82,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         self.ddp_config = ddp_config
+        self.mp_policy = mp_policy
         log_single_rank(
             logger,
             logging.INFO,
@@ -104,6 +110,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             config=config,
             module=MegatronFSDP(
                 ddp_config=ddp_config,
+                mp_policy=mp_policy,
                 module=module,
                 fsdp_unit_modules=self.fsdp_unit_modules,
                 disable_bucketing=disable_bucketing,

@@ -44,6 +44,7 @@ from .mixed_precision import (
     is_float8tensor,
     is_te_min_version,
 )
+from .mp_policy import MixedPrecisionPolicy
 from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
 from .utils import (
     _MODEL_PARALLEL_RNG_TRACKER_NAME,
@@ -1531,15 +1532,10 @@ class ParamAndGradBuffer:
         module (torch.nn.Module): The module whose parameters are to be grouped
             and flatten.
         bucketing_policy (BucketingPolicy): The bucketing policy.
-        data_parallel_group (torch.distributed.ProcessGroup): The data parallel group.
-        expert_data_parallel_group (Optional[torch.distributed.ProcessGroup]):
-            The expert data parallel group.
-        main_params_dtype: (Optional[torch.dtype]): Whether to store main/high-precision
-            weights for optimization, quantization, or checkpointing. If None, default
-            to the model weight buffer data.
-        main_grads_dtype (Optional[torch.dtype]): Data-type used for the main gradient
-            buffer that shards and accumulates reduced gradients. If None, default
-            to the original gradient data-type, i.e. the model compute data-type.
+        dist_index (FSDPDistributedIndex): FSDPDistributedIndex object containing references to the
+            process groups and device meshes used by Megatron-FSDP.
+        mp_policy (megatron_fsdp.mp_policy.MixedPrecisionPolicy): Configuration for mixed-precision
+            customization of compute and communications in Megatron-FSDP.
         gradient_scaling_factor (Optional[float]): The gradient scaling factor.
         expert_gradient_scaling_factor (Optional[float]): The expert gradient
             scaling factor.
@@ -1555,8 +1551,7 @@ class ParamAndGradBuffer:
         module: torch.nn.Module,
         bucketing_policy: BucketingPolicy,
         dist_index: FSDPDistributedIndex,
-        main_params_dtype: Optional[torch.dtype] = torch.float32,
-        main_grads_dtype: Optional[torch.dtype] = torch.float32,
+        mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
         gradient_scaling_factor: Optional[float] = None,
         expert_gradient_scaling_factor: Optional[float] = None,
         device: torch.device = torch.device("cuda"),
@@ -1573,8 +1568,7 @@ class ParamAndGradBuffer:
         self.module = module
         self.bucketing_policy = bucketing_policy
         self.param_to_name = {p: name for name, p in self.module.named_parameters()}
-        self.main_params_dtype = main_params_dtype
-        self.main_grads_dtype = main_grads_dtype
+        self.mp_policy = mp_policy
         self.dist_index = dist_index
         self.params = list(module.parameters())
         self.gradient_scaling_factor = gradient_scaling_factor
@@ -1896,9 +1890,6 @@ class ParamAndGradBuffer:
             self.double_buf_units = []
 
         self.buffer_all_in_one = True
-
-        main_params_dtype = self.main_params_dtype
-        main_grads_dtype = self.main_grads_dtype
         buffer_size = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, "float8": 0}
 
         # Only create HSDP buffers if sharding on DP-Outer. Otherwise, no need to all-gather
@@ -1960,8 +1951,8 @@ class ParamAndGradBuffer:
                 param_dtype = group.params[0].dtype
                 main_grad_dtype = param_dtype
             # Use a custom main gradient data-type.
-            if self.ddp_config.main_grads_dtype is not None:
-                main_grad_dtype = self.ddp_config.main_grads_dtype
+            if self.mp_policy.main_grads_dtype is not None:
+                main_grad_dtype = self.mp_policy.main_grads_dtype
 
             # Check if the parameter group needs a transpose buffer for model weights.
             # Currently, only mxfp8 needs it.
@@ -2018,13 +2009,16 @@ class ParamAndGradBuffer:
 
             # Initialize the main weight buffer if a main weight data-type is specified.
             # Otherwise, don't create this buffer, and use the model compute weight buffer instead.
-            if should_create_grad_buffer_or_main_weight_buffer and main_params_dtype is not None:
+            if (
+                should_create_grad_buffer_or_main_weight_buffer
+                and self.mp_policy.main_params_dtype is not None
+            ):
                 group.main_weight_buffer = DataParallelBuffer(
                     self.ddp_config,
                     group.params,
                     is_data_distributed=is_main_weight_buffer_distributed
                     and main_buf_dp_group.size() > 1,
-                    dtype=main_params_dtype,
+                    dtype=self.mp_policy.main_params_dtype,
                     device=self.device,
                     data_parallel_group=main_buf_dp_group,
                     bucket_id=group_id,
@@ -2964,7 +2958,9 @@ class ParamAndGradBuffer:
             if gbuf is None:
                 continue
             scaling_factor = gbuf.gradient_scaling_factor
-            reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
+            reduce_op = gradient_reduce_preprocessing(
+                gbuf.data, scaling_factor, self.ddp_config, self.mp_policy
+            )
             reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
                 output=gbuf.get_shard_from_local_buffer(),
                 input=gbuf.data,
@@ -3002,7 +2998,9 @@ class ParamAndGradBuffer:
             if gbuf is not None:
                 continue
             scaling_factor = gbuf.gradient_scaling_factor
-            reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
+            reduce_op = gradient_reduce_preprocessing(
+                gbuf.data, scaling_factor, self.ddp_config, self.mp_policy
+            )
             all_reduce_handler = torch.distributed.all_reduce(
                 gbuf.data, op=reduce_op, group=gbuf.data_parallel_group, async_op=async_op
             )
@@ -3241,6 +3239,7 @@ class GradReducePipeline:
         # released ensures that our double buffer will not explode due to too
         # many empty bucket requests.
         ddp_config = self.buffer.ddp_config
+        mp_policy = self.buffer.mp_policy
         if ddp_config.fsdp_double_buffer:
             self._enforce_double_buffer_limit(bucket_group)
 
@@ -3272,7 +3271,9 @@ class GradReducePipeline:
 
                     # Pre-scale unsharded bucket gradient and prepare the ReduceOp.
                     scaling_factor = gbuf.gradient_scaling_factor
-                    reduce_op = gradient_reduce_preprocessing(rs_input, scaling_factor, ddp_config)
+                    reduce_op = gradient_reduce_preprocessing(
+                        rs_input, scaling_factor, ddp_config, mp_policy
+                    )
 
                     # Reduce-scatter or all-reduce the unsharded gradient.
                     if gbuf.is_data_distributed:
@@ -3289,7 +3290,7 @@ class GradReducePipeline:
                                 grad_shard = torch.empty_like(grad_shard, dtype=rs_input.dtype)
 
                         # Execute the reduce-scatter collective.
-                        custom_accum_dtype = _use_custom_grad_accum_dtype(rs_input, ddp_config)
+                        custom_accum_dtype = _use_custom_grad_accum_dtype(rs_input, mp_policy)
                         reduced_grad = self._custom_dtype_grad_accum_reduce_scatter_op(
                             input_buffer=rs_input,
                             output_buffer=grad_shard,
@@ -3331,10 +3332,10 @@ class GradReducePipeline:
                     # with a custom kernel. For now, do them separately.
                     if reduce_op == torch.distributed.ReduceOp.AVG:
                         # AVG reduction.
-                        reduced_grad = reduced_grad.mean(dim=0, dtype=ddp_config.grad_accum_dtype)
+                        reduced_grad = reduced_grad.mean(dim=0, dtype=mp_policy.grad_accum_dtype)
                     elif reduce_op == torch.distributed.ReduceOp.SUM:
                         # SUM reduction.
-                        reduced_grad = reduced_grad.sum(dim=0, dtype=ddp_config.grad_accum_dtype)
+                        reduced_grad = reduced_grad.sum(dim=0, dtype=mp_policy.grad_accum_dtype)
                 # Accumulate the reduced gradient into the local gradient buffer.
                 # Accumulation data-type is type-promoted with respect to the
                 # accumulated gradient and the buffer main_grads_dtype.
@@ -3380,7 +3381,9 @@ class GradReducePipeline:
 
                         # Get the appropriate ReduceOp. Skip gradient scaling for DP-Outer,
                         # because the (DP-Shard, DP-Outer) scaling is already applied.
-                        reduce_op = gradient_reduce_preprocessing(rs_input, None, ddp_config)
+                        reduce_op = gradient_reduce_preprocessing(
+                            rs_input, None, ddp_config, mp_policy
+                        )
 
                         # All-reduce or reduce-scatter the DP-Shard gradients across DP-Outer.
                         if (
@@ -3389,7 +3392,7 @@ class GradReducePipeline:
                             # Retrieve the (DP-Outer, DP-Shard) gradient shard from the
                             # main gradient buffer which shards across the entire DP group,
                             # i.e. across all DP-Shard and DP-Outer ranks.
-                            custom_accum_dtype = _use_custom_grad_accum_dtype(rs_input, ddp_config)
+                            custom_accum_dtype = _use_custom_grad_accum_dtype(rs_input, mp_policy)
                             with self.buffer.mem_alloc_context():  # Optional[NCCL_UB]
                                 # FIXME(@shjwudp): In-place reduce-scatter has unexplained
                                 # issues with corrupt gradients or convergence problems.
@@ -3436,7 +3439,7 @@ class GradReducePipeline:
                             # communication buffer that needs to be copied to the target buffer.
                             if grad_comm_with_custom_dtype:
                                 main_grad_buffer.data.copy_(rs_input)
-                for grad_buffer_shard, reduced_grad_shard, reduce_op in grad_accum_closure:
+                for main_grad_buffer, reduced_grad, reduce_op in grad_accum_closure:
                     # Reduce gradients if necessary.
                     if reduce_op is not None:
                         # TODO(@shjwudp, @cspades): Fuse the reduction and copy
@@ -3444,16 +3447,14 @@ class GradReducePipeline:
                         if reduce_op == torch.distributed.ReduceOp.AVG:
                             # AVG reduction.
                             reduced_grad = reduced_grad.mean(
-                                dim=0, dtype=ddp_config.grad_accum_dtype
+                                dim=0, dtype=mp_policy.grad_accum_dtype
                             )
                         elif reduce_op == torch.distributed.ReduceOp.SUM:
                             # SUM reduction.
-                            reduced_grad = reduced_grad.sum(
-                                dim=0, dtype=ddp_config.grad_accum_dtype
-                            )
+                            reduced_grad = reduced_grad.sum(dim=0, dtype=mp_policy.grad_accum_dtype)
                     # Update the (DP-Outer, DP-Shard) gradient shard in the main gradient buffer.
                     # No accumulation should happen in the (DP-Shard, DP-Outer) gradient buffer.
-                    grad_buffer_shard.copy_(reduced_grad_shard)
+                    main_grad_buffer.copy_(reduced_grad)
 
             reduce_scatter_view_out_event = self.outer_fsdp_group_grad_reduce_stream.record_event()
 
@@ -3497,14 +3498,14 @@ class GradReducePipeline:
         """
         # Cast gradient to gradient communication dtype if specified and necessary.
         grad_comm_with_custom_dtype: bool = (
-            self.buffer.ddp_config.grad_comm_dtype is not None
-            and comm_tensor.dtype != self.buffer.ddp_config.grad_comm_dtype
+            self.buffer.mp_policy.grad_comm_dtype is not None
+            and comm_tensor.dtype != self.buffer.mp_policy.grad_comm_dtype
         )
         if grad_comm_with_custom_dtype:
             # Adds copy / cast / memory overhead.
             with self.buffer.mem_alloc_context():  # Optional[NCCL_UB]
                 grad_comm_tensor = comm_tensor.to(
-                    dtype=self.buffer.ddp_config.grad_comm_dtype,
+                    dtype=self.buffer.mp_policy.grad_comm_dtype,
                     copy=True,  # Should already be a copy due to dtype mismatch.
                 )
             return grad_comm_tensor, True
@@ -3981,21 +3982,19 @@ class AllGatherPipeline:
         )
 
 
-def _use_custom_grad_accum_dtype(
-    input_grad: torch.Tensor, ddp_config: DistributedDataParallelConfig
-) -> bool:
+def _use_custom_grad_accum_dtype(input_grad: torch.Tensor, mp_policy: MixedPrecisionPolicy) -> bool:
     """
     Checks if gradients need to be accumulated with a custom data-type.
     """
     return (
-        ddp_config.grad_accum_dtype is not None
+        mp_policy.grad_accum_dtype is not None
         # Accumulation data-type does not match communication data-type.
-        and ddp_config.grad_accum_dtype != input_grad.dtype
+        and mp_policy.grad_accum_dtype != input_grad.dtype
     )
 
 
 @torch.no_grad()
-def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config):
+def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config, mp_policy):
     """
     Gradient reduce preprocessing for gradient averaging and gradient scaling.
     """
@@ -4012,7 +4011,7 @@ def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config):
     elif (
         ddp_config.gradient_reduce_div_fusion
         # Custom gradient accumulation precision cannot be fused.
-        and not _use_custom_grad_accum_dtype(grad_data, ddp_config)
+        and not _use_custom_grad_accum_dtype(grad_data, mp_policy)
         and grad_data.dtype != torch.bfloat16
     ):
         # Fused SUM reduction.

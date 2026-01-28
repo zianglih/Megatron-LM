@@ -28,6 +28,7 @@ from .mixed_precision import (
     fp8_discard_transpose_cache,
     is_float8tensor,
 )
+from .mp_policy import MixedPrecisionPolicy
 from .param_and_grad_buffer import (
     AllGatherPipeline,
     BucketingPolicy,
@@ -105,6 +106,8 @@ class MegatronFSDP(torch.nn.Module):
         ddp_config (DistributedDataParallelConfig): FullyShardedDataParallel configuration dataclass
             containing a variety of Megatron-derived parameters that control the behavior of
             Megatron-FSDP.
+        mp_policy (megatron_fsdp.mp_policy.MixedPrecisionPolicy): Configuration for mixed-precision
+            customization of compute and communications in Megatron-FSDP.
         fsdp_unit_modules (List[torch.nn.Module] | List[str]): List of modules that
             should be treated as an FSDP Unit, i.e. the minimum releasable model unit.
             It affects the granularity of the communication parameter grouping and
@@ -164,6 +167,7 @@ class MegatronFSDP(torch.nn.Module):
         module: torch.nn.Module,
         dist_index: FSDPDistributedIndex,
         ddp_config: DistributedDataParallelConfig = None,
+        mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
         fsdp_unit_modules: Optional[List[torch.nn.Module] | List[str]] = None,
         disable_bucketing: bool = False,
         device: Optional[torch.device] = None,
@@ -209,15 +213,6 @@ class MegatronFSDP(torch.nn.Module):
             self.ddp_config = DistributedDataParallelConfig(
                 data_parallel_sharding_strategy="optim_grads_params",
                 outer_dp_sharding_strategy="no_shard",
-                # Main weight buffer required for Megatron-LM
-                # and TransformerEngine FP8 parameters.
-                main_params_dtype=torch.float32,
-                # Default to FP32 gradients.
-                main_grads_dtype=torch.float32,
-                # No customization for communication data-type.
-                grad_comm_dtype=None,
-                # Default to FP32 gradient accumulation.
-                grad_accum_dtype=torch.float32,
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 average_in_collective=False,
@@ -230,6 +225,7 @@ class MegatronFSDP(torch.nn.Module):
         else:
             self.ddp_config = ddp_config
         self.data_parallel_sharding_strategy = self.ddp_config.data_parallel_sharding_strategy
+        self.mp_policy = mp_policy
         self.calculate_per_token_loss = calculate_per_token_loss
         self.init_model_with_meta_device = init_model_with_meta_device
         self.enable_fine_grained_param_gather_hook = enable_fine_grained_param_gather_hook
@@ -351,8 +347,7 @@ class MegatronFSDP(torch.nn.Module):
                 data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
             ),
             dist_index=self.dist_index,
-            main_params_dtype=self.ddp_config.main_params_dtype,
-            main_grads_dtype=self.ddp_config.main_grads_dtype,
+            mp_policy=self.mp_policy,
             gradient_scaling_factor=gradient_scaling_factor,
             expert_gradient_scaling_factor=expert_gradient_scaling_factor,
             device=self.device,
