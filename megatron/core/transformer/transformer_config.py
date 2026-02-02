@@ -210,6 +210,9 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
+    post_self_attn_layernorm: bool = False
+    post_mlp_layernorm: bool = False
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -503,6 +506,9 @@ class TransformerConfig(ModelParallelConfig):
     fp4_quantizer_factory: Optional[str] = None
     """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
     Required when fp4_recipe is custom."""
+
+    fp4_moe_expert_only: bool = False
+    """If True, apply FP4/NVFP4 only to MoE expert GEMMs."""
 
     ####################
     # MoE related
@@ -985,6 +991,8 @@ class TransformerConfig(ModelParallelConfig):
         # FP4 validation
         if self.fp4_param and not self.fp4:
             raise ValueError("fp4_param must be used together with fp4 mode.")
+        if self.fp4_moe_expert_only and not self.fp4:
+            raise ValueError("fp4_moe_expert_only must be used together with fp4 mode.")
 
         if self.fp4 and self.fp8:
             raise ValueError("fp4 and fp8 cannot be used simultaneously. Please choose one.")

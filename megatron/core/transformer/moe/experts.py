@@ -2,6 +2,7 @@
 
 import copy
 import itertools
+from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
 from math import ceil
@@ -25,6 +26,7 @@ from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_qui
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.jit import jit_fuser
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     fine_grained_offloading_group_commit,
     fine_grained_offloading_group_start,
@@ -861,6 +863,11 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         tokens_per_expert = tokens_per_expert.tolist()
+        fp4_context = (
+            get_fp4_context(self.config)
+            if self.config.fp4 and self.config.fp4_moe_expert_only
+            else nullcontext()
+        )
         if self.config.fp8 or self.config.fp4:
             actual_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
@@ -887,9 +894,10 @@ class TEGroupedMLP(MegatronModule):
                 permuted_local_hidden_states, name="expert_fc1"
             )
         with get_fine_grained_offloading_context(self.offload_expert_fc1):
-            fc1_output, bias_parallel = self.linear_fc1(
-                permuted_local_hidden_states, tokens_per_expert
-            )
+            with fp4_context:
+                fc1_output, bias_parallel = self.linear_fc1(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
         if self.offload_expert_fc1:
             fc1_output, bias_parallel = fine_grained_offloading_group_commit(
                 fc1_output,
@@ -969,7 +977,8 @@ class TEGroupedMLP(MegatronModule):
             with get_fine_grained_offloading_context(self.offload_moe_act):
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
 
-        output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
+        with fp4_context:
+            output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
         if self.offload_moe_act:
@@ -1102,6 +1111,11 @@ class SequentialMLP(MegatronModule):
         permuted_probs: torch.Tensor,
     ):
         """Forward step of the SequentialMLP."""
+        fp4_context = (
+            get_fp4_context(self.config)
+            if self.config.fp4 and self.config.fp4_moe_expert_only
+            else nullcontext()
+        )
 
         if self.config.moe_apply_probs_on_input:
             assert (
@@ -1120,12 +1134,14 @@ class SequentialMLP(MegatronModule):
                 hidden, probs = self._pad_tensor_for_quantization(
                     permuted_local_hidden_states, permuted_probs
                 )
-                output, output_bias = self.local_experts[0](hidden, probs)
+                with fp4_context:
+                    output, output_bias = self.local_experts[0](hidden, probs)
                 output = output[: permuted_local_hidden_states.shape[0]]
             else:
-                output, output_bias = self.local_experts[0](
-                    permuted_local_hidden_states, permuted_probs
-                )
+                with fp4_context:
+                    output, output_bias = self.local_experts[0](
+                        permuted_local_hidden_states, permuted_probs
+                    )
 
             return output, output_bias
         else:
@@ -1138,10 +1154,12 @@ class SequentialMLP(MegatronModule):
             for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
                 if self.config.fp8 or self.config.fp4:
                     hidden, probs = self._pad_tensor_for_quantization(tokens, probs)
-                    output, output_bias = expert(hidden, probs)
+                    with fp4_context:
+                        output, output_bias = expert(hidden, probs)
                     output = output[: tokens.shape[0]]
                 else:
-                    output, output_bias = expert(tokens, probs)
+                    with fp4_context:
+                        output, output_bias = expert(tokens, probs)
                 output_local_list.append(output)
 
             output_local = torch.cat(output_local_list, dim=0)

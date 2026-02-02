@@ -688,7 +688,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             )
         elif self.config.fp4:
             use_outer_quantization_context = False
-            use_inner_quantization_context = True
+            use_inner_quantization_context = not self.config.fp4_moe_expert_only
             outer_quantization_context = nullcontext()
         else:
             # No quantization
