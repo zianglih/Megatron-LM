@@ -8,6 +8,11 @@ from typing import Optional, Protocol, Union
 
 import torch
 
+from miles_megatron_plugins.flashinfer_moe import (
+    maybe_replace_flashinfer_moe_expert_spec,
+    run_flashinfer_moe,
+    use_flashinfer_moe,
+)
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
@@ -145,6 +150,7 @@ class MoELayer(BaseMoELayer):
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+        submodules = maybe_replace_flashinfer_moe_expert_spec(submodules)
         self.submodules = submodules
         # TODO(Hepteract): delete the usage of the global parallel_state.
         # Initialize process groups with the global parallel_state.
@@ -396,6 +402,15 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors, padding_mask=None, input_ids=None):
+            if use_flashinfer_moe():
+                return run_flashinfer_moe(
+                    self,
+                    hidden_states,
+                    intermediate_tensors,
+                    padding_mask,
+                    input_ids,
+                )
+
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
