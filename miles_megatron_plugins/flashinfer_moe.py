@@ -29,12 +29,12 @@ from typing import Sequence
 import torch
 import torch.nn.functional as F
 
+from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
     TERowParallelGroupedLinear,
 )
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
-from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.spec_utils import ModuleSpec, get_module
 from megatron.core.utils import get_pg_rank, log_single_rank
@@ -42,17 +42,14 @@ from megatron.core.utils import get_pg_rank, log_single_rank
 logger = logging.getLogger(__name__)
 
 _ENV = "MILES_USE_FLASHINFER_MOE"
-_QUANTIZATION_ENV = "MILES_FLASHINFER_MOE_QUANTIZATION"
-_DEQUANTIZED_ENV = "MILES_FLASHINFER_MOE_DEQUANTIZED"
+_BACKWARD_OVERRIDE_ENV = "NVTE_BACKWARD_OVERRIDE"
 HIGH_PRECISION_BACKWARD = "high_precision"
 DEQUANTIZED_BACKWARD = "dequantized"
 _LOGGED_LAYERS: set[tuple[str, str, str]] = set()
-_VALIDATED_DEQUANTIZED_SUPPORT: set[str] = set()
 _NVFP4_GROUP_SIZE = 16
 _TE_NVFP4_ROW_ALIGNMENT = 16
 _MXFP8_GROUP_SIZE = 32
 _TE_MXFP8_ROW_ALIGNMENT = 32
-_SUPPORTED_QUANTIZATIONS = ("nvfp4", "mxfp8")
 # The replay uses shared stateless TE shells, and ``functional_call``
 # temporarily rebinds their parameters. This does not make the runner generally
 # thread-safe; it only keeps one replay's shell state internally consistent.
@@ -62,50 +59,16 @@ _BF16_SURROGATE_LOCK = threading.Lock()
 def flashinfer_moe_backward_mode() -> str:
     """Resolve the explicit surrogate-backward operand mode."""
 
-    value = os.environ.get(_DEQUANTIZED_ENV, "").strip()
-    if value in ("", "0"):
+    value = os.environ.get(_BACKWARD_OVERRIDE_ENV)
+    if value == HIGH_PRECISION_BACKWARD:
         return HIGH_PRECISION_BACKWARD
-    elif value == "1":
+    elif value == DEQUANTIZED_BACKWARD:
         return DEQUANTIZED_BACKWARD
     else:
-        raise ValueError(f"Unsupported {_DEQUANTIZED_ENV}={value!r}; expected '0' or '1'")
-
-
-def _require_dequantized_backward_support(quantization: str) -> None:
-    """Fail early when the image's TE lacks the saved-storage contract."""
-
-    if quantization in _VALIDATED_DEQUANTIZED_SUPPORT:
-        return
-    try:
-        from transformer_engine.pytorch.quantized_tensor import (
-            prepare_for_saving,
-            restore_from_saved,
+        raise ValueError(
+            f"FlashInfer MoE requires {_BACKWARD_OVERRIDE_ENV} to be exactly "
+            f"{HIGH_PRECISION_BACKWARD!r} or {DEQUANTIZED_BACKWARD!r}; got {value!r}"
         )
-
-        if quantization == "nvfp4":
-            from transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage import (
-                NVFP4TensorStorage,
-            )
-
-            del NVFP4TensorStorage
-        elif quantization == "mxfp8":
-            from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import (
-                MXFP8TensorStorage,
-            )
-
-            del MXFP8TensorStorage
-        else:
-            raise NotImplementedError(
-                f"FlashInfer MoE quantization {quantization!r} has no "
-                "dequantized-backward capability branch"
-            )
-        del prepare_for_saving, restore_from_saved
-    except (ImportError, AttributeError) as exc:
-        raise RuntimeError(
-            f"{_DEQUANTIZED_ENV}=1 with {quantization} requires Transformer "
-            "Engine saved quantized-storage support"
-        ) from exc
-    _VALIDATED_DEQUANTIZED_SUPPORT.add(quantization)
 
 
 def _padded_linear_scales(scales: torch.Tensor, *, rows: int, scale_columns: int) -> torch.Tensor:
@@ -263,7 +226,7 @@ def use_flashinfer_moe() -> bool:
 def flashinfer_moe_dispatch_mode(config) -> str:
     """Resolve one explicit communication mode for the FlashInfer MoE path."""
 
-    if getattr(config, "moe_combine_in_fp32", False):
+    if config.moe_combine_in_fp32:
         raise ValueError(
             "FlashInfer MoE does not support FP32 combine because router gradients "
             "would bypass the BF16 surrogate boundary"
@@ -274,10 +237,9 @@ def flashinfer_moe_dispatch_mode(config) -> str:
     elif dispatcher == "alltoall":
         return "alltoall"
     elif dispatcher == "flex":
-        backend = getattr(config, "moe_flex_dispatcher_backend", "unknown")
         raise NotImplementedError(
             "FlashInfer MoE does not yet support the flex token dispatcher "
-            f"with {backend!r} backend"
+            f"with {config.moe_flex_dispatcher_backend!r} backend"
         )
     else:
         raise NotImplementedError(
@@ -288,49 +250,29 @@ def flashinfer_moe_dispatch_mode(config) -> str:
 def _flashinfer_moe_quantization(config) -> str:
     """Resolve one explicitly supported routed-MoE quantization."""
 
-    override = os.environ.get(_QUANTIZATION_ENV, "").strip().lower()
-    if override and override not in _SUPPORTED_QUANTIZATIONS:
+    if config.fp8 is not None and config.fp4 is not None:
         raise ValueError(
-            f"Unsupported {_QUANTIZATION_ENV}={override!r}; supported values are "
-            f"{', '.join(_SUPPORTED_QUANTIZATIONS)}"
+            "FlashInfer MoE requires exactly one quantization; both FP8 and FP4 are active"
         )
-
-    configured = []
-    fp8_recipe = getattr(config, "fp8_recipe", None)
-    fp8_recipe = getattr(fp8_recipe, "value", fp8_recipe)
-    if getattr(config, "fp8", None) is not None:
-        if fp8_recipe != "mxfp8":
+    elif config.fp8 is not None:
+        if config.fp8_recipe != Fp8Recipe.mxfp8:
             raise ValueError(
-                f"FlashInfer MoE does not support active FP8 recipe {fp8_recipe!r}; "
+                f"FlashInfer MoE does not support active FP8 recipe {config.fp8_recipe!r}; "
                 "supported FP8 recipe: 'mxfp8'"
             )
-        configured.append("mxfp8")
-
-    fp4_recipe = getattr(config, "fp4_recipe", None)
-    fp4_recipe = getattr(fp4_recipe, "value", fp4_recipe)
-    if getattr(config, "fp4", None) is not None:
-        if fp4_recipe != "nvfp4":
+        return "mxfp8"
+    elif config.fp4 is not None:
+        if config.fp4_recipe != Fp4Recipe.nvfp4:
             raise ValueError(
-                f"FlashInfer MoE does not support active FP4 recipe {fp4_recipe!r}; "
+                f"FlashInfer MoE does not support active FP4 recipe {config.fp4_recipe!r}; "
                 "supported FP4 recipe: 'nvfp4'"
             )
-        configured.append("nvfp4")
-
-    if len(configured) > 1:
-        raise ValueError(f"FlashInfer MoE requires exactly one quantization, got {configured}")
-    if override:
-        if configured and configured[0] != override:
-            raise ValueError(
-                f"{_QUANTIZATION_ENV}={override!r} conflicts with active "
-                f"{configured[0]!r} quantization"
-            )
-        return override
-    if not configured:
+        return "nvfp4"
+    else:
         raise ValueError(
-            "FlashInfer MoE requires an explicit supported quantization: active "
-            "MXFP8/NVFP4 config or MILES_FLASHINFER_MOE_QUANTIZATION"
+            "FlashInfer MoE requires exactly one quantization; neither FP8 with recipe "
+            "'mxfp8' nor FP4 with recipe 'nvfp4' is active"
         )
-    return configured[0]
 
 
 def _validate_flashinfer_moe_config(config) -> str:
@@ -338,7 +280,7 @@ def _validate_flashinfer_moe_config(config) -> str:
 
     flashinfer_moe_dispatch_mode(config)
     quantization = _flashinfer_moe_quantization(config)
-    if getattr(config, "moe_shared_expert_overlap", False):
+    if config.moe_shared_expert_overlap:
         raise ValueError("FlashInfer MoE does not support shared-expert overlap")
     if config.delay_wgrad_compute:
         raise ValueError("FlashInfer MoE does not support delayed expert weight gradients")
@@ -348,16 +290,15 @@ def _validate_flashinfer_moe_config(config) -> str:
         raise ValueError("FlashInfer MoE does not support expert bias")
     if not config.gated_linear_unit or config.activation_func is not F.silu:
         raise ValueError("FlashInfer MoE currently supports gated SwiGLU only")
-    if getattr(config, "use_te_activation_func", False):
+    if config.use_te_activation_func:
         raise ValueError("FlashInfer MoE does not support Transformer Engine activation modules")
-    offloaded_expert_stages = {"expert_fc1", "moe_act"}.intersection(
-        getattr(config, "offload_modules", None) or ()
-    )
-    if getattr(config, "fine_grained_activation_offloading", False) and offloaded_expert_stages:
-        raise ValueError(
-            "FlashInfer MoE does not support fine-grained activation offloading for "
-            f"{sorted(offloaded_expert_stages)}"
-        )
+    if config.fine_grained_activation_offloading:
+        offloaded_expert_stages = {"expert_fc1", "moe_act"}.intersection(config.offload_modules)
+        if offloaded_expert_stages:
+            raise ValueError(
+                "FlashInfer MoE does not support fine-grained activation offloading for "
+                f"{sorted(offloaded_expert_stages)}"
+            )
     if config.activation_func_clamp_value is not None or config.glu_linear_offset != 0.0:
         raise ValueError("FlashInfer MoE does not support SwiGLU clamp or linear offset")
     if config.moe_expert_capacity_factor is not None:
@@ -368,11 +309,7 @@ def _validate_flashinfer_moe_config(config) -> str:
         raise ValueError("FlashInfer MoE requires routing weights in the fused finalize")
     if config.expert_tensor_parallel_size != 1:
         raise ValueError("FlashInfer MoE currently requires expert tensor parallel size 1")
-    if (
-        config.params_dtype != torch.bfloat16
-        or getattr(config, "fp8_param", False)
-        or getattr(config, "fp4_param", False)
-    ):
+    if config.params_dtype != torch.bfloat16 or config.fp8_param or config.fp4_param:
         raise TypeError("FlashInfer MoE master weights must remain BF16")
     if config.num_moe_experts > 2048:
         raise ValueError("FlashInfer routed MoE supports at most 2048 global experts")
@@ -400,10 +337,12 @@ class FlashInferGroupedMLP(TEGroupedMLP):
     """Megatron TE expert parameters with a FlashInfer compute boundary."""
 
     def __init__(self, num_local_experts, config, submodules, pg_collection=None):
+        self._flashinfer_moe_backward_mode = flashinfer_moe_backward_mode()
         self._flashinfer_moe_quantization = _validate_flashinfer_moe_config(config)
         self._flashinfer_moe_dispatch_mode = flashinfer_moe_dispatch_mode(config)
-        self._flashinfer_moe_activation_in_fp32 = getattr(config, "moe_activation_in_fp32", False)
+        self._flashinfer_moe_activation_in_fp32 = config.moe_activation_in_fp32
         self._flashinfer_moe_fused_activation = config.bias_activation_fusion
+        self._flashinfer_moe_runner = None
         if pg_collection is None:
             raise ValueError("FlashInferGroupedMLP requires a ProcessGroupCollection")
         super().__init__(num_local_experts, config, submodules, pg_collection=pg_collection)
@@ -439,29 +378,21 @@ def maybe_replace_flashinfer_moe_expert_spec(submodules):
         return submodules
 
     replacement = copy.copy(submodules)
-    if isinstance(submodules.experts, ModuleSpec):
-        expert_spec = copy.copy(submodules.experts)
-        expert_spec.module = FlashInferGroupedMLP
-    else:
-        expert_spec = ModuleSpec(module=FlashInferGroupedMLP)
+    if not isinstance(submodules.experts, ModuleSpec):
+        raise TypeError(f"{_ENV}=1 requires experts to use Megatron ModuleSpec")
+    expert_spec = copy.copy(submodules.experts)
+    expert_spec.module = FlashInferGroupedMLP
     if expert_spec.submodules is None:
-        if TEColumnParallelGroupedLinear is None or TERowParallelGroupedLinear is None:
-            raise RuntimeError("FlashInfer MoE requires Transformer Engine grouped linears")
-        expert_spec.submodules = MLPSubmodules(
-            linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
+        raise ValueError(
+            "FlashInfer MoE requires explicit Transformer Engine grouped FC1/FC2 submodules"
         )
-    else:
-        linear_fc1 = getattr(expert_spec.submodules, "linear_fc1", None)
-        linear_fc2 = getattr(expert_spec.submodules, "linear_fc2", None)
-        if (
-            linear_fc1 is None
-            or linear_fc2 is None
-            or get_module(linear_fc1) is not TEColumnParallelGroupedLinear
-            or get_module(linear_fc2) is not TERowParallelGroupedLinear
-        ):
-            raise ValueError(
-                "FlashInfer MoE requires Transformer Engine grouped FC1/FC2 submodules"
-            )
+    linear_fc1 = expert_spec.submodules.linear_fc1
+    linear_fc2 = expert_spec.submodules.linear_fc2
+    if (
+        get_module(linear_fc1) is not TEColumnParallelGroupedLinear
+        or get_module(linear_fc2) is not TERowParallelGroupedLinear
+    ):
+        raise ValueError("FlashInfer MoE requires Transformer Engine grouped FC1/FC2 submodules")
     replacement.experts = expert_spec
     return replacement
 
@@ -735,7 +666,7 @@ class _TEBF16GroupedLinear:
                 device="meta",
             )
 
-        if getattr(self.op, "primary_weights_in_fp8", False):
+        if self.op.primary_weights_in_fp8:
             raise RuntimeError(
                 "FlashInfer MoE BF16 surrogate was constructed with quantized parameters"
             )
@@ -1316,7 +1247,6 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
             fp8_quantization_type=Fp8QuantizationType.MxFp8,
             activation_type=ActivationType.Swiglu.value,
         )
-        output = output[0] if isinstance(output, list) else output
         backward_hidden_states = None
         if backward_mode == DEQUANTIZED_BACKWARD:
             backward_hidden_states = _mxfp8_activation_storage(
@@ -1331,40 +1261,11 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
 
 
 def _flashinfer_moe_runner_type(quantization: str):
-    """Resolve a runner only after checking that its FlashInfer API is present."""
+    """Resolve the runner for one explicitly supported quantization."""
 
     if quantization == "nvfp4":
-        try:
-            from flashinfer import nvfp4_block_scale_interleave, nvfp4_quantize
-            from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
-        except (ImportError, AttributeError) as exc:
-            raise RuntimeError(
-                "FlashInfer NVFP4 routed MoE requires the NVFP4 quantizer, "
-                "layout helpers, and TRT-LLM routed kernel"
-            ) from exc
-        del nvfp4_block_scale_interleave, nvfp4_quantize
-        del trtllm_fp4_block_scale_routed_moe
         return _FlashInferNVFP4Runner
     elif quantization == "mxfp8":
-        try:
-            from flashinfer import block_scale_interleave, mxfp8_quantize
-            from flashinfer.fused_moe import Fp8QuantizationType, trtllm_fp8_block_scale_routed_moe
-            from flashinfer.fused_moe.core import get_reorder_rows_for_gated_act_gemm_row_indices
-            from flashinfer.tllm_enums import WeightLayout
-            from flashinfer.utils import (
-                get_shuffle_matrix_a_row_indices,
-                get_shuffle_matrix_sf_a_row_indices,
-            )
-        except (ImportError, AttributeError) as exc:
-            raise RuntimeError(
-                "FlashInfer MXFP8 routed MoE requires FlashInfer 0.6.14+ with "
-                "MXFP8 quantization, shuffled-weight helpers, and the TRT-LLM "
-                "FP8 routed kernel"
-            ) from exc
-        del block_scale_interleave, mxfp8_quantize
-        del Fp8QuantizationType, trtllm_fp8_block_scale_routed_moe
-        del get_reorder_rows_for_gated_act_gemm_row_indices, WeightLayout
-        del get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices
         return _FlashInferMXFP8Runner
     else:
         raise NotImplementedError(
@@ -1588,7 +1489,7 @@ def _run_flashinfer_forward_with_surrogate(
 def _get_flashinfer_runner(experts: FlashInferGroupedMLP, quantization: str, device: torch.device):
     """Return a cached runner for one module's contiguous local expert shard."""
 
-    runner = getattr(experts, "_flashinfer_moe_runner", None)
+    runner = experts._flashinfer_moe_runner
     if runner is not None and runner.quantization == quantization:
         return runner
 
@@ -1622,9 +1523,7 @@ def _run_dispatched_flashinfer_moe(
 
     dispatch_mode = experts._flashinfer_moe_dispatch_mode
     quantization = experts._flashinfer_moe_quantization
-    backward_mode = flashinfer_moe_backward_mode()
-    if backward_mode == DEQUANTIZED_BACKWARD:
-        _require_dequantized_backward_support(quantization)
+    backward_mode = experts._flashinfer_moe_backward_mode
     if hidden_states.dtype != torch.bfloat16:
         raise TypeError(f"FlashInfer MoE expects BF16 hidden states, got {hidden_states.dtype}")
     if not hidden_states.is_cuda:
@@ -1670,13 +1569,13 @@ def _run_dispatched_flashinfer_moe(
             logging.WARNING,
             "FlashInfer MoE path active: Megatron %s dispatch, routed TRT-LLM "
             "top-k=1 local assignments, %s, %s BF16 surrogate backward "
-            "(%s=1, %s=%d)",
+            "(%s=1, %s=%s)",
             dispatch_mode,
             _flashinfer_moe_description(quantization),
             backward_mode,
             _ENV,
-            _DEQUANTIZED_ENV,
-            int(backward_mode == DEQUANTIZED_BACKWARD),
+            _BACKWARD_OVERRIDE_ENV,
+            backward_mode,
         )
         _LOGGED_LAYERS.add(log_key)
 

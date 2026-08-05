@@ -11,7 +11,12 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelGroupedLinear,
+    TERowParallelGroupedLinear,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -44,6 +49,15 @@ from miles_megatron_plugins.flashinfer_moe import (
     use_flashinfer_moe,
 )
 from tests.unit_tests.test_utilities import Utils
+
+
+def _te_grouped_mlp_spec(module=GroupedMLP):
+    return ModuleSpec(
+        module=module,
+        submodules=MLPSubmodules(
+            linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
+        ),
+    )
 
 
 def _sequential_bf16_routed_experts(
@@ -81,24 +95,30 @@ def test_flashinfer_moe_is_opt_in(monkeypatch):
     assert use_flashinfer_moe()
 
 
-def test_flashinfer_moe_backward_mode_is_explicit(monkeypatch):
-    monkeypatch.delenv("MILES_FLASHINFER_MOE_DEQUANTIZED", raising=False)
-    assert flashinfer_moe_backward_mode() == HIGH_PRECISION_BACKWARD
+@pytest.mark.parametrize("mode", [HIGH_PRECISION_BACKWARD, DEQUANTIZED_BACKWARD])
+def test_flashinfer_moe_backward_mode_accepts_te_override(monkeypatch, mode):
+    monkeypatch.setenv("NVTE_BACKWARD_OVERRIDE", mode)
 
-    monkeypatch.setenv("MILES_FLASHINFER_MOE_DEQUANTIZED", "0")
-    assert flashinfer_moe_backward_mode() == HIGH_PRECISION_BACKWARD
+    assert flashinfer_moe_backward_mode() == mode
 
-    monkeypatch.setenv("MILES_FLASHINFER_MOE_DEQUANTIZED", "1")
-    assert flashinfer_moe_backward_mode() == DEQUANTIZED_BACKWARD
 
-    monkeypatch.setenv("MILES_FLASHINFER_MOE_DEQUANTIZED", "future")
-    with pytest.raises(ValueError, match="expected '0' or '1'"):
+@pytest.mark.parametrize(
+    "mode", [None, "", "0", "1", "default", "HIGH_PRECISION", " high_precision", "future"]
+)
+def test_flashinfer_moe_backward_mode_rejects_missing_or_noncanonical_te_override(
+    monkeypatch, mode
+):
+    if mode is None:
+        monkeypatch.delenv("NVTE_BACKWARD_OVERRIDE", raising=False)
+    else:
+        monkeypatch.setenv("NVTE_BACKWARD_OVERRIDE", mode)
+
+    with pytest.raises(ValueError, match="NVTE_BACKWARD_OVERRIDE.*exactly"):
         flashinfer_moe_backward_mode()
 
 
-def test_flashinfer_moe_quantization_resolves_config_and_override(monkeypatch):
+def test_flashinfer_moe_quantization_resolves_active_megatron_recipe():
     config = SimpleNamespace(fp8="e4m3", fp8_recipe="mxfp8", fp4=None, fp4_recipe="nvfp4")
-    monkeypatch.delenv("MILES_FLASHINFER_MOE_QUANTIZATION", raising=False)
     assert _flashinfer_moe_quantization(config) == "mxfp8"
 
     config.fp8 = None
@@ -106,7 +126,7 @@ def test_flashinfer_moe_quantization_resolves_config_and_override(monkeypatch):
     assert _flashinfer_moe_quantization(config) == "nvfp4"
 
     config.fp4 = None
-    with pytest.raises(ValueError, match="requires an explicit supported quantization"):
+    with pytest.raises(ValueError, match="requires exactly one quantization"):
         _flashinfer_moe_quantization(config)
 
     config.fp8 = "e4m3"
@@ -119,17 +139,9 @@ def test_flashinfer_moe_quantization_resolves_config_and_override(monkeypatch):
     with pytest.raises(ValueError, match="requires exactly one quantization"):
         _flashinfer_moe_quantization(config)
 
-    config.fp4 = None
-    monkeypatch.setenv("MILES_FLASHINFER_MOE_QUANTIZATION", "mxfp8")
-    assert _flashinfer_moe_quantization(config) == "mxfp8"
-
     config.fp8 = None
-    config.fp4 = "e2m1"
-    with pytest.raises(ValueError, match="conflicts with active 'nvfp4'"):
-        _flashinfer_moe_quantization(config)
-
-    monkeypatch.setenv("MILES_FLASHINFER_MOE_QUANTIZATION", "fp6")
-    with pytest.raises(ValueError, match="nvfp4.*mxfp8"):
+    config.fp4_recipe = "custom"
+    with pytest.raises(ValueError, match="does not support active FP4 recipe"):
         _flashinfer_moe_quantization(config)
 
 
@@ -142,25 +154,35 @@ def test_flashinfer_moe_has_explicit_unsupported_dispatch_branches():
 
 def test_flashinfer_moe_dispatch_mode_selects_explicit_collective_branch():
     assert (
-        flashinfer_moe_dispatch_mode(SimpleNamespace(moe_token_dispatcher_type="allgather"))
+        flashinfer_moe_dispatch_mode(
+            SimpleNamespace(moe_token_dispatcher_type="allgather", moe_combine_in_fp32=False)
+        )
         == "allgather"
     )
     assert (
-        flashinfer_moe_dispatch_mode(SimpleNamespace(moe_token_dispatcher_type="alltoall"))
+        flashinfer_moe_dispatch_mode(
+            SimpleNamespace(moe_token_dispatcher_type="alltoall", moe_combine_in_fp32=False)
+        )
         == "alltoall"
     )
 
 
 @pytest.mark.parametrize("backend", ["deepep", "hybridep"])
 def test_flashinfer_moe_dispatch_mode_rejects_flex_backends_explicitly(backend):
-    config = SimpleNamespace(moe_token_dispatcher_type="flex", moe_flex_dispatcher_backend=backend)
+    config = SimpleNamespace(
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend=backend,
+        moe_combine_in_fp32=False,
+    )
 
     with pytest.raises(NotImplementedError, match=rf"flex.*{backend}"):
         flashinfer_moe_dispatch_mode(config)
 
 
 def test_flashinfer_moe_dispatch_mode_rejects_unknown_dispatcher_explicitly():
-    config = SimpleNamespace(moe_token_dispatcher_type="future_dispatcher")
+    config = SimpleNamespace(
+        moe_token_dispatcher_type="future_dispatcher", moe_combine_in_fp32=False
+    )
 
     with pytest.raises(NotImplementedError, match="future_dispatcher.*no execution branch"):
         flashinfer_moe_dispatch_mode(config)
@@ -173,12 +195,7 @@ def test_flashinfer_moe_dispatch_mode_rejects_fp32_combine():
         flashinfer_moe_dispatch_mode(config)
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
-    reason="FlashInfer routed MoE capability checks require Blackwell",
-)
-def test_flashinfer_moe_dispatch_checks_supported_runner_capabilities():
+def test_flashinfer_moe_resolves_supported_runners_explicitly():
     assert _flashinfer_moe_runner_type("nvfp4") is _FlashInferNVFP4Runner
     assert _flashinfer_moe_runner_type("mxfp8") is _FlashInferMXFP8Runner
     assert "NVFP4" in _flashinfer_moe_description("nvfp4")
@@ -189,16 +206,37 @@ def test_flashinfer_moe_selects_extension_experts_without_mutating_source(monkey
     class OtherExperts:
         pass
 
-    original = SimpleNamespace(experts=ModuleSpec(module=OtherExperts))
+    original = SimpleNamespace(experts=_te_grouped_mlp_spec(OtherExperts))
     monkeypatch.setenv("MILES_USE_FLASHINFER_MOE", "1")
 
     replacement = maybe_replace_flashinfer_moe_expert_spec(original)
 
     assert replacement is not original
     assert replacement.experts.module is FlashInferGroupedMLP
-    assert replacement.experts.submodules is not None
+    assert replacement.experts.submodules is original.experts.submodules
     assert original.experts.module is OtherExperts
-    assert original.experts.submodules is None
+
+
+def test_flashinfer_moe_rejects_implicit_expert_submodules(monkeypatch):
+    class OtherExperts:
+        pass
+
+    original = SimpleNamespace(experts=ModuleSpec(module=OtherExperts))
+    monkeypatch.setenv("MILES_USE_FLASHINFER_MOE", "1")
+
+    with pytest.raises(ValueError, match="requires explicit Transformer Engine grouped"):
+        maybe_replace_flashinfer_moe_expert_spec(original)
+
+
+def test_flashinfer_moe_rejects_non_module_expert_spec(monkeypatch):
+    class OtherExperts:
+        pass
+
+    original = SimpleNamespace(experts=OtherExperts)
+    monkeypatch.setenv("MILES_USE_FLASHINFER_MOE", "1")
+
+    with pytest.raises(TypeError, match="requires experts to use Megatron ModuleSpec"):
+        maybe_replace_flashinfer_moe_expert_spec(original)
 
 
 def test_flashinfer_moe_rejects_non_grouped_expert_submodules(monkeypatch):
@@ -259,10 +297,7 @@ def test_flashinfer_experts_reuse_megatron_te_parameter_contract():
         ),
     ],
 )
-def test_flashinfer_moe_rejects_unsupported_te_execution_paths(
-    monkeypatch, updates, exception, message
-):
-    monkeypatch.setenv("MILES_FLASHINFER_MOE_QUANTIZATION", "mxfp8")
+def test_flashinfer_moe_rejects_unsupported_te_execution_paths(updates, exception, message):
     config = TransformerConfig(
         num_layers=1,
         hidden_size=128,
@@ -281,6 +316,8 @@ def test_flashinfer_moe_rejects_unsupported_te_execution_paths(
         activation_func=F.silu,
         bf16=True,
         params_dtype=torch.bfloat16,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
     )
     for attribute, value in updates.items():
         setattr(config, attribute, value)
@@ -1507,45 +1544,67 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
 
     try:
         monkeypatch.setenv("MILES_USE_FLASHINFER_MOE", "1")
-        monkeypatch.setenv("MILES_FLASHINFER_MOE_QUANTIZATION", runner_type.quantization)
         if runner_type.quantization == "nvfp4":
             _set_nvfp4_4over6_env(monkeypatch, flashinfer=True)
+        if runner_type.quantization == "nvfp4":
+            precision_config = {"fp4": "e2m1", "fp4_recipe": "nvfp4"}
+        elif runner_type.quantization == "mxfp8":
+            precision_config = {"fp8": "e4m3", "fp8_recipe": "mxfp8"}
+        else:
+            raise NotImplementedError(
+                f"test has no precision-config branch for {runner_type.quantization!r}"
+            )
 
-        torch.manual_seed(1234)
-        model_parallel_cuda_manual_seed(1234)
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=hidden_size,
-            num_attention_heads=16,
-            num_moe_experts=num_experts,
-            moe_ffn_hidden_size=intermediate_size,
-            moe_router_topk=top_k,
-            moe_router_pre_softmax=True,
-            moe_router_load_balancing_type="none",
-            moe_token_dispatcher_type=moe_token_dispatcher_type,
-            moe_grouped_gemm=True,
-            moe_permute_fusion=False,
-            moe_router_dtype="fp32",
-            tensor_model_parallel_size=1,
-            expert_model_parallel_size=world_size,
-            expert_tensor_parallel_size=1,
-            sequence_parallel=False,
-            add_bias_linear=False,
-            gated_linear_unit=True,
-            activation_func=F.silu,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            gradient_accumulation_fusion=True,
-            use_cpu_initialization=False,
-        )
-        layer = MoELayer(
-            config, MoESubmodules(experts=ModuleSpec(module=GroupedMLP)), layer_number=1
-        ).cuda()
-        layer.train()
+        def build_layer(backward_mode):
+            monkeypatch.setenv("NVTE_BACKWARD_OVERRIDE", backward_mode)
+            torch.manual_seed(1234)
+            model_parallel_cuda_manual_seed(1234)
+            config = TransformerConfig(
+                num_layers=1,
+                hidden_size=hidden_size,
+                num_attention_heads=16,
+                num_moe_experts=num_experts,
+                moe_ffn_hidden_size=intermediate_size,
+                moe_router_topk=top_k,
+                moe_router_pre_softmax=True,
+                moe_router_load_balancing_type="none",
+                moe_token_dispatcher_type=moe_token_dispatcher_type,
+                moe_grouped_gemm=True,
+                moe_permute_fusion=False,
+                moe_router_dtype="fp32",
+                tensor_model_parallel_size=1,
+                expert_model_parallel_size=world_size,
+                expert_tensor_parallel_size=1,
+                sequence_parallel=False,
+                add_bias_linear=False,
+                gated_linear_unit=True,
+                activation_func=F.silu,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                gradient_accumulation_fusion=True,
+                use_cpu_initialization=False,
+                **precision_config,
+            )
+            layer = MoELayer(
+                config, MoESubmodules(experts=_te_grouped_mlp_spec()), layer_number=1
+            ).cuda()
+            layer.train()
+            return layer
+
+        high_precision_layer = build_layer(HIGH_PRECISION_BACKWARD)
+        dequantized_layer = build_layer(DEQUANTIZED_BACKWARD)
+        dequantized_layer.load_state_dict(high_precision_layer.state_dict())
+        assert (
+            high_precision_layer.experts._flashinfer_moe_backward_mode,
+            dequantized_layer.experts._flashinfer_moe_backward_mode,
+        ) == (HIGH_PRECISION_BACKWARD, DEQUANTIZED_BACKWARD)
         parameter_ownership_before = tuple(
-            (name, id(parameter)) for name, parameter in layer.named_parameters()
+            tuple((name, id(parameter)) for name, parameter in candidate.named_parameters())
+            for candidate in (high_precision_layer, dequantized_layer)
         )
-        state_keys_before = tuple(layer.state_dict())
+        state_keys_before = tuple(
+            tuple(candidate.state_dict()) for candidate in (high_precision_layer, dequantized_layer)
+        )
 
         torch.manual_seed(5678 + rank)
         hidden_seed = torch.randn((num_tokens, 1, hidden_size), device="cuda", dtype=torch.bfloat16)
@@ -1553,9 +1612,8 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         grad_seed = torch.randn_like(hidden_seed)
         route_ids = _distributed_routing_ids(rank, world_size, num_tokens, num_experts, top_k)
 
-        monkeypatch.setenv("MILES_FLASHINFER_MOE_DEQUANTIZED", "0")
         reference = _run_distributed_layer_once(
-            layer,
+            high_precision_layer,
             hidden_seed,
             logits_seed,
             grad_seed,
@@ -1564,7 +1622,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             surrogate_reference="bf16",
         )
         high_precision = _run_distributed_layer_once(
-            layer,
+            high_precision_layer,
             hidden_seed,
             logits_seed,
             grad_seed,
@@ -1572,9 +1630,8 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             dispatch_mode=moe_token_dispatcher_type,
         )
 
-        monkeypatch.setenv("MILES_FLASHINFER_MOE_DEQUANTIZED", "1")
         dequantized_reference = _run_distributed_layer_once(
-            layer,
+            dequantized_layer,
             hidden_seed,
             logits_seed,
             grad_seed,
@@ -1583,7 +1640,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             surrogate_reference=DEQUANTIZED_BACKWARD,
         )
         dequantized = _run_distributed_layer_once(
-            layer,
+            dequantized_layer,
             hidden_seed,
             logits_seed,
             grad_seed,
@@ -1731,15 +1788,18 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             torch.distributed.all_gather(output_nonzero_tensors, output_nonzero)
             output_nonzero_by_rank = [value.item() for value in output_nonzero_tensors]
 
-        actual_runner = getattr(layer.experts, "_flashinfer_moe_runner", None)
+        actual_runner = getattr(dequantized_layer.experts, "_flashinfer_moe_runner", None)
         runner_cache_cleared = (
             isinstance(actual_runner, runner_type)
             and actual_runner._prepared is None
             and actual_runner._weight_key is None
         )
         parameter_ownership_unchanged = parameter_ownership_before == tuple(
-            (name, id(parameter)) for name, parameter in layer.named_parameters()
-        ) and state_keys_before == tuple(layer.state_dict())
+            tuple((name, id(parameter)) for name, parameter in candidate.named_parameters())
+            for candidate in (high_precision_layer, dequantized_layer)
+        ) and state_keys_before == tuple(
+            tuple(candidate.state_dict()) for candidate in (high_precision_layer, dequantized_layer)
+        )
         result_metadata = (
             reference.bias,
             high_precision.bias,

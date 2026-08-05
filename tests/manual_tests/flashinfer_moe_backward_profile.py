@@ -15,7 +15,12 @@ import torch.nn.functional as F
 os.environ["MILES_USE_FLASHINFER_MOE"] = "1"
 
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelGroupedLinear,
+    TERowParallelGroupedLinear,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -28,6 +33,7 @@ TOP_K = 8
 NUM_TOKENS = 4096
 ITERATIONS = 3
 OUTSTANDING_FORWARDS = (1, 4)
+BACKWARD_MODES = ("high_precision", "dequantized")
 
 
 def _routing_ids(rank: int, world_size: int) -> torch.Tensor:
@@ -57,9 +63,14 @@ def _install_route(layer: MoELayer, route_logits: torch.Tensor, route_ids: torch
     layer.route = types.MethodType(route, layer)
 
 
-def _build_layer(dispatcher: str, quantization: str, world_size: int) -> MoELayer:
-    os.environ["MILES_FLASHINFER_MOE_QUANTIZATION"] = quantization
+def _build_layer(
+    dispatcher: str, quantization: str, backward_mode: str, world_size: int
+) -> MoELayer:
+    if backward_mode not in BACKWARD_MODES:
+        raise ValueError(f"unsupported backward mode {backward_mode!r}")
+    os.environ["NVTE_BACKWARD_OVERRIDE"] = backward_mode
     if quantization == "nvfp4":
+        precision_config = {"fp4": "e2m1", "fp4_recipe": "nvfp4"}
         os.environ.update(
             {
                 "NVTE_NVFP4_4OVER6": "all",
@@ -70,6 +81,10 @@ def _build_layer(dispatcher: str, quantization: str, world_size: int) -> MoELaye
                 "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
             }
         )
+    elif quantization == "mxfp8":
+        precision_config = {"fp8": "e4m3", "fp8_recipe": "mxfp8"}
+    else:
+        raise ValueError(f"unsupported quantization {quantization!r}")
     config = TransformerConfig(
         num_layers=1,
         hidden_size=HIDDEN_SIZE,
@@ -93,9 +108,19 @@ def _build_layer(dispatcher: str, quantization: str, world_size: int) -> MoELaye
         bf16=True,
         params_dtype=torch.bfloat16,
         use_cpu_initialization=False,
+        **precision_config,
     )
     return MoELayer(
-        config, MoESubmodules(experts=ModuleSpec(module=GroupedMLP)), layer_number=1
+        config,
+        MoESubmodules(
+            experts=ModuleSpec(
+                module=GroupedMLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
+                ),
+            )
+        ),
+        layer_number=1,
     ).cuda()
 
 
@@ -129,10 +154,7 @@ def _measure(
     logits_seed: torch.Tensor,
     grad_seed: torch.Tensor,
     route_ids: torch.Tensor,
-    *,
-    mode: int,
 ) -> tuple[float, float]:
-    os.environ["MILES_FLASHINFER_MOE_DEQUANTIZED"] = str(mode)
     _step(layer, hidden_seed, logits_seed, grad_seed, route_ids)
     layer.zero_grad(set_to_none=True)
     torch.distributed.barrier()
@@ -163,12 +185,10 @@ def _measure_outstanding_memory(
     grad_seed: torch.Tensor,
     route_ids: torch.Tensor,
     *,
-    mode: int,
     outstanding: int,
 ) -> tuple[float, float]:
     """Measure live post-forward memory and total forward/backward peak."""
 
-    os.environ["MILES_FLASHINFER_MOE_DEQUANTIZED"] = str(mode)
     _step(layer, hidden_seed, logits_seed, grad_seed, route_ids)
     layer.zero_grad(set_to_none=True)
     torch.distributed.barrier()
@@ -217,34 +237,34 @@ def main() -> None:
             ("allgather", "mxfp8"),
         )
     ):
-        layer = _build_layer(dispatcher, quantization, world_size)
-        layer.train()
         torch.manual_seed(5678 + rank)
         hidden_seed = torch.randn((NUM_TOKENS, 1, HIDDEN_SIZE), device="cuda", dtype=torch.bfloat16)
         logits_seed = torch.randn((NUM_TOKENS, TOP_K), device="cuda", dtype=torch.float32)
         grad_seed = torch.randn_like(hidden_seed)
         results = {}
         memory_results = {}
-        mode_order = (0, 1) if case_index % 2 == 0 else (1, 0)
-        for mode in mode_order:
-            results[mode] = _measure(
-                layer, hidden_seed, logits_seed, grad_seed, route_ids, mode=mode
-            )
-            memory_results[mode] = {
+        mode_order = BACKWARD_MODES if case_index % 2 == 0 else BACKWARD_MODES[::-1]
+        for backward_mode in mode_order:
+            # Construct each mode independently with identical parameters. The
+            # backward policy is model-static and must be selected before the
+            # FlashInfer expert module is initialized.
+            torch.manual_seed(1234 + case_index)
+            model_parallel_cuda_manual_seed(1234 + case_index)
+            layer = _build_layer(dispatcher, quantization, backward_mode, world_size)
+            layer.train()
+            results[backward_mode] = _measure(layer, hidden_seed, logits_seed, grad_seed, route_ids)
+            memory_results[backward_mode] = {
                 outstanding: _measure_outstanding_memory(
-                    layer,
-                    hidden_seed,
-                    logits_seed,
-                    grad_seed,
-                    route_ids,
-                    mode=mode,
-                    outstanding=outstanding,
+                    layer, hidden_seed, logits_seed, grad_seed, route_ids, outstanding=outstanding
                 )
                 for outstanding in OUTSTANDING_FORWARDS
             }
+            del layer
+            gc.collect()
+            torch.cuda.empty_cache()
         if rank == 0:
-            high_ms, high_mib = results[0]
-            deq_ms, deq_mib = results[1]
+            high_ms, high_mib = results["high_precision"]
+            deq_ms, deq_mib = results["dequantized"]
             print(
                 "FlashInfer backward profile: "
                 f"quantization={quantization}, dispatcher={dispatcher}, "
@@ -257,8 +277,8 @@ def main() -> None:
                 flush=True,
             )
             for outstanding in OUTSTANDING_FORWARDS:
-                high_live, high_total_peak = memory_results[0][outstanding]
-                deq_live, deq_total_peak = memory_results[1][outstanding]
+                high_live, high_total_peak = memory_results["high_precision"][outstanding]
+                deq_live, deq_total_peak = memory_results["dequantized"][outstanding]
                 print(
                     "FlashInfer outstanding-forward memory: "
                     f"quantization={quantization}, dispatcher={dispatcher}, "
@@ -271,7 +291,7 @@ def main() -> None:
                     f"total_peak_delta_mib={deq_total_peak - high_total_peak:.2f}",
                     flush=True,
                 )
-        del layer, hidden_seed, logits_seed, grad_seed
+        del hidden_seed, logits_seed, grad_seed
         gc.collect()
         torch.cuda.empty_cache()
 

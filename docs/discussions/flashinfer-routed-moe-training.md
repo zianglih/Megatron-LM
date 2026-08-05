@@ -20,25 +20,30 @@ Set:
 export MILES_USE_FLASHINFER_MOE=1
 ```
 
-Select exactly one quantization through the active Megatron recipe or an
-explicit override:
+Select exactly one quantization through the canonical Megatron precision
+arguments:
 
-```bash
-export MILES_FLASHINFER_MOE_QUANTIZATION=nvfp4  # or mxfp8
+```text
+MXFP8: --fp8-format e4m3 --fp8-recipe mxfp8
+NVFP4: --fp4-format e2m1 --fp4-recipe nvfp4
 ```
 
-If an active `fp4=nvfp4` or `fp8=mxfp8` recipe and the override are both
-present, they must agree. There is no implicit NVFP4 fallback.
+The plugin infers its FlashInfer runner from the active format and recipe.
+There is no implicit NVFP4 fallback, and unsupported or simultaneous recipes
+are rejected explicitly.
 
-Backward uses the original BF16 operands by default. To recompute with BF16
-values decoded from the exact forward quantized operands, set:
+Select the surrogate operands explicitly with the same Transformer Engine
+setting used by the rest of the model:
 
 ```bash
-export MILES_FLASHINFER_MOE_DEQUANTIZED=1
+export NVTE_BACKWARD_OVERRIDE=high_precision
+# or
+export NVTE_BACKWARD_OVERRIDE=dequantized
 ```
 
-This is analogous to Transformer Engine's `NVTE_BACKWARD_OVERRIDE=dequantized`
-mode from
+`high_precision` uses the original BF16 operands, while `dequantized` uses
+BF16 values decoded from the exact forward quantized operands. The setting is
+required; unset, empty, and unsupported values are rejected. This follows
 [NVIDIA/TransformerEngine#2644](https://github.com/NVIDIA/TransformerEngine/pull/2644).
 
 ## Dispatch and expert ownership
