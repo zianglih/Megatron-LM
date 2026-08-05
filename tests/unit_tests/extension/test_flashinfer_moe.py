@@ -44,13 +44,7 @@ from miles_megatron_plugins.flashinfer_moe import (
     _grouped_mlp_weight_parameters,
     _pack_topk_ids,
     _run_flashinfer_forward_with_surrogate,
-    _te_mxfp8_quantize_gated_weight,
-    _te_mxfp8_quantize_weight,
-    _te_nvfp4_quantize_gated_weight,
-    _te_nvfp4_quantize_weight,
     _validate_flashinfer_moe_config,
-    dequantize_mxfp8_activation,
-    dequantize_nvfp4_activation,
     flashinfer_moe_backward_mode,
     flashinfer_moe_dispatch_mode,
     maybe_replace_flashinfer_moe_expert_spec,
@@ -966,7 +960,7 @@ def test_flashinfer_dequantizes_forward_activation_payload(
         from flashinfer import mxfp8_quantize
 
         data, scales = mxfp8_quantize(hidden, False, backend="cute-dsl")
-        actual = dequantize_mxfp8_activation(data, scales, dtype=torch.bfloat16)
+        actual = _FlashInferMXFP8Runner.dequantize_activation(data, scales, dtype=torch.bfloat16)
         scale_bytes = scales.view(torch.uint8).reshape(33, hidden_size // 32)
         expanded_scales = scale_bytes.repeat_interleave(32, dim=-1)
         expected = torch.where(
@@ -995,7 +989,7 @@ def test_flashinfer_dequantizes_forward_activation_payload(
             per_token_activation=True,
             backend="cuda",
         )
-        actual = dequantize_nvfp4_activation(
+        actual = _FlashInferNVFP4Runner.dequantize_activation(
             data,
             scales,
             per_token_scale,
@@ -1034,7 +1028,7 @@ def test_flashinfer_mxfp8_zero_scale_dequantizes_to_zero():
     data, scales = mxfp8_quantize(hidden, False, backend="cute-dsl")
 
     assert torch.count_nonzero(scales.view(torch.uint8)).item() == 0
-    actual = dequantize_mxfp8_activation(data, scales, dtype=torch.bfloat16)
+    actual = _FlashInferMXFP8Runner.dequantize_activation(data, scales, dtype=torch.bfloat16)
     torch.testing.assert_close(actual, hidden, rtol=0, atol=0)
 
 
@@ -1050,7 +1044,7 @@ def test_te_mxfp8_weight_quantization_matches_miles_rollout_sync(seed):
     torch.manual_seed(seed)
     weight = torch.randn((3, 128), device="cuda", dtype=torch.bfloat16) * 0.02
 
-    actual_qweight, actual_scale = _te_mxfp8_quantize_weight(weight)
+    actual_qweight, actual_scale = _FlashInferMXFP8Runner._quantize_weight(weight)
     expected_qweight, expected_scale = mxfp8_quantize(weight)
 
     torch.testing.assert_close(
@@ -1073,7 +1067,9 @@ def test_te_mxfp8_gated_weight_adapts_megatron_to_trtllm_order():
     gate_q, gate_scale = mxfp8_quantize(gate)
     up_q, up_scale = mxfp8_quantize(up)
 
-    actual_qweight, actual_scale = _te_mxfp8_quantize_gated_weight(torch.cat((gate, up), dim=0))
+    actual_qweight, actual_scale = _FlashInferMXFP8Runner._quantize_gated_weight(
+        torch.cat((gate, up), dim=0)
+    )
 
     torch.testing.assert_close(
         actual_qweight.view(torch.uint8),
@@ -1262,12 +1258,8 @@ def test_flashinfer_prepares_exact_dequantized_forward_weights(monkeypatch, runn
     assert prepared.backward_w13 is not None
     assert prepared.backward_w2 is not None
 
-    if runner_type is _FlashInferMXFP8Runner:
-        *_, w13_quantized = _te_mxfp8_quantize_gated_weight(w13[0], return_quantized=True)
-        *_, w2_quantized = _te_mxfp8_quantize_weight(w2[0], return_quantized=True)
-    else:
-        *_, w13_quantized = _te_nvfp4_quantize_gated_weight(w13[0], return_quantized=True)
-        *_, w2_quantized = _te_nvfp4_quantize_weight(w2[0], return_quantized=True)
+    *_, w13_quantized = runner_type._quantize_gated_weight(w13[0], return_quantized=True)
+    *_, w2_quantized = runner_type._quantize_weight(w2[0], return_quantized=True)
     expected_w13 = w13_quantized.dequantize(dtype=torch.bfloat16)[:256, :128]
     expected_w2 = w2_quantized.dequantize(dtype=torch.bfloat16)[:128, :128]
 
@@ -1426,7 +1418,9 @@ def test_te_weight_quantization_matches_miles_rollout_sync(monkeypatch, seed):
     torch.manual_seed(seed)
     weight = torch.randn((3, 128), device="cuda", dtype=torch.bfloat16) * 0.02
 
-    actual_qweight, actual_block_scale, actual_global_scale = _te_nvfp4_quantize_weight(weight)
+    actual_qweight, actual_block_scale, actual_global_scale = (
+        _FlashInferNVFP4Runner._quantize_weight(weight)
+    )
     expected_qweight, expected_block_scale, expected_global_scale = nvfp4_quantize_1d(weight)
 
     torch.testing.assert_close(actual_qweight, expected_qweight, rtol=0, atol=0)
@@ -1451,8 +1445,8 @@ def test_te_gated_weight_quantization_matches_miles_pair_sync(monkeypatch, seed)
     gate_up_weight = torch.randn((32, 128), device="cuda", dtype=torch.bfloat16) * 0.02
     gate_weight, up_weight = gate_up_weight.chunk(2, dim=0)
 
-    actual_qweight, actual_block_scale, actual_global_scale = _te_nvfp4_quantize_gated_weight(
-        gate_up_weight
+    actual_qweight, actual_block_scale, actual_global_scale = (
+        _FlashInferNVFP4Runner._quantize_gated_weight(gate_up_weight)
     )
     (
         (expected_gate_qweight, expected_gate_block_scale, expected_gate_scale),

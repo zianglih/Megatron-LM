@@ -121,21 +121,6 @@ def _transformer_engine_modules() -> _TransformerEngineModules:
 
 
 @cache
-def _te_mxfp8_storage() -> ModuleType:
-    return importlib.import_module("transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage")
-
-
-@cache
-def _te_nvfp4_storage() -> ModuleType:
-    return importlib.import_module("transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage")
-
-
-@cache
-def _te_nvfp4_tensor() -> ModuleType:
-    return importlib.import_module("transformer_engine.pytorch.tensor.nvfp4_tensor")
-
-
-@cache
 def _te_quantized_tensor() -> ModuleType:
     return importlib.import_module("transformer_engine.pytorch.quantized_tensor")
 
@@ -168,111 +153,6 @@ def _padded_linear_scales(scales: torch.Tensor, *, rows: int, scale_columns: int
     padded = torch.empty((padded_rows, padded_columns), device=scales.device, dtype=torch.uint8)
     padded[:rows, :scale_columns].copy_(scales.view(torch.uint8).reshape(rows, scale_columns))
     return padded
-
-
-def _mxfp8_activation_storage(data: torch.Tensor, scales: torch.Tensor, *, dtype: torch.dtype):
-    """Wrap the exact FlashInfer rowwise MXFP8 payload for deferred decode."""
-
-    te = _transformer_engine_modules()
-
-    if data.ndim != 2 or data.shape[1] % _MXFP8_GROUP_SIZE:
-        raise ValueError(
-            "FlashInfer MXFP8 activation must be [M, K] with K divisible by 32, "
-            f"got {tuple(data.shape)}"
-        )
-    rows, columns = data.shape
-    if rows == 0:
-        raise ValueError("FlashInfer MXFP8 storage requires at least one row")
-    linear_scales = _padded_linear_scales(
-        scales, rows=rows, scale_columns=columns // _MXFP8_GROUP_SIZE
-    )
-    return _te_mxfp8_storage().MXFP8TensorStorage(
-        data.view(torch.uint8),
-        linear_scales,
-        None,
-        None,
-        te.constants.DType.kFloat8E4M3,
-        None,
-        False,
-        fake_dtype=dtype,
-    )
-
-
-def dequantize_mxfp8_activation(
-    data: torch.Tensor, scales: torch.Tensor, *, dtype: torch.dtype
-) -> torch.Tensor:
-    """GPU-dequantize the exact rowwise MXFP8 activation used by FlashInfer."""
-
-    if data.shape[0] == 0:
-        return torch.empty_like(data, dtype=dtype)
-    return _mxfp8_activation_storage(data, scales, dtype=dtype).dequantize(dtype=dtype)
-
-
-def _nvfp4_activation_storage(
-    data: torch.Tensor,
-    scales: torch.Tensor,
-    per_token_scale: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-    e4m3_max: int,
-    use_4over6: bool,
-):
-    """Wrap exact NVFP4 q/block scales with equivalent TE row metadata."""
-
-    te = _transformer_engine_modules()
-
-    if data.ndim != 2:
-        raise ValueError(f"FlashInfer NVFP4 activation must be [M, K/2], got {tuple(data.shape)}")
-    rows, packed_columns = data.shape
-    columns = packed_columns * 2
-    if columns % _NVFP4_GROUP_SIZE:
-        raise ValueError(f"FlashInfer NVFP4 activation K={columns} must be divisible by 16")
-    if per_token_scale.numel() != rows:
-        raise ValueError(
-            "FlashInfer NVFP4 per-token scale count mismatch: "
-            f"got {per_token_scale.numel()}, expected {rows}"
-        )
-    if rows == 0:
-        raise ValueError("FlashInfer NVFP4 storage requires at least one row")
-    linear_scales = _padded_linear_scales(
-        scales, rows=rows, scale_columns=columns // _NVFP4_GROUP_SIZE
-    )
-    # TE derives the row decode scale as amax / (E4M3_MAX * E2M1_MAX).
-    # FlashInfer returns that decode scale directly, so reconstruct the amax.
-    row_amax = per_token_scale.to(torch.float32).reshape(rows) * float(e4m3_max * 6)
-    return _te_nvfp4_storage().NVFP4TensorStorage(
-        data.view(torch.uint8),
-        linear_scales,
-        None,
-        None,
-        row_amax,
-        None,
-        te.constants.DType.kFloat4E2M1,
-        None,
-        False,
-        fake_dtype=dtype,
-        row_scaled_nvfp4=True,
-        nvfp4_use_4over6=use_4over6,
-        nvfp4_e4m3_max=e4m3_max,
-    )
-
-
-def dequantize_nvfp4_activation(
-    data: torch.Tensor,
-    scales: torch.Tensor,
-    per_token_scale: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-    e4m3_max: int,
-    use_4over6: bool,
-) -> torch.Tensor:
-    """Decode FlashInfer NVFP4 q data through equivalent TE row metadata."""
-
-    if data.shape[0] == 0:
-        return torch.empty((0, data.shape[1] * 2), device=data.device, dtype=dtype)
-    return _nvfp4_activation_storage(
-        data, scales, per_token_scale, dtype=dtype, e4m3_max=e4m3_max, use_4over6=use_4over6
-    ).dequantize(dtype=dtype)
 
 
 def _dequantize_weight_payload(
@@ -990,62 +870,117 @@ class _FlashInferBF16Runner(_FlashInferRunnerBase):
         )
 
 
-def _te_mxfp8_quantize_weight(weight: torch.Tensor, *, return_quantized: bool = False):
-    """Quantize one expert matrix with Miles' rowwise MXFP8 contract."""
-
-    te = _transformer_engine_modules()
-    if weight.ndim != 2:
-        raise ValueError(f"MXFP8 expert weight must be 2D, got {tuple(weight.shape)}")
-    weight = weight.contiguous()
-    num_rows, num_cols = weight.shape
-    if num_cols % _MXFP8_GROUP_SIZE:
-        raise ValueError(f"MXFP8 expert K={num_cols} must be divisible by {_MXFP8_GROUP_SIZE}")
-    pad_rows = (-num_rows) % _TE_MXFP8_ROW_ALIGNMENT
-    if pad_rows:
-        weight = torch.cat(
-            (weight, torch.zeros((pad_rows, num_cols), device=weight.device, dtype=weight.dtype)),
-            dim=0,
-        )
-
-    quantizer = te.api.MXFP8Quantizer(
-        fp8_dtype=te.constants.TE_DType[torch.float8_e4m3fn], rowwise=True, columnwise=False
-    )
-    quantizer.internal = True
-    quantized = quantizer.quantize(weight)
-    qweight = quantized._rowwise_data[:num_rows, :num_cols]
-    qweight = qweight.contiguous().view(torch.float8_e4m3fn)
-    scale = quantized._rowwise_scale_inv[:num_rows, : num_cols // _MXFP8_GROUP_SIZE].contiguous()
-    result = (qweight, scale.view(torch.uint8))
-    if return_quantized:
-        return (*result, quantized)
-    return result
-
-
-def _te_mxfp8_quantize_gated_weight(
-    gate_up_weight: torch.Tensor, *, return_quantized: bool = False
-):
-    """Quantize Megatron [gate, up] rows and adapt them to TRT-LLM [up, gate]."""
-
-    result = _te_mxfp8_quantize_weight(gate_up_weight, return_quantized=return_quantized)
-    if return_quantized:
-        qweight, scale, quantized = result
-    else:
-        qweight, scale = result
-    gate_qweight, up_qweight = qweight.chunk(2, dim=0)
-    gate_scale, up_scale = scale.chunk(2, dim=0)
-    reordered = (
-        torch.cat((up_qweight, gate_qweight), dim=0),
-        torch.cat((up_scale, gate_scale), dim=0),
-    )
-    if return_quantized:
-        return (*reordered, quantized)
-    return reordered
-
-
 class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
     """MXFP8 exact-forward adapter matching Miles and SGLang layouts."""
 
     quantization = "mxfp8"
+
+    @staticmethod
+    @cache
+    def _te_storage() -> ModuleType:
+        return importlib.import_module(
+            "transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage"
+        )
+
+    @classmethod
+    def _activation_storage(
+        cls, data: torch.Tensor, scales: torch.Tensor, *, dtype: torch.dtype
+    ):
+        """Wrap the exact FlashInfer rowwise MXFP8 payload for deferred decode."""
+
+        te = _transformer_engine_modules()
+        if data.ndim != 2 or data.shape[1] % _MXFP8_GROUP_SIZE:
+            raise ValueError(
+                "FlashInfer MXFP8 activation must be [M, K] with K divisible by 32, "
+                f"got {tuple(data.shape)}"
+            )
+        rows, columns = data.shape
+        if rows == 0:
+            raise ValueError("FlashInfer MXFP8 storage requires at least one row")
+        linear_scales = _padded_linear_scales(
+            scales, rows=rows, scale_columns=columns // _MXFP8_GROUP_SIZE
+        )
+        return cls._te_storage().MXFP8TensorStorage(
+            data.view(torch.uint8),
+            linear_scales,
+            None,
+            None,
+            te.constants.DType.kFloat8E4M3,
+            None,
+            False,
+            fake_dtype=dtype,
+        )
+
+    @classmethod
+    def dequantize_activation(
+        cls, data: torch.Tensor, scales: torch.Tensor, *, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """GPU-dequantize the exact rowwise MXFP8 activation used by FlashInfer."""
+
+        if data.shape[0] == 0:
+            return torch.empty_like(data, dtype=dtype)
+        return cls._activation_storage(data, scales, dtype=dtype).dequantize(dtype=dtype)
+
+    @staticmethod
+    def _quantize_weight(weight: torch.Tensor, *, return_quantized: bool = False):
+        """Quantize one expert matrix with Miles' rowwise MXFP8 contract."""
+
+        te = _transformer_engine_modules()
+        if weight.ndim != 2:
+            raise ValueError(f"MXFP8 expert weight must be 2D, got {tuple(weight.shape)}")
+        weight = weight.contiguous()
+        num_rows, num_cols = weight.shape
+        if num_cols % _MXFP8_GROUP_SIZE:
+            raise ValueError(f"MXFP8 expert K={num_cols} must be divisible by {_MXFP8_GROUP_SIZE}")
+        pad_rows = (-num_rows) % _TE_MXFP8_ROW_ALIGNMENT
+        if pad_rows:
+            weight = torch.cat(
+                (
+                    weight,
+                    torch.zeros(
+                        (pad_rows, num_cols), device=weight.device, dtype=weight.dtype
+                    ),
+                ),
+                dim=0,
+            )
+
+        quantizer = te.api.MXFP8Quantizer(
+            fp8_dtype=te.constants.TE_DType[torch.float8_e4m3fn],
+            rowwise=True,
+            columnwise=False,
+        )
+        quantizer.internal = True
+        quantized = quantizer.quantize(weight)
+        qweight = quantized._rowwise_data[:num_rows, :num_cols]
+        qweight = qweight.contiguous().view(torch.float8_e4m3fn)
+        scale = quantized._rowwise_scale_inv[
+            :num_rows, : num_cols // _MXFP8_GROUP_SIZE
+        ].contiguous()
+        result = (qweight, scale.view(torch.uint8))
+        if return_quantized:
+            return (*result, quantized)
+        return result
+
+    @classmethod
+    def _quantize_gated_weight(
+        cls, gate_up_weight: torch.Tensor, *, return_quantized: bool = False
+    ):
+        """Quantize Megatron [gate, up] rows and adapt them to TRT-LLM [up, gate]."""
+
+        result = cls._quantize_weight(gate_up_weight, return_quantized=return_quantized)
+        if return_quantized:
+            qweight, scale, quantized = result
+        else:
+            qweight, scale = result
+        gate_qweight, up_qweight = qweight.chunk(2, dim=0)
+        gate_scale, up_scale = scale.chunk(2, dim=0)
+        reordered = (
+            torch.cat((up_qweight, gate_qweight), dim=0),
+            torch.cat((up_scale, gate_scale), dim=0),
+        )
+        if return_quantized:
+            return (*reordered, quantized)
+        return reordered
 
     def _prepare_weights(
         self,
@@ -1076,10 +1011,12 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
         for expert in range(self.local_num_experts):
             # Miles owns Megatron [gate, up] masters. FlashInfer consumes W3/W1
             # [up, gate] before its gated-row interleave and row shuffle.
-            w13_result = _te_mxfp8_quantize_gated_weight(
+            w13_result = self._quantize_gated_weight(
                 w13_gate_up[expert], return_quantized=dequantized_backward
             )
-            w2_result = _te_mxfp8_quantize_weight(w2[expert], return_quantized=dequantized_backward)
+            w2_result = self._quantize_weight(
+                w2[expert], return_quantized=dequantized_backward
+            )
             if dequantized_backward:
                 w13_q, w13_sf, w13_quantized = w13_result
                 w2_q, w2_sf, w2_quantized = w2_result
@@ -1224,7 +1161,7 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
         backward_hidden_states = None
         if backward_mode == DEQUANTIZED_BACKWARD:
             with _flashinfer_nvtx_range("qdq_capture_mxfp8"):
-                backward_hidden_states = _mxfp8_activation_storage(
+                backward_hidden_states = self._activation_storage(
                     hidden_q, hidden_sf, dtype=hidden_states.dtype
                 )
         return _FlashInferForwardResult(
@@ -1235,104 +1172,203 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
         )
 
 
-def _te_nvfp4_weight_e4m3_max() -> int:
-    use_4over6 = os.environ.get("NVTE_NVFP4_4OVER6", "").strip().lower()
-    use_256 = os.environ.get("NVTE_NVFP4_4OVER6_E4M3_USE_256", "all").strip().lower()
-    if use_4over6 in ("weights", "all") and use_256 in ("weights", "all"):
-        return 256
-    return 448
-
-
-def _te_nvfp4_global_decode_scale(global_amax: torch.Tensor, e4m3_max: int) -> torch.Tensor:
-    encode_scale = torch.div(
-        torch.tensor(float(e4m3_max * 6), device=global_amax.device, dtype=torch.float32),
-        global_amax.to(torch.float32),
-    )
-    encode_scale = torch.minimum(
-        encode_scale,
-        torch.tensor(
-            torch.finfo(torch.float32).max, device=global_amax.device, dtype=torch.float32
-        ),
-    )
-    encode_scale = torch.where(encode_scale == 0.0, torch.ones_like(encode_scale), encode_scale)
-    return torch.reciprocal(encode_scale)
-
-
-def _te_nvfp4_quantize_weight(weight: torch.Tensor, *, return_quantized: bool = False):
-    """Quantize one expert matrix with Miles' TE weight-sync contract."""
-
-    weight = weight.contiguous()
-    num_rows, num_cols = weight.shape
-    pad_rows = (-num_rows) % _TE_NVFP4_ROW_ALIGNMENT
-    if pad_rows:
-        weight = torch.cat(
-            (weight, torch.zeros((pad_rows, num_cols), device=weight.device, dtype=weight.dtype)),
-            dim=0,
-        )
-
-    use_4over6 = os.environ.get("NVTE_NVFP4_4OVER6", "").strip().lower() in ("weights", "all")
-    e4m3_max = _te_nvfp4_weight_e4m3_max()
-    err_mode = os.environ.get("NVTE_NVFP4_4OVER6_ERR_MODE", "MAE").strip().upper()
-    quantizer = _te_nvfp4_tensor().NVFP4Quantizer(
-        rowwise=True,
-        columnwise=False,
-        with_amax_reduction=False,
-        with_rht=False,
-        with_post_rht_amax=False,
-        with_2d_quantization=False,
-        stochastic_rounding=False,
-        row_scaled_nvfp4=False,
-        nvfp4_use_4over6=use_4over6,
-        nvfp4_e4m3_max=e4m3_max,
-        nvfp4_4over6_err_mode=err_mode,
-        with_random_sign_mask=False,
-    )
-    # This quantization is an implementation detail of the custom autograd
-    # boundary. Ask TE for lightweight storage directly instead of a Tensor
-    # subclass whose autograd wrapper owns zero-sized base storage.
-    quantizer.internal = True
-    quantized = quantizer.quantize(weight)
-    qweight = quantized._rowwise_data[:num_rows, : num_cols // 2].contiguous()
-    block_scale = quantized._rowwise_scale_inv[
-        :num_rows, : num_cols // _NVFP4_GROUP_SIZE
-    ].contiguous()
-    global_amax = quantized._amax_rowwise.reshape(-1)[0]
-    result = (
-        qweight,
-        block_scale.view(torch.float8_e4m3fn),
-        _te_nvfp4_global_decode_scale(global_amax, e4m3_max),
-    )
-    if return_quantized:
-        return (*result, quantized)
-    return result
-
-
-def _te_nvfp4_quantize_gated_weight(
-    gate_up_weight: torch.Tensor, *, return_quantized: bool = False
-):
-    """Quantize shared-scale gate/up rows, then adapt to FlashInfer order."""
-
-    result = _te_nvfp4_quantize_weight(gate_up_weight, return_quantized=return_quantized)
-    if return_quantized:
-        qweight, block_scale, global_scale, quantized = result
-    else:
-        qweight, block_scale, global_scale = result
-    gate_qweight, up_qweight = qweight.chunk(2, dim=0)
-    gate_block_scale, up_block_scale = block_scale.chunk(2, dim=0)
-    reordered = (
-        torch.cat((up_qweight, gate_qweight), dim=0),
-        torch.cat((up_block_scale, gate_block_scale), dim=0),
-        global_scale,
-    )
-    if return_quantized:
-        return (*reordered, quantized)
-    return reordered
-
-
 class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
     """NVFP4 exact-forward adapter."""
 
     quantization = "nvfp4"
+
+    @staticmethod
+    @cache
+    def _te_storage() -> ModuleType:
+        return importlib.import_module(
+            "transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage"
+        )
+
+    @staticmethod
+    @cache
+    def _te_tensor() -> ModuleType:
+        return importlib.import_module("transformer_engine.pytorch.tensor.nvfp4_tensor")
+
+    @classmethod
+    def _activation_storage(
+        cls,
+        data: torch.Tensor,
+        scales: torch.Tensor,
+        per_token_scale: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        e4m3_max: int,
+        use_4over6: bool,
+    ):
+        """Wrap exact NVFP4 q/block scales with equivalent TE row metadata."""
+
+        te = _transformer_engine_modules()
+        if data.ndim != 2:
+            raise ValueError(
+                f"FlashInfer NVFP4 activation must be [M, K/2], got {tuple(data.shape)}"
+            )
+        rows, packed_columns = data.shape
+        columns = packed_columns * 2
+        if columns % _NVFP4_GROUP_SIZE:
+            raise ValueError(f"FlashInfer NVFP4 activation K={columns} must be divisible by 16")
+        if per_token_scale.numel() != rows:
+            raise ValueError(
+                "FlashInfer NVFP4 per-token scale count mismatch: "
+                f"got {per_token_scale.numel()}, expected {rows}"
+            )
+        if rows == 0:
+            raise ValueError("FlashInfer NVFP4 storage requires at least one row")
+        linear_scales = _padded_linear_scales(
+            scales, rows=rows, scale_columns=columns // _NVFP4_GROUP_SIZE
+        )
+        # TE derives the row decode scale as amax / (E4M3_MAX * E2M1_MAX).
+        # FlashInfer returns that decode scale directly, so reconstruct the amax.
+        row_amax = per_token_scale.to(torch.float32).reshape(rows) * float(e4m3_max * 6)
+        return cls._te_storage().NVFP4TensorStorage(
+            data.view(torch.uint8),
+            linear_scales,
+            None,
+            None,
+            row_amax,
+            None,
+            te.constants.DType.kFloat4E2M1,
+            None,
+            False,
+            fake_dtype=dtype,
+            row_scaled_nvfp4=True,
+            nvfp4_use_4over6=use_4over6,
+            nvfp4_e4m3_max=e4m3_max,
+        )
+
+    @classmethod
+    def dequantize_activation(
+        cls,
+        data: torch.Tensor,
+        scales: torch.Tensor,
+        per_token_scale: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        e4m3_max: int,
+        use_4over6: bool,
+    ) -> torch.Tensor:
+        """Decode FlashInfer NVFP4 q data through equivalent TE row metadata."""
+
+        if data.shape[0] == 0:
+            return torch.empty((0, data.shape[1] * 2), device=data.device, dtype=dtype)
+        return cls._activation_storage(
+            data,
+            scales,
+            per_token_scale,
+            dtype=dtype,
+            e4m3_max=e4m3_max,
+            use_4over6=use_4over6,
+        ).dequantize(dtype=dtype)
+
+    @staticmethod
+    def _te_weight_e4m3_max() -> int:
+        use_4over6 = os.environ.get("NVTE_NVFP4_4OVER6", "").strip().lower()
+        use_256 = os.environ.get("NVTE_NVFP4_4OVER6_E4M3_USE_256", "all").strip().lower()
+        if use_4over6 in ("weights", "all") and use_256 in ("weights", "all"):
+            return 256
+        return 448
+
+    @staticmethod
+    def _global_decode_scale(global_amax: torch.Tensor, e4m3_max: int) -> torch.Tensor:
+        encode_scale = torch.div(
+            torch.tensor(float(e4m3_max * 6), device=global_amax.device, dtype=torch.float32),
+            global_amax.to(torch.float32),
+        )
+        encode_scale = torch.minimum(
+            encode_scale,
+            torch.tensor(
+                torch.finfo(torch.float32).max,
+                device=global_amax.device,
+                dtype=torch.float32,
+            ),
+        )
+        encode_scale = torch.where(
+            encode_scale == 0.0, torch.ones_like(encode_scale), encode_scale
+        )
+        return torch.reciprocal(encode_scale)
+
+    @classmethod
+    def _quantize_weight(cls, weight: torch.Tensor, *, return_quantized: bool = False):
+        """Quantize one expert matrix with Miles' TE weight-sync contract."""
+
+        weight = weight.contiguous()
+        num_rows, num_cols = weight.shape
+        pad_rows = (-num_rows) % _TE_NVFP4_ROW_ALIGNMENT
+        if pad_rows:
+            weight = torch.cat(
+                (
+                    weight,
+                    torch.zeros(
+                        (pad_rows, num_cols), device=weight.device, dtype=weight.dtype
+                    ),
+                ),
+                dim=0,
+            )
+
+        use_4over6 = os.environ.get("NVTE_NVFP4_4OVER6", "").strip().lower() in (
+            "weights",
+            "all",
+        )
+        e4m3_max = cls._te_weight_e4m3_max()
+        err_mode = os.environ.get("NVTE_NVFP4_4OVER6_ERR_MODE", "MAE").strip().upper()
+        quantizer = cls._te_tensor().NVFP4Quantizer(
+            rowwise=True,
+            columnwise=False,
+            with_amax_reduction=False,
+            with_rht=False,
+            with_post_rht_amax=False,
+            with_2d_quantization=False,
+            stochastic_rounding=False,
+            row_scaled_nvfp4=False,
+            nvfp4_use_4over6=use_4over6,
+            nvfp4_e4m3_max=e4m3_max,
+            nvfp4_4over6_err_mode=err_mode,
+            with_random_sign_mask=False,
+        )
+        # This quantization is an implementation detail of the custom autograd
+        # boundary. Ask TE for lightweight storage directly instead of a Tensor
+        # subclass whose autograd wrapper owns zero-sized base storage.
+        quantizer.internal = True
+        quantized = quantizer.quantize(weight)
+        qweight = quantized._rowwise_data[:num_rows, : num_cols // 2].contiguous()
+        block_scale = quantized._rowwise_scale_inv[
+            :num_rows, : num_cols // _NVFP4_GROUP_SIZE
+        ].contiguous()
+        global_amax = quantized._amax_rowwise.reshape(-1)[0]
+        result = (
+            qweight,
+            block_scale.view(torch.float8_e4m3fn),
+            cls._global_decode_scale(global_amax, e4m3_max),
+        )
+        if return_quantized:
+            return (*result, quantized)
+        return result
+
+    @classmethod
+    def _quantize_gated_weight(
+        cls, gate_up_weight: torch.Tensor, *, return_quantized: bool = False
+    ):
+        """Quantize shared-scale gate/up rows, then adapt to FlashInfer order."""
+
+        result = cls._quantize_weight(gate_up_weight, return_quantized=return_quantized)
+        if return_quantized:
+            qweight, block_scale, global_scale, quantized = result
+        else:
+            qweight, block_scale, global_scale = result
+        gate_qweight, up_qweight = qweight.chunk(2, dim=0)
+        gate_block_scale, up_block_scale = block_scale.chunk(2, dim=0)
+        reordered = (
+            torch.cat((up_qweight, gate_qweight), dim=0),
+            torch.cat((up_block_scale, gate_block_scale), dim=0),
+            global_scale,
+        )
+        if return_quantized:
+            return (*reordered, quantized)
+        return reordered
 
     @staticmethod
     def _e4m3_max() -> float:
@@ -1374,10 +1410,12 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
         for expert in range(self.local_num_experts):
             # Quantize Megatron's shared-scale [gate, up] matrix before adapting
             # its emitted rows to the TRT-LLM gated kernel's [up, gate] order.
-            w13_result = _te_nvfp4_quantize_gated_weight(
+            w13_result = self._quantize_gated_weight(
                 w13_gate_up[expert], return_quantized=dequantized_backward
             )
-            w2_result = _te_nvfp4_quantize_weight(w2[expert], return_quantized=dequantized_backward)
+            w2_result = self._quantize_weight(
+                w2[expert], return_quantized=dequantized_backward
+            )
             if dequantized_backward:
                 w13_q, w13_sf, w13_decode, w13_quantized = w13_result
                 w2_q, w2_sf, w2_decode, w2_quantized = w2_result
@@ -1537,7 +1575,7 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
         backward_hidden_states = None
         if backward_mode == DEQUANTIZED_BACKWARD:
             with _flashinfer_nvtx_range("qdq_capture_nvfp4"):
-                backward_hidden_states = _nvfp4_activation_storage(
+                backward_hidden_states = self._activation_storage(
                     hidden_fp4,
                     hidden_scales,
                     per_token_scale,
