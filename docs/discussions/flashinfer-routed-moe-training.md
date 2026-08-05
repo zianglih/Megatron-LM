@@ -176,6 +176,12 @@ per-token activations. The adapter mirrors that division of ownership.
   parallelism greater than one are rejected. Miles' all-`-1` replay padding
   rows are supported by applying the same deterministic expert-ID replacement
   as `ReplayManager`.
+- The path requires SM100+, BF16 hidden states and master weights, at most 2048
+  global experts, and routing probabilities applied inside the fused expert
+  finalization (`moe_apply_probs_on_input=False`). NVFP4 hidden/intermediate
+  dimensions must be multiples of 16. MXFP8 requires those dimensions to be
+  multiples of 128 and the global expert count to be divisible by 4 and greater
+  than the FlashInfer kernel top-k.
 - The A2A branch additionally rejects router quantization padding. It bypasses
   the FlashInfer launch when a rank receives zero assignments while retaining
   connected zero gradients and participation in the reverse A2A.
@@ -187,8 +193,6 @@ per-token activations. The adapter mirrors that division of ownership.
   integrated later at the same dispatched-expert boundary. This change
   validates both Megatron's standard `alltoall` dispatcher and the retained
   replicated `allgather` branch.
-- The current MXFP8 path requires hidden and expert-intermediate dimensions to
-  be multiples of 128. Shape padding can relax this in a later iteration.
 - The trainer run used EP4 while rollout data came from EP2. Ordinary NCCL
   all-reduce does not preserve the same partial-sum association across those
   topologies, so reusing the FlashInfer expert kernel alone cannot guarantee
@@ -203,6 +207,11 @@ per-token activations. The adapter mirrors that division of ownership.
   transfer and optimizer-state resume have not yet been exercised.
 - Partial MoE CUDA graph capture is rejected. Full-layer activation
   checkpointing may re-run the FlashInfer forward and must be measured.
+- The current distributed numerical test uses TP1/EP8/ETP1, sequence parallel
+  off, unfused permutation, and no shared experts. TP+EP, fused permutation,
+  shared experts, activation checkpointing, optimizer steps/resume, and
+  end-to-end training remain unvalidated. No A2A-versus-allgather throughput or
+  memory conclusion is claimed.
 
 ## Validation log
 
@@ -278,13 +287,25 @@ each FlashInfer result against a topology-identical BF16 reference. It also
 covers explicit dispatcher selection, DeepEP/HybridEP rejection, singleton
 global expert-ID construction, and an `M=0` custom-autograd path that skips
 FlashInfer while returning connected zero gradients and invalidating cached
-weights.
+weights. Reference and quantized backwards receive the same deterministic,
+nonuniform upstream gradient; relative-L2 and scale-aware maximum errors are
+checked for hidden, routing-logit, and local-parameter gradients.
+
+The test installs deterministic differentiable routing so every rank executes
+the same collective schedule and the final EP rank receives zero assignments.
+It therefore checks gradients of the injected routing logits, not parameters of
+Megatron's real router; router top-k and Miles replay are covered structurally
+but are not exercised by this distributed runtime test. The BF16 reference
+replaces only the fused-kernel autograd boundary, so it intentionally shares
+the adapter's dispatcher and expert-ID reconstruction. Focused helper tests
+cover that reconstruction separately, but the numerical comparison is not an
+independent oracle for the shared packing code.
 
 The ordinary focused run passes every non-distributed case and skips only the
 eight cases that require an eight-rank launch:
 
 ```text
-29 passed, 8 skipped, 25 warnings in 1.48s
+29 passed, 8 skipped, 25 warnings in 1.47s
 ```
 
 The distributed matrix runs as:
@@ -297,17 +318,20 @@ python -m torch.distributed.run --standalone --nproc_per_node=8 \
 ```
 
 ```text
-8 passed, 29 deselected, 41 warnings in 27.15s
+8 passed, 29 deselected, 41 warnings in 26.16s
 ```
 
 Across the eight cases, NVFP4 forward relative L2 was at most `0.214520`
-against BF16 and MXFP8 was at most `0.070004`. Hidden-gradient relative L2 was
-at most `0.003635`; router and local-parameter gradient relative L2 values were
-`0.0` at the displayed precision. The quantization-specific forward limits are
-`0.25` for NVFP4 and `0.10` for MXFP8, and all surrogate-gradient relative L2
-limits are `0.01`. Deterministic routing leaves EP rank 7 with zero received
-assignments in every A2A case while verifying that inverse A2A still restores
-its locally originated token outputs.
+against BF16 and MXFP8 was at most `0.070004`. The worst per-token relative L2
+values were `0.243297` and `0.083410`, respectively. Hidden-gradient relative
+L2 was at most `0.003749`; routing-logit and local-parameter gradient relative
+L2 values were `0.0` at the displayed precision. The quantization-specific
+global/per-token forward limits are `0.25`/`0.30` for NVFP4 and `0.10`/`0.15`
+for MXFP8. All surrogate-gradient relative L2 limits are `0.01`, with an
+additional scale-aware maximum-error check. Deterministic routing leaves EP
+rank 7 with zero received assignments in every A2A case while verifying the
+exact global assignment count and that inverse A2A restores its locally
+originated token outputs.
 
 The checked-in distributed smoke runs the complete Megatron route, permutation,
 EP A2A, local FlashInfer `top_k=1`, inverse A2A, and final unpermute lifecycle:
@@ -322,7 +346,8 @@ still originating tokens there. The run completed the reverse A2A, recovered
 rank 7's outputs, and verified that the plugin's padded token all-gather and EP
 output all-reduce were not called. Against the same A2A lifecycle with BF16
 experts, the observed MXFP8 forward relative L2 was `0.070036`; maximum hidden,
-router, and local-parameter surrogate-gradient errors were all `0.0`.
+routing-logit, and local-parameter surrogate-gradient errors were all
+`0.000000` at the displayed precision.
 
 ### Quantized-weight contract
 

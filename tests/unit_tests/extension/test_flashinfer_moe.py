@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core import parallel_state
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.experts import GroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
@@ -548,8 +549,12 @@ def _distributed_routing_ids(
 ) -> torch.Tensor:
     """Route to unique experts on every EP rank except the final rank."""
 
+    if num_experts % world_size:
+        raise ValueError(f"num_experts={num_experts} must be divisible by world_size={world_size}")
     local_experts = num_experts // world_size
     active_experts = num_experts - local_experts
+    if top_k > active_experts:
+        raise ValueError(f"top_k={top_k} exceeds active experts={active_experts}")
     token_ids = torch.arange(num_tokens, device="cuda", dtype=torch.long)
     slot_ids = torch.arange(top_k, device="cuda", dtype=torch.long)
     bases = (rank * num_tokens + token_ids) * top_k
@@ -598,6 +603,7 @@ def _run_distributed_layer_once(
     layer: MoELayer,
     hidden_seed: torch.Tensor,
     logits_seed: torch.Tensor,
+    grad_seed: torch.Tensor,
     route_ids: torch.Tensor,
     *,
     dispatch_mode: str,
@@ -647,7 +653,7 @@ def _run_distributed_layer_once(
         if hook is not None:
             hook.remove()
 
-    output.float().sum().backward()
+    torch.autograd.backward(output, grad_seed)
     parameter_grads = []
     missing_grads = int(hidden.grad is None) + int(route_logits.grad is None)
     hidden_grad = torch.zeros_like(hidden) if hidden.grad is None else hidden.grad
@@ -677,6 +683,13 @@ def _global_max(value: torch.Tensor) -> float:
 
 
 def _global_relative_l2(actual_tensors, reference_tensors) -> float:
+    actual_tensors = tuple(actual_tensors)
+    reference_tensors = tuple(reference_tensors)
+    if len(actual_tensors) != len(reference_tensors):
+        raise ValueError(
+            "distributed numerical comparison requires matching tensor lists, "
+            f"got {len(actual_tensors)} and {len(reference_tensors)}"
+        )
     error_sq = torch.zeros((), device="cuda")
     reference_sq = torch.zeros((), device="cuda")
     for actual, reference in zip(actual_tensors, reference_tensors):
@@ -685,6 +698,13 @@ def _global_relative_l2(actual_tensors, reference_tensors) -> float:
     torch.distributed.all_reduce(error_sq)
     torch.distributed.all_reduce(reference_sq)
     return torch.sqrt(error_sq / reference_sq.clamp_min(1e-20)).item()
+
+
+def _global_abs_max(tensors) -> float:
+    value = torch.zeros((), device="cuda")
+    for tensor in tensors:
+        value = torch.maximum(value, tensor.detach().float().abs().max())
+    return _global_max(value)
 
 
 @pytest.mark.internal
@@ -738,6 +758,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
     metrics = None
     reference = None
     actual = None
+    run_completed = False
 
     try:
         monkeypatch.setenv("MILES_USE_FLASHINFER_MOE", "1")
@@ -779,12 +800,14 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         torch.manual_seed(5678 + rank)
         hidden_seed = torch.randn((num_tokens, 1, hidden_size), device="cuda", dtype=torch.bfloat16)
         logits_seed = torch.randn((num_tokens, top_k), device="cuda", dtype=torch.float32)
+        grad_seed = torch.randn_like(hidden_seed)
         route_ids = _distributed_routing_ids(rank, world_size, num_tokens, num_experts, top_k)
 
         reference = _run_distributed_layer_once(
             layer,
             hidden_seed,
             logits_seed,
+            grad_seed,
             route_ids,
             dispatch_mode=moe_token_dispatcher_type,
             bf16_reference=True,
@@ -793,6 +816,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             layer,
             hidden_seed,
             logits_seed,
+            grad_seed,
             route_ids,
             dispatch_mode=moe_token_dispatcher_type,
             bf16_reference=False,
@@ -803,13 +827,21 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         torch.distributed.all_reduce(forward_error_sq)
         torch.distributed.all_reduce(reference_sq)
         forward_rel_l2 = torch.sqrt(forward_error_sq / reference_sq.clamp_min(1e-20)).item()
+        per_token_forward_rel_l2 = _global_max(
+            torch.sqrt(
+                (actual.output.float() - reference.output.float()).square().sum(dim=-1)
+                / reference.output.float().square().sum(dim=-1).clamp_min(1e-20)
+            ).max()
+        )
         hidden_grad_max = _global_max(
             (actual.hidden_grad.float() - reference.hidden_grad.float()).abs().max()
         )
+        hidden_grad_reference_max = _global_abs_max((reference.hidden_grad,))
         hidden_grad_rel_l2 = _global_relative_l2((actual.hidden_grad,), (reference.hidden_grad,))
         route_grad_max = _global_max(
             (actual.route_grad.float() - reference.route_grad.float()).abs().max()
         )
+        route_grad_reference_max = _global_abs_max((reference.route_grad,))
         route_grad_rel_l2 = _global_relative_l2((actual.route_grad,), (reference.route_grad,))
         parameter_grad_error = torch.zeros((), device="cuda")
         for actual_grad, reference_grad in zip(actual.parameter_grads, reference.parameter_grads):
@@ -817,6 +849,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
                 parameter_grad_error, (actual_grad.float() - reference_grad.float()).abs().max()
             )
         parameter_grad_max = _global_max(parameter_grad_error)
+        parameter_grad_reference_max = _global_abs_max(reference.parameter_grads)
         parameter_grad_rel_l2 = _global_relative_l2(
             actual.parameter_grads, reference.parameter_grads
         )
@@ -826,11 +859,15 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         torch.distributed.all_reduce(missing_grads)
         metrics = (
             forward_rel_l2,
+            per_token_forward_rel_l2,
             hidden_grad_max,
+            hidden_grad_reference_max,
             hidden_grad_rel_l2,
             route_grad_max,
+            route_grad_reference_max,
             route_grad_rel_l2,
             parameter_grad_max,
+            parameter_grad_reference_max,
             parameter_grad_rel_l2,
             missing_grads.item(),
         )
@@ -871,8 +908,15 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             runner_cache_cleared,
         )
         torch.cuda.synchronize()
+        run_completed = True
     finally:
-        Utils.destroy_model_parallel()
+        if run_completed:
+            Utils.destroy_model_parallel()
+        else:
+            parallel_state.destroy_model_parallel()
+            Utils.inited = False
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
 
     assert reference is not None and actual is not None and metrics is not None
     assert result_metadata == (
@@ -886,11 +930,15 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
     )
     (
         forward_rel_l2,
+        per_token_forward_rel_l2,
         hidden_grad_max,
+        hidden_grad_reference_max,
         hidden_grad_rel_l2,
         route_grad_max,
+        route_grad_reference_max,
         route_grad_rel_l2,
         parameter_grad_max,
+        parameter_grad_reference_max,
         parameter_grad_rel_l2,
         missing_grads,
     ) = metrics
@@ -900,6 +948,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             f"quantization={runner_type.quantization}, "
             f"dispatcher={moe_token_dispatcher_type}, top_k={top_k}, "
             f"forward_rel_l2={forward_rel_l2:.6f}, "
+            f"per_token_forward_rel_l2={per_token_forward_rel_l2:.6f}, "
             f"hidden_grad_rel_l2={hidden_grad_rel_l2:.6f}, "
             f"hidden_grad_max={hidden_grad_max:.6f}, "
             f"route_grad_rel_l2={route_grad_rel_l2:.6f}, "
@@ -909,14 +958,22 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         )
     assert missing_grads == 0
     forward_tolerance = 0.25 if runner_type.quantization == "nvfp4" else 0.10
+    per_token_forward_tolerance = 0.30 if runner_type.quantization == "nvfp4" else 0.15
     assert forward_rel_l2 < forward_tolerance
+    assert per_token_forward_rel_l2 < per_token_forward_tolerance
     assert hidden_grad_rel_l2 < 0.01
     assert route_grad_rel_l2 < 0.01
     assert parameter_grad_rel_l2 < 0.01
+    gradient_atol = 0.125
+    gradient_rtol = 0.01
+    assert hidden_grad_max < gradient_atol + gradient_rtol * hidden_grad_reference_max
+    assert route_grad_max < gradient_atol + gradient_rtol * route_grad_reference_max
+    assert parameter_grad_max < gradient_atol + gradient_rtol * parameter_grad_reference_max
 
     if moe_token_dispatcher_type == "alltoall":
         assert received_by_rank is not None
         assert all(received > 0 for received in received_by_rank[:-1])
         assert received_by_rank[-1] == 0
+        assert sum(received_by_rank) == world_size * num_tokens * top_k
         assert output_nonzero_by_rank is not None
         assert output_nonzero_by_rank[-1] == 1

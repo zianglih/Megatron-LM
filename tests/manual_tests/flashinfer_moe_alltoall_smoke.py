@@ -23,8 +23,8 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-os.environ.setdefault("MILES_USE_FLASHINFER_MOE", "1")
-os.environ.setdefault("MILES_FLASHINFER_MOE_QUANTIZATION", "mxfp8")
+os.environ["MILES_USE_FLASHINFER_MOE"] = "1"
+os.environ["MILES_FLASHINFER_MOE_QUANTIZATION"] = "mxfp8"
 
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -41,6 +41,8 @@ def _routing_ids(rank: int, world_size: int, tokens: int, experts: int) -> torch
     active_owners = world_size - 1
     if active_owners < 2:
         raise RuntimeError("The all-to-all smoke test requires at least three ranks")
+    if experts % world_size:
+        raise RuntimeError(f"experts={experts} must be divisible by world_size={world_size}")
     local_experts = experts // world_size
     ids = []
     for token in range(tokens):
@@ -109,6 +111,8 @@ def _global_max(value: torch.Tensor) -> torch.Tensor:
 
 def main() -> None:
     world_size = int(os.environ["WORLD_SIZE"])
+    if world_size != 8:
+        raise RuntimeError(f"FlashInfer all-to-all smoke requires 8 ranks, got {world_size}")
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -154,12 +158,13 @@ def main() -> None:
     route_ids = _routing_ids(rank, world_size, tokens, experts)
     hidden_seed = torch.randn((tokens, 1, hidden_size), device="cuda", dtype=torch.bfloat16)
     logits_seed = torch.randn((tokens, 2), device="cuda", dtype=torch.float32)
+    grad_seed = torch.randn_like(hidden_seed)
 
     hidden_ref = hidden_seed.detach().clone().requires_grad_()
     logits_ref = logits_seed.detach().clone().requires_grad_()
     _install_route(layer, logits_ref, route_ids)
     reference = _bf16_reference(layer, hidden_ref)
-    reference.float().sum().backward()
+    torch.autograd.backward(reference, grad_seed)
     ref_param_grads = [parameter.grad.detach().clone() for parameter in layer.experts.parameters()]
 
     layer.zero_grad(set_to_none=True)
@@ -184,22 +189,10 @@ def main() -> None:
     ):
         actual, bias = layer(hidden_actual)
     hook.remove()
-    if bias is not None:
-        raise AssertionError("unexpected expert bias")
-    actual.float().sum().backward()
+    torch.autograd.backward(actual, grad_seed)
     actual_param_grads = [
         parameter.grad.detach().clone() for parameter in layer.experts.parameters()
     ]
-
-    if len(received_rows) != 1:
-        raise AssertionError(f"rank {rank} unexpected dispatched rows: {received_rows}")
-    if rank == world_size - 1:
-        if received_rows != [0]:
-            raise AssertionError(f"zero-receive rank got {received_rows}")
-        if torch.count_nonzero(actual).item() == 0:
-            raise AssertionError("zero-receive rank lost its inverse-A2A token outputs")
-    elif received_rows[0] == 0:
-        raise AssertionError(f"active expert rank {rank} received no assignments")
 
     forward_error_sq = (actual.float() - reference.float()).square().sum()
     reference_sq = reference.float().square().sum()
@@ -220,7 +213,30 @@ def main() -> None:
         )
     parameter_grad_error = _global_max(parameter_grad_error)
 
-    if forward_rel_l2.item() >= 0.35:
+    received = torch.tensor(
+        received_rows if len(received_rows) == 1 else [-1], device="cuda", dtype=torch.int64
+    )
+    received_tensors = [torch.empty_like(received) for _ in range(world_size)]
+    torch.distributed.all_gather(received_tensors, received)
+    received_by_rank = [value.item() for value in received_tensors]
+    output_nonzero = torch.tensor(
+        [int(torch.count_nonzero(actual).item() > 0)], device="cuda", dtype=torch.int32
+    )
+    output_nonzero_tensors = [torch.empty_like(output_nonzero) for _ in range(world_size)]
+    torch.distributed.all_gather(output_nonzero_tensors, output_nonzero)
+    output_nonzero_by_rank = [value.item() for value in output_nonzero_tensors]
+
+    if bias is not None:
+        raise AssertionError("unexpected expert bias")
+    if any(received <= 0 for received in received_by_rank[:-1]):
+        raise AssertionError(f"active expert rank received no assignments: {received_by_rank}")
+    if received_by_rank[-1] != 0:
+        raise AssertionError(f"zero-receive rank got assignments: {received_by_rank}")
+    if sum(received_by_rank) != world_size * tokens * 2:
+        raise AssertionError(f"assignment count mismatch: {received_by_rank}")
+    if output_nonzero_by_rank[-1] != 1:
+        raise AssertionError("zero-receive rank lost its inverse-A2A token outputs")
+    if forward_rel_l2.item() >= 0.10:
         raise AssertionError(f"MXFP8 forward relative L2 too large: {forward_rel_l2.item():.6f}")
     if hidden_grad_error.item() >= 0.02:
         raise AssertionError(f"hidden surrogate gradient mismatch: {hidden_grad_error.item():.6f}")
@@ -236,7 +252,7 @@ def main() -> None:
             "FlashInfer all-to-all smoke passed: "
             f"world={world_size}, forward_rel_l2={forward_rel_l2.item():.6f}, "
             f"hidden_grad_max={hidden_grad_error.item():.6f}, "
-            f"route_grad_max={route_grad_error.item():.6f}, "
+            f"routing_logit_grad_max={route_grad_error.item():.6f}, "
             f"parameter_grad_max={parameter_grad_error.item():.6f}"
         )
 
