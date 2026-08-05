@@ -19,6 +19,8 @@ from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
     TERowParallelGroupedLinear,
 )
+from megatron.core.fp4_utils import get_fp4_context
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP
@@ -130,7 +132,15 @@ def _forward(
     hidden = hidden_seed.detach().clone().requires_grad_()
     route_logits = logits_seed.detach().clone().requires_grad_()
     _install_route(layer, route_logits, route_ids)
-    output, bias = layer(hidden)
+    layer_no = layer.layer_number - 1
+    if layer.config.fp8:
+        quantization_context = get_fp8_context(layer.config, layer_no)
+    elif layer.config.fp4:
+        quantization_context = get_fp4_context(layer.config, layer_no)
+    else:
+        raise ValueError("FlashInfer MoE profile requires an FP8 or FP4 configuration")
+    with quantization_context:
+        output, bias = layer(hidden)
     if bias is not None:
         raise RuntimeError("unexpected expert bias")
     return output
