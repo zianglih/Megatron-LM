@@ -76,6 +76,10 @@ router -> Megatron dispatch -> FlashInfer local experts -> Megatron combine
 `allgather` uses `MoEAllGatherTokenDispatcher` unchanged. `alltoall` uses
 `MoEAlltoAllTokenDispatcher` unchanged. The plugin does not implement a
 collective, reconstruct routing, pad ranks, or reproduce the MoE layer forward.
+With the supported expert tensor parallel size of one, the latter dispatches
+hidden rows and router probabilities and combines expert outputs through
+Megatron's variable-split `torch.distributed.all_to_all_single`; autograd runs
+the inverse collective with the splits reversed.
 
 Megatron hands the expert module rows already sorted by local expert, their
 `tokens_per_expert`, and the corresponding differentiable routing
@@ -150,6 +154,14 @@ The surrogate is intentionally not the mathematical derivative of the fused
 quantized forward. The choice only controls which forward operands seed the
 BF16 recomputation.
 
+The local fused forward and grouped surrogate backward also use Megatron's
+existing conditional NVTX helpers. Fine-grained `flashinfer_moe` ranges cover
+input preparation, per-precision weight preparation, activation quantization,
+kernel input packing, the fused kernel, QDQ capture/save/restore, and the
+surrogate's input preparation, FC1, activation, FC2, and autograd work. They
+emit only when Megatron NVTX profiling is enabled, without introducing a
+plugin-specific profiling switch or any synchronization in production code.
+
 ## Supported surface
 
 - NVIDIA Blackwell (SM100 or newer)
@@ -179,6 +191,17 @@ paths, shared-expert preservation, and TE-driven runner selection. The
 distributed numerical test exercises both quantizations, BF16 boundary-layer
 execution, both Megatron dispatchers, and both backward operand settings.
 
+For its 4,096-token quantized MXFP8 and NVFP4 cases, the distributed test also
+emits non-gating performance diagnostics. It routes assignments evenly across
+all experts, warms up both dispatchers, and runs six uninstrumented timed steps
+per dispatcher in alternating `allgather`/`alltoall` order. It reports every
+synchronized max-rank sample, median/min/max end-to-end forward-and-backward
+latency, cross-rank skew, global token and routed-assignment throughput, and the
+direct latency ratio. One excluded replay per dispatcher then enables
+Megatron's NVTX profiling so the production ranges above can be inspected in
+Nsight without contaminating the reported timing. These diagnostics have no
+pass/fail thresholds and are not performance guarantees.
+
 Run the focused suite with:
 
 ```bash
@@ -186,7 +209,7 @@ python3 -m pytest -q tests/unit_tests/extension/test_flashinfer_moe.py
 
 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 \
 python3 -m torch.distributed.run --standalone --nproc_per_node=8 \
-  -m pytest -q -x tests/unit_tests/extension/test_flashinfer_moe.py \
+  -m pytest -q -s -x tests/unit_tests/extension/test_flashinfer_moe.py \
   -k test_flashinfer_routed_forward_and_surrogate_backward
 ```
 

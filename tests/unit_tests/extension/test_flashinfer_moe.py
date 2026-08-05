@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+import statistics
+import time
 import types
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -10,7 +12,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, utils as core_utils
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
     TERowParallelGroupedLinear,
@@ -1429,6 +1431,24 @@ def _distributed_routing_ids(
     return ((bases.unsqueeze(1) + slot_ids) % active_experts).contiguous()
 
 
+def _balanced_distributed_routing_ids(
+    rank: int, world_size: int, num_tokens: int, num_experts: int, top_k: int
+) -> torch.Tensor:
+    """Route benchmark assignments evenly across every global expert."""
+
+    if top_k > num_experts:
+        raise ValueError(f"top_k={top_k} exceeds num_experts={num_experts}")
+    total_assignments = world_size * num_tokens * top_k
+    if total_assignments % num_experts:
+        raise ValueError(
+            f"{total_assignments} benchmark assignments cannot balance over {num_experts} experts"
+        )
+    token_ids = torch.arange(num_tokens, device="cuda", dtype=torch.long)
+    slot_ids = torch.arange(top_k, device="cuda", dtype=torch.long)
+    bases = (rank * num_tokens + token_ids) * top_k
+    return ((bases.unsqueeze(1) + slot_ids) % num_experts).contiguous()
+
+
 def _install_distributed_route(
     layer: MoELayer, route_logits: torch.Tensor, route_ids: torch.Tensor
 ) -> None:
@@ -1544,6 +1564,14 @@ def _dequantized_flashinfer_apply(
     return result.output.detach() + (surrogate - surrogate.detach())
 
 
+def _distributed_layer_precision_context(layer: MoELayer, layer_no: int):
+    if layer.config.fp8 is not None:
+        return get_fp8_context(layer.config, layer_no)
+    if layer.config.fp4 is not None:
+        return get_fp4_context(layer.config, layer_no)
+    raise ValueError("distributed FlashInfer MoE test requires FP8 or FP4 context")
+
+
 def _run_distributed_layer_once(
     layer: MoELayer,
     hidden_seed: torch.Tensor,
@@ -1571,12 +1599,7 @@ def _run_distributed_layer_once(
 
     try:
         with ExitStack() as stack:
-            if layer.config.fp8 is not None:
-                stack.enter_context(get_fp8_context(layer.config, layer_no))
-            elif layer.config.fp4 is not None:
-                stack.enter_context(get_fp4_context(layer.config, layer_no))
-            else:
-                raise ValueError("distributed FlashInfer MoE test requires FP8 or FP4 context")
+            stack.enter_context(_distributed_layer_precision_context(layer, layer_no))
             if surrogate_reference == "bf16":
                 stack.enter_context(
                     mock.patch.object(
@@ -1620,6 +1643,199 @@ def _run_distributed_layer_once(
         parameter_grads=parameter_grads,
         missing_grads=missing_grads,
         received_rows=received_rows,
+    )
+
+
+def _assert_distributed_case_consensus(group, fingerprint):
+    """Fail symmetrically if independent pytest ranks select different cases."""
+
+    local_fingerprint = torch.tensor(fingerprint, device="cuda", dtype=torch.int64)
+    gathered = [torch.empty_like(local_fingerprint) for _ in range(group.size())]
+    torch.distributed.all_gather(gathered, local_fingerprint, group=group)
+    if any(not torch.equal(candidate, local_fingerprint) for candidate in gathered):
+        raise RuntimeError(
+            "distributed FlashInfer performance case mismatch across ranks: "
+            f"{[candidate.tolist() for candidate in gathered]}"
+        )
+
+
+def _run_distributed_performance_step(
+    layer: MoELayer,
+    hidden_seed: torch.Tensor,
+    logits_seed: torch.Tensor,
+    grad_seed: torch.Tensor,
+    route_ids: torch.Tensor,
+    *,
+    layer_no: int,
+    group,
+    nvtx_profile_label: str | None = None,
+) -> float:
+    """Run one synchronized step; input setup and the barrier are not timed."""
+
+    layer.zero_grad(set_to_none=True)
+    hidden = hidden_seed.detach().clone().requires_grad_()
+    route_logits = logits_seed.detach().clone().requires_grad_()
+    _install_distributed_route(layer, route_logits, route_ids)
+
+    torch.cuda.synchronize()
+    torch.distributed.barrier(group=group)
+    torch.cuda.synchronize()
+    wall_start = time.perf_counter()
+    if nvtx_profile_label is not None:
+        core_utils.nvtx_range_push(msg="flashinfer_moe_perf", suffix=nvtx_profile_label)
+    try:
+        with _distributed_layer_precision_context(layer, layer_no):
+            output, _ = layer(hidden)
+        torch.autograd.backward(output, grad_seed)
+        torch.cuda.synchronize()
+    finally:
+        if nvtx_profile_label is not None:
+            core_utils.nvtx_range_pop(msg="flashinfer_moe_perf", suffix=nvtx_profile_label)
+    step_wall_ms = (time.perf_counter() - wall_start) * 1e3
+
+    del hidden, route_logits, output
+    layer.zero_grad(set_to_none=True)
+    return step_wall_ms
+
+
+def _distributed_critical_time(local_step_ms: float, group) -> tuple[float, float]:
+    local = torch.tensor([local_step_ms], device="cuda", dtype=torch.float64)
+    maximum = local.clone()
+    minimum = local.clone()
+    torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX, group=group)
+    torch.distributed.all_reduce(minimum, op=torch.distributed.ReduceOp.MIN, group=group)
+    return maximum.item(), maximum.item() - minimum.item()
+
+
+def _benchmark_distributed_layers(
+    layers,
+    hidden_seed: torch.Tensor,
+    logits_seed: torch.Tensor,
+    grad_seed: torch.Tensor,
+    route_ids: torch.Tensor,
+    *,
+    layer_no: int,
+    top_k: int,
+    iterations: int = 6,
+):
+    """Compare dispatchers without instrumentation, then emit one NVTX replay."""
+
+    dispatchers = ("allgather", "alltoall")
+    group = layers["allgather"].token_dispatcher.ep_group
+    nvtx_stack_depth = len(core_utils._nvtx_range_messages)
+    critical_samples = {dispatcher: [] for dispatcher in dispatchers}
+    rank_skew_samples = {dispatcher: [] for dispatcher in dispatchers}
+    with mock.patch.object(core_utils, "_nvtx_enabled", False):
+        for dispatcher in dispatchers:
+            _run_distributed_performance_step(
+                layers[dispatcher],
+                hidden_seed,
+                logits_seed,
+                grad_seed,
+                route_ids,
+                layer_no=layer_no,
+                group=group,
+            )
+        for iteration in range(iterations):
+            execution_order = dispatchers if iteration % 2 == 0 else tuple(reversed(dispatchers))
+            for dispatcher in execution_order:
+                local_step_ms = _run_distributed_performance_step(
+                    layers[dispatcher],
+                    hidden_seed,
+                    logits_seed,
+                    grad_seed,
+                    route_ids,
+                    layer_no=layer_no,
+                    group=group,
+                )
+                critical_ms, rank_skew_ms = _distributed_critical_time(local_step_ms, group)
+                critical_samples[dispatcher].append(critical_ms)
+                rank_skew_samples[dispatcher].append(rank_skew_ms)
+    assert len(core_utils._nvtx_range_messages) == nvtx_stack_depth
+
+    with mock.patch.object(core_utils, "_nvtx_enabled", True):
+        for dispatcher in dispatchers:
+            _run_distributed_performance_step(
+                layers[dispatcher],
+                hidden_seed,
+                logits_seed,
+                grad_seed,
+                route_ids,
+                layer_no=layer_no,
+                group=group,
+                nvtx_profile_label=f"{dispatcher}_profile_step",
+            )
+    assert len(core_utils._nvtx_range_messages) == nvtx_stack_depth
+
+    global_tokens = group.size() * hidden_seed.shape[0]
+    results = {}
+    for dispatcher in dispatchers:
+        step_median_ms = statistics.median(critical_samples[dispatcher])
+        results[dispatcher] = SimpleNamespace(
+            iterations=iterations,
+            step_samples_ms=critical_samples[dispatcher],
+            rank_skew_samples_ms=rank_skew_samples[dispatcher],
+            step_median_ms=step_median_ms,
+            step_min_ms=min(critical_samples[dispatcher]),
+            step_max_ms=max(critical_samples[dispatcher]),
+            rank_skew_median_ms=statistics.median(rank_skew_samples[dispatcher]),
+            global_tokens=global_tokens,
+            global_tokens_per_s=global_tokens / (step_median_ms * 1e-3),
+            routed_assignments_per_s=global_tokens * top_k / (step_median_ms * 1e-3),
+        )
+    return results
+
+
+def _report_distributed_performance(
+    performance,
+    *,
+    configured_precision: str,
+    execution_precision: str,
+    num_tokens: int,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+):
+    """Print paired, non-gating dispatcher measurements."""
+
+    for dispatcher in ("allgather", "alltoall"):
+        result = performance[dispatcher]
+        samples = "/".join(f"{sample:.3f}" for sample in result.step_samples_ms)
+        rank_skews = "/".join(f"{sample:.3f}" for sample in result.rank_skew_samples_ms)
+        print(
+            "FlashInfer distributed perf (non-gating): "
+            f"configured={configured_precision}, execution={execution_precision}, "
+            f"dispatcher={dispatcher}, backward_mode={HIGH_PRECISION_BACKWARD}, "
+            "routing=balanced, measurement=uninstrumented, order=alternating, "
+            f"tokens_per_rank={num_tokens}, global_tokens={result.global_tokens}, "
+            f"num_experts={num_experts}, hidden_size={hidden_size}, "
+            f"intermediate_size={intermediate_size}, top_k={top_k}, "
+            f"iterations={result.iterations}, step_samples_ms={samples}, "
+            f"step_median_ms={result.step_median_ms:.3f}, "
+            f"step_min_ms={result.step_min_ms:.3f}, "
+            f"step_max_ms={result.step_max_ms:.3f}, "
+            f"rank_skew_samples_ms={rank_skews}, "
+            f"rank_skew_median_ms={result.rank_skew_median_ms:.3f}, "
+            f"global_tokens_per_s={result.global_tokens_per_s:.1f}, "
+            f"routed_assignments_per_s={result.routed_assignments_per_s:.1f}, "
+            "nvtx_profile_replays=1",
+            flush=True,
+        )
+
+    allgather = performance["allgather"]
+    alltoall = performance["alltoall"]
+    print(
+        "FlashInfer distributed perf comparison (non-gating): "
+        f"configured={configured_precision}, execution={execution_precision}, "
+        "routing=balanced, measurement=uninstrumented, order=alternating, "
+        f"tokens_per_rank={num_tokens}, global_tokens={allgather.global_tokens}, "
+        f"top_k={top_k}, allgather_step_ms={allgather.step_median_ms:.3f}, "
+        f"alltoall_step_ms={alltoall.step_median_ms:.3f}, "
+        "alltoall_speedup="
+        f"{allgather.step_median_ms / alltoall.step_median_ms:.3f}, "
+        "speedup_definition=allgather_step_ms/alltoall_step_ms",
+        flush=True,
     )
 
 
@@ -1749,6 +1965,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
     high_precision = None
     dequantized_reference = None
     dequantized = None
+    performance = None
     run_completed = False
 
     try:
@@ -1764,7 +1981,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
                 f"test has no precision-config branch for {precision_case.configured!r}"
             )
 
-        def build_layer(backward_mode):
+        def build_layer(backward_mode, dispatcher_type=moe_token_dispatcher_type):
             monkeypatch.setenv("NVTE_BACKWARD_OVERRIDE", backward_mode)
             torch.manual_seed(1234)
             model_parallel_cuda_manual_seed(1234)
@@ -1777,7 +1994,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
                 moe_router_topk=top_k,
                 moe_router_pre_softmax=True,
                 moe_router_load_balancing_type="none",
-                moe_token_dispatcher_type=moe_token_dispatcher_type,
+                moe_token_dispatcher_type=dispatcher_type,
                 moe_grouped_gemm=True,
                 moe_permute_fusion=False,
                 moe_router_dtype="fp32",
@@ -1818,6 +2035,26 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         )
         state_keys_before = tuple(
             tuple(candidate.state_dict()) for candidate in (high_precision_layer, dequantized_layer)
+        )
+        benchmark_case = (
+            num_tokens == 4096
+            and precision_case.execution in ("mxfp8", "nvfp4")
+            and moe_token_dispatcher_type == "allgather"
+        )
+        _assert_distributed_case_consensus(
+            high_precision_layer.token_dispatcher.ep_group,
+            (
+                num_tokens,
+                num_experts,
+                hidden_size,
+                intermediate_size,
+                top_k,
+                ("mxfp8", "nvfp4").index(precision_case.configured),
+                ("bf16", "mxfp8", "nvfp4").index(precision_case.execution),
+                ("allgather", "alltoall").index(moe_token_dispatcher_type),
+                precision_case.layer_no,
+                int(benchmark_case),
+            ),
         )
 
         torch.manual_seed(5678 + rank)
@@ -1868,6 +2105,23 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             dispatch_mode=moe_token_dispatcher_type,
             layer_no=precision_case.layer_no,
         )
+
+        if benchmark_case:
+            alltoall_layer = build_layer(HIGH_PRECISION_BACKWARD, "alltoall")
+            alltoall_layer.load_state_dict(high_precision_layer.state_dict())
+            balanced_route_ids = _balanced_distributed_routing_ids(
+                rank, world_size, num_tokens, num_experts, top_k
+            )
+            performance = _benchmark_distributed_layers(
+                {"allgather": high_precision_layer, "alltoall": alltoall_layer},
+                hidden_seed,
+                logits_seed,
+                grad_seed,
+                balanced_route_ids,
+                layer_no=precision_case.layer_no,
+                top_k=top_k,
+            )
+            del alltoall_layer
 
         forward_error_sq = (high_precision.output.float() - reference.output.float()).square().sum()
         reference_sq = reference.output.float().square().sum()
@@ -2035,6 +2289,18 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             runner_cache_cleared,
             parameter_ownership_unchanged,
         )
+        if rank == 0 and performance is not None:
+            _report_distributed_performance(
+                performance,
+                configured_precision=precision_case.configured,
+                execution_precision=precision_case.execution,
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                top_k=top_k,
+            )
+        torch.distributed.barrier(group=high_precision_layer.token_dispatcher.ep_group)
         torch.cuda.synchronize()
         run_completed = True
     finally:

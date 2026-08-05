@@ -25,6 +25,7 @@ import importlib
 import logging
 import os
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
 from types import ModuleType
@@ -41,12 +42,18 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.transformer.moe.experts import TEGroupedMLP, _MoEActivationInFP32
 from megatron.core.transformer.spec_utils import ModuleSpec, get_module
-from megatron.core.utils import get_pg_rank, log_single_rank
+from megatron.core.utils import (
+    get_pg_rank,
+    log_single_rank,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 logger = logging.getLogger(__name__)
 
 _ENV = "MILES_USE_FLASHINFER_MOE"
 _BACKWARD_OVERRIDE_ENV = "NVTE_BACKWARD_OVERRIDE"
+_NVTX_MESSAGE = "flashinfer_moe"
 HIGH_PRECISION_BACKWARD = "high_precision"
 DEQUANTIZED_BACKWARD = "dequantized"
 _LOGGED_LAYERS: set[tuple[str, str, str]] = set()
@@ -58,6 +65,17 @@ _TE_NVFP4_ROW_ALIGNMENT = 16
 # temporarily rebinds their parameters. This does not make the runner generally
 # thread-safe; it only keeps one replay's shell state internally consistent.
 _BF16_SURROGATE_LOCK = threading.Lock()
+
+
+@contextmanager
+def _flashinfer_nvtx_range(suffix: str):
+    """Use Megatron's opt-in NVTX switch without a plugin-specific control."""
+
+    nvtx_range_push(msg=_NVTX_MESSAGE, suffix=suffix)
+    try:
+        yield
+    finally:
+        nvtx_range_pop(msg=_NVTX_MESSAGE, suffix=suffix)
 
 
 @dataclass(frozen=True)
@@ -449,9 +467,10 @@ class FlashInferGroupedMLP(TEGroupedMLP):
     ):
         """Run FlashInfer on assignments already dispatched to local experts."""
 
-        return _run_dispatched_flashinfer_moe(
-            self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
-        )
+        with _flashinfer_nvtx_range("routed_experts_forward"):
+            return _run_dispatched_flashinfer_moe(
+                self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
+            )
 
     def backward_dw(self):
         """Custom autograd produces weight gradients without delayed TE work."""
@@ -737,17 +756,20 @@ class _BF16GroupedMLPSurrogate:
         with _BF16_SURROGATE_LOCK:
             self._initialize(hidden_states.device)
             assert self._fc1 is not None and self._fc2 is not None
-            fc1_output = self._fc1(hidden_states, splits, w13_gate_up)
-            if activation_in_fp32:
-                activated = _MoEActivationInFP32.apply(fc1_output, topk_weights, 0.0)
-            elif fused_activation:
-                activated = weighted_bias_swiglu_impl(
-                    fc1_output, None, topk_weights, fp8_input_store=False
-                )
-            else:
-                gate, up = fc1_output.chunk(2, dim=-1)
-                activated = (F.silu(gate) * up * topk_weights).to(fc1_output.dtype)
-            return self._fc2(activated, splits, w2)
+            with _flashinfer_nvtx_range("surrogate_fc1"):
+                fc1_output = self._fc1(hidden_states, splits, w13_gate_up)
+            with _flashinfer_nvtx_range("surrogate_activation"):
+                if activation_in_fp32:
+                    activated = _MoEActivationInFP32.apply(fc1_output, topk_weights, 0.0)
+                elif fused_activation:
+                    activated = weighted_bias_swiglu_impl(
+                        fc1_output, None, topk_weights, fp8_input_store=False
+                    )
+                else:
+                    gate, up = fc1_output.chunk(2, dim=-1)
+                    activated = (F.silu(gate) * up * topk_weights).to(fc1_output.dtype)
+            with _flashinfer_nvtx_range("surrogate_fc2"):
+                return self._fc2(activated, splits, w2)
 
 
 class _FlashInferRunnerBase:
@@ -894,33 +916,36 @@ class _FlashInferBF16Runner(_FlashInferRunnerBase):
                 "FlashInfer BF16 MoE has no dequantized operands; "
                 f"got backward mode {backward_mode!r}"
             )
-        prepared = self._prepare_weights(w13_gate_up, w2, weight_key)
-        packed_topk = _pack_topk_ids(topk_ids, topk_weights)
-        tune_max_tokens = 1 << max(hidden_states.shape[0] - 1, 0).bit_length()
-        output = flashinfer.fused_moe.trtllm_bf16_routed_moe(
-            topk_ids=packed_topk,
-            hidden_states=hidden_states,
-            gemm1_weights=prepared.gemm1_weights,
-            gemm2_weights=prepared.gemm2_weights,
-            num_experts=self.num_experts,
-            top_k=topk_ids.shape[1],
-            n_group=None,
-            topk_group=None,
-            intermediate_size=self.intermediate_size,
-            local_expert_offset=self.local_expert_offset,
-            local_num_experts=self.local_num_experts,
-            routed_scaling_factor=1.0,
-            routing_method_type=flashinfer.api.RoutingMethodType.TopK.value,
-            use_shuffled_weight=True,
-            weight_layout=flashinfer.tllm_enums.WeightLayout.BlockMajorK.value,
-            do_finalize=True,
-            enable_pdl=(
-                hidden_states.shape[0] <= 8192
-                and flashinfer.utils.device_support_pdl(hidden_states.device)
-            ),
-            tune_max_num_tokens=tune_max_tokens,
-            activation_type=flashinfer.api.ActivationType.Swiglu.value,
-        )
+        with _flashinfer_nvtx_range("weight_prepare_bf16"):
+            prepared = self._prepare_weights(w13_gate_up, w2, weight_key)
+        with _flashinfer_nvtx_range("kernel_input_pack_bf16"):
+            packed_topk = _pack_topk_ids(topk_ids, topk_weights)
+            tune_max_tokens = 1 << max(hidden_states.shape[0] - 1, 0).bit_length()
+        with _flashinfer_nvtx_range("fused_kernel_bf16"):
+            output = flashinfer.fused_moe.trtllm_bf16_routed_moe(
+                topk_ids=packed_topk,
+                hidden_states=hidden_states,
+                gemm1_weights=prepared.gemm1_weights,
+                gemm2_weights=prepared.gemm2_weights,
+                num_experts=self.num_experts,
+                top_k=topk_ids.shape[1],
+                n_group=None,
+                topk_group=None,
+                intermediate_size=self.intermediate_size,
+                local_expert_offset=self.local_expert_offset,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=1.0,
+                routing_method_type=flashinfer.api.RoutingMethodType.TopK.value,
+                use_shuffled_weight=True,
+                weight_layout=flashinfer.tllm_enums.WeightLayout.BlockMajorK.value,
+                do_finalize=True,
+                enable_pdl=(
+                    hidden_states.shape[0] <= 8192
+                    and flashinfer.utils.device_support_pdl(hidden_states.device)
+                ),
+                tune_max_num_tokens=tune_max_tokens,
+                activation_type=flashinfer.api.ActivationType.Swiglu.value,
+            )
         return _FlashInferForwardResult(
             output=output, backward_hidden_states=None, backward_w13=None, backward_w2=None
         )
@@ -1115,49 +1140,54 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
         backward_mode: str,
     ) -> _FlashInferForwardResult:
         flashinfer = _flashinfer_modules()
-        prepared = self._prepare_weights(w13_gate_up, w2, weight_key, backward_mode)
-        hidden_q, hidden_sf = flashinfer.api.mxfp8_quantize(
-            hidden_states.contiguous(), False, backend="cute-dsl"
-        )
-        hidden_sf = hidden_sf.view(torch.uint8).reshape(
-            hidden_states.shape[0], self.hidden_size // _MXFP8_GROUP_SIZE
-        )
-        packed_topk = _pack_topk_ids(topk_ids, topk_weights)
-        tune_max_tokens = 1 << max(hidden_states.shape[0] - 1, 0).bit_length()
-        output = flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(
-            topk_ids=packed_topk,
-            routing_bias=None,
-            hidden_states=hidden_q,
-            hidden_states_scale=hidden_sf,
-            gemm1_weights=prepared.gemm1_weights,
-            gemm1_weights_scale=prepared.gemm1_scales,
-            gemm2_weights=prepared.gemm2_weights,
-            gemm2_weights_scale=prepared.gemm2_scales,
-            num_experts=self.num_experts,
-            top_k=topk_ids.shape[1],
-            n_group=None,
-            topk_group=None,
-            intermediate_size=self.intermediate_size,
-            local_expert_offset=self.local_expert_offset,
-            local_num_experts=self.local_num_experts,
-            routed_scaling_factor=1.0,
-            routing_method_type=flashinfer.api.RoutingMethodType.TopK.value,
-            use_shuffled_weight=True,
-            weight_layout=flashinfer.tllm_enums.WeightLayout.MajorK.value,
-            do_finalize=True,
-            enable_pdl=(
-                hidden_states.shape[0] <= 8192
-                and flashinfer.utils.device_support_pdl(hidden_states.device)
-            ),
-            tune_max_num_tokens=tune_max_tokens,
-            fp8_quantization_type=flashinfer.fused_moe.Fp8QuantizationType.MxFp8,
-            activation_type=flashinfer.api.ActivationType.Swiglu.value,
-        )
+        with _flashinfer_nvtx_range("weight_prepare_mxfp8"):
+            prepared = self._prepare_weights(w13_gate_up, w2, weight_key, backward_mode)
+        with _flashinfer_nvtx_range("activation_quantize_mxfp8"):
+            hidden_q, hidden_sf = flashinfer.api.mxfp8_quantize(
+                hidden_states.contiguous(), False, backend="cute-dsl"
+            )
+            hidden_sf = hidden_sf.view(torch.uint8).reshape(
+                hidden_states.shape[0], self.hidden_size // _MXFP8_GROUP_SIZE
+            )
+        with _flashinfer_nvtx_range("kernel_input_pack_mxfp8"):
+            packed_topk = _pack_topk_ids(topk_ids, topk_weights)
+            tune_max_tokens = 1 << max(hidden_states.shape[0] - 1, 0).bit_length()
+        with _flashinfer_nvtx_range("fused_kernel_mxfp8"):
+            output = flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(
+                topk_ids=packed_topk,
+                routing_bias=None,
+                hidden_states=hidden_q,
+                hidden_states_scale=hidden_sf,
+                gemm1_weights=prepared.gemm1_weights,
+                gemm1_weights_scale=prepared.gemm1_scales,
+                gemm2_weights=prepared.gemm2_weights,
+                gemm2_weights_scale=prepared.gemm2_scales,
+                num_experts=self.num_experts,
+                top_k=topk_ids.shape[1],
+                n_group=None,
+                topk_group=None,
+                intermediate_size=self.intermediate_size,
+                local_expert_offset=self.local_expert_offset,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=1.0,
+                routing_method_type=flashinfer.api.RoutingMethodType.TopK.value,
+                use_shuffled_weight=True,
+                weight_layout=flashinfer.tllm_enums.WeightLayout.MajorK.value,
+                do_finalize=True,
+                enable_pdl=(
+                    hidden_states.shape[0] <= 8192
+                    and flashinfer.utils.device_support_pdl(hidden_states.device)
+                ),
+                tune_max_num_tokens=tune_max_tokens,
+                fp8_quantization_type=flashinfer.fused_moe.Fp8QuantizationType.MxFp8,
+                activation_type=flashinfer.api.ActivationType.Swiglu.value,
+            )
         backward_hidden_states = None
         if backward_mode == DEQUANTIZED_BACKWARD:
-            backward_hidden_states = _mxfp8_activation_storage(
-                hidden_q, hidden_sf, dtype=hidden_states.dtype
-            )
+            with _flashinfer_nvtx_range("qdq_capture_mxfp8"):
+                backward_hidden_states = _mxfp8_activation_storage(
+                    hidden_q, hidden_sf, dtype=hidden_states.dtype
+                )
         return _FlashInferForwardResult(
             output=output,
             backward_hidden_states=backward_hidden_states,
@@ -1407,70 +1437,75 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
         backward_mode: str,
     ) -> _FlashInferForwardResult:
         flashinfer = _flashinfer_modules()
-        prepared = self._prepare_weights(w13_gate_up, w2, weight_key, backward_mode)
-        e4m3_max = self._e4m3_max()
-        input_global_scale = torch.full(
-            (1,), 1.0 / (e4m3_max * 6.0), dtype=torch.float32, device=hidden_states.device
-        )
-        hidden_fp4, hidden_scales, per_token_scale = flashinfer.api.nvfp4_quantize(
-            hidden_states.contiguous(),
-            input_global_scale,
-            sfLayout=flashinfer.api.SfLayout.layout_linear,
-            per_token_activation=True,
-            backend="cuda",
-        )
-        hidden_fp4 = hidden_fp4.reshape(hidden_states.shape[0], self.hidden_size // 2)
-        hidden_scales = hidden_scales.view(torch.float8_e4m3fn).reshape(
-            hidden_states.shape[0], self.hidden_size // 16
-        )
-        packed_topk = _pack_topk_ids(topk_ids, topk_weights)
-        tune_max_tokens = 1 << max(hidden_states.shape[0] - 1, 0).bit_length()
+        with _flashinfer_nvtx_range("weight_prepare_nvfp4"):
+            prepared = self._prepare_weights(w13_gate_up, w2, weight_key, backward_mode)
+        with _flashinfer_nvtx_range("activation_quantize_nvfp4"):
+            e4m3_max = self._e4m3_max()
+            input_global_scale = torch.full(
+                (1,), 1.0 / (e4m3_max * 6.0), dtype=torch.float32, device=hidden_states.device
+            )
+            hidden_fp4, hidden_scales, per_token_scale = flashinfer.api.nvfp4_quantize(
+                hidden_states.contiguous(),
+                input_global_scale,
+                sfLayout=flashinfer.api.SfLayout.layout_linear,
+                per_token_activation=True,
+                backend="cuda",
+            )
+            hidden_fp4 = hidden_fp4.reshape(hidden_states.shape[0], self.hidden_size // 2)
+            hidden_scales = hidden_scales.view(torch.float8_e4m3fn).reshape(
+                hidden_states.shape[0], self.hidden_size // 16
+            )
+        with _flashinfer_nvtx_range("kernel_input_pack_nvfp4"):
+            packed_topk = _pack_topk_ids(topk_ids, topk_weights)
+            tune_max_tokens = 1 << max(hidden_states.shape[0] - 1, 0).bit_length()
 
-        output = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
-            topk_ids=packed_topk,
-            routing_bias=None,
-            hidden_states=hidden_fp4,
-            hidden_states_scale=hidden_scales,
-            gemm1_weights=prepared.gemm1_weights,
-            gemm1_weights_scale=prepared.gemm1_scales,
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
-            gemm2_weights=prepared.gemm2_weights,
-            gemm2_weights_scale=prepared.gemm2_scales,
-            gemm2_bias=None,
-            output1_scale_scalar=prepared.output1_scale,
-            output1_scale_gate_scalar=prepared.output1_gate_scale,
-            output2_scale_scalar=prepared.output2_scale,
-            per_token_scale=per_token_scale,
-            num_experts=self.num_experts,
-            top_k=topk_ids.shape[1],
-            n_group=0,
-            topk_group=0,
-            intermediate_size=self.intermediate_size,
-            local_expert_offset=self.local_expert_offset,
-            local_num_experts=self.local_num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=1,
-            do_finalize=True,
-            activation_type=flashinfer.api.ActivationType.Swiglu.value,
-            tune_max_num_tokens=tune_max_tokens,
-            enable_pdl=(
-                hidden_states.shape[0] <= 8192
-                and flashinfer.utils.device_support_pdl(hidden_states.device)
-            ),
-        )[0]
+        with _flashinfer_nvtx_range("fused_kernel_nvfp4"):
+            output = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
+                topk_ids=packed_topk,
+                routing_bias=None,
+                hidden_states=hidden_fp4,
+                hidden_states_scale=hidden_scales,
+                gemm1_weights=prepared.gemm1_weights,
+                gemm1_weights_scale=prepared.gemm1_scales,
+                gemm1_bias=None,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=None,
+                gemm2_weights=prepared.gemm2_weights,
+                gemm2_weights_scale=prepared.gemm2_scales,
+                gemm2_bias=None,
+                output1_scale_scalar=prepared.output1_scale,
+                output1_scale_gate_scalar=prepared.output1_gate_scale,
+                output2_scale_scalar=prepared.output2_scale,
+                per_token_scale=per_token_scale,
+                num_experts=self.num_experts,
+                top_k=topk_ids.shape[1],
+                n_group=0,
+                topk_group=0,
+                intermediate_size=self.intermediate_size,
+                local_expert_offset=self.local_expert_offset,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=1,
+                do_finalize=True,
+                activation_type=flashinfer.api.ActivationType.Swiglu.value,
+                tune_max_num_tokens=tune_max_tokens,
+                enable_pdl=(
+                    hidden_states.shape[0] <= 8192
+                    and flashinfer.utils.device_support_pdl(hidden_states.device)
+                ),
+            )[0]
         backward_hidden_states = None
         if backward_mode == DEQUANTIZED_BACKWARD:
-            backward_hidden_states = _nvfp4_activation_storage(
-                hidden_fp4,
-                hidden_scales,
-                per_token_scale,
-                dtype=hidden_states.dtype,
-                e4m3_max=int(e4m3_max),
-                use_4over6=os.environ.get("FLASHINFER_NVFP4_4OVER6") == "1",
-            )
+            with _flashinfer_nvtx_range("qdq_capture_nvfp4"):
+                backward_hidden_states = _nvfp4_activation_storage(
+                    hidden_fp4,
+                    hidden_scales,
+                    per_token_scale,
+                    dtype=hidden_states.dtype,
+                    e4m3_max=int(e4m3_max),
+                    use_4over6=os.environ.get("FLASHINFER_NVFP4_4OVER6") == "1",
+                )
         return _FlashInferForwardResult(
             output=output,
             backward_hidden_states=backward_hidden_states,
@@ -1561,49 +1596,60 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
         if backward_mode == HIGH_PRECISION_BACKWARD:
             ctx.save_for_backward(hidden_states, topk_weights, *expert_weights)
         elif backward_mode == DEQUANTIZED_BACKWARD:
-            backward_hidden_states = result.backward_hidden_states
-            backward_w13 = result.backward_w13
-            backward_w2 = result.backward_w2
-            if any(
-                tensor is None for tensor in (backward_hidden_states, backward_w13, backward_w2)
-            ):
-                raise RuntimeError(
-                    "FlashInfer MoE dequantized backward is missing a forward operand"
+            with _flashinfer_nvtx_range("qdq_save"):
+                backward_hidden_states = result.backward_hidden_states
+                backward_w13 = result.backward_w13
+                backward_w2 = result.backward_w2
+                if any(
+                    tensor is None for tensor in (backward_hidden_states, backward_w13, backward_w2)
+                ):
+                    raise RuntimeError(
+                        "FlashInfer MoE dequantized backward is missing a forward operand"
+                    )
+                ctx.backward_dtype = hidden_states.dtype
+                quantized_operands = (
+                    _quantized_storage_shell(backward_hidden_states),
+                    topk_weights,
                 )
-            ctx.backward_dtype = hidden_states.dtype
-            quantized_operands = (_quantized_storage_shell(backward_hidden_states), topk_weights)
-            (tensors_to_save, tensor_objects) = _te_quantized_tensor().prepare_for_saving(
-                *quantized_operands
-            )
-            ctx.quantized_tensor_count = len(tensors_to_save)
-            ctx.save_for_backward(*tensors_to_save, *backward_w13, *backward_w2)
-            ctx.tensor_objects = tensor_objects
-            ctx.saved_quantized_operands = True
+                (tensors_to_save, tensor_objects) = _te_quantized_tensor().prepare_for_saving(
+                    *quantized_operands
+                )
+                ctx.quantized_tensor_count = len(tensors_to_save)
+                ctx.save_for_backward(*tensors_to_save, *backward_w13, *backward_w2)
+                ctx.tensor_objects = tensor_objects
+                ctx.saved_quantized_operands = True
         else:
             raise ValueError(f"Unsupported FlashInfer MoE backward mode {backward_mode!r}")
         return result.output
 
     @staticmethod
     def backward(ctx, grad_output):
+        with _flashinfer_nvtx_range("surrogate_backward"):
+            return _FlashInferForwardBF16Backward._backward(ctx, grad_output)
+
+    @staticmethod
+    def _backward(ctx, grad_output):
         # Forward mirrors are not backward operands. Release them before the
         # BF16 grouped replay to reduce its live-memory peak and ensure a
         # failed replay cannot leave optimizer-stale prepared weights cached.
-        ctx.runner.invalidate_weights()
-        if ctx.saved_quantized_operands:
-            tensor_objects = [
-                None if tensor_object is None else _quantized_storage_shell(tensor_object)
-                for tensor_object in ctx.tensor_objects
-            ]
-            restored = _te_quantized_tensor().restore_from_saved(
-                tensor_objects, ctx.saved_tensors[: ctx.quantized_tensor_count]
-            )
-            hidden_storage, topk_weights = restored
-            hidden_states = hidden_storage.dequantize(dtype=ctx.backward_dtype)
-            expert_weights = ctx.saved_tensors[ctx.quantized_tensor_count :]
-        else:
-            hidden_states, topk_weights, *expert_weights = ctx.saved_tensors
-        needs = ctx.needs_input_grad
-        weight_needs = needs[9:]
+        with _flashinfer_nvtx_range("backward_operand_restore"):
+            ctx.runner.invalidate_weights()
+            if ctx.saved_quantized_operands:
+                with _flashinfer_nvtx_range("qdq_restore"):
+                    tensor_objects = [
+                        None if tensor_object is None else _quantized_storage_shell(tensor_object)
+                        for tensor_object in ctx.tensor_objects
+                    ]
+                    restored = _te_quantized_tensor().restore_from_saved(
+                        tensor_objects, ctx.saved_tensors[: ctx.quantized_tensor_count]
+                    )
+                    hidden_storage, topk_weights = restored
+                    hidden_states = hidden_storage.dequantize(dtype=ctx.backward_dtype)
+                    expert_weights = ctx.saved_tensors[ctx.quantized_tensor_count :]
+            else:
+                hidden_states, topk_weights, *expert_weights = ctx.saved_tensors
+            needs = ctx.needs_input_grad
+            weight_needs = needs[9:]
         if hidden_states.shape[0] == 0:
             # Avoid launching a full BF16 expert recompute just to manufacture
             # explicit zeros on an EP rank with no dispatched assignments.
@@ -1624,33 +1670,36 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
             )
 
         with torch.enable_grad():
-            hidden_ref = hidden_states.detach().requires_grad_(needs[0])
-            weights_ref = topk_weights.detach().requires_grad_(needs[1])
-            w13_needs = weight_needs[: ctx.num_local_experts]
-            w2_needs = weight_needs[ctx.num_local_experts :]
-            w13_ref = tuple(
-                weight.detach().requires_grad_(any(w13_needs))
-                for weight in expert_weights[: ctx.num_local_experts]
-            )
-            w2_ref = tuple(
-                weight.detach().requires_grad_(any(w2_needs))
-                for weight in expert_weights[ctx.num_local_experts :]
-            )
-            output_ref = ctx.runner.bf16_surrogate(
-                hidden_ref,
-                weights_ref,
-                w13_ref,
-                w2_ref,
-                ctx.tokens_per_expert,
-                activation_in_fp32=ctx.activation_in_fp32,
-                fused_activation=ctx.fused_activation,
-            )
+            with _flashinfer_nvtx_range("surrogate_input_prep"):
+                hidden_ref = hidden_states.detach().requires_grad_(needs[0])
+                weights_ref = topk_weights.detach().requires_grad_(needs[1])
+                w13_needs = weight_needs[: ctx.num_local_experts]
+                w2_needs = weight_needs[ctx.num_local_experts :]
+                w13_ref = tuple(
+                    weight.detach().requires_grad_(any(w13_needs))
+                    for weight in expert_weights[: ctx.num_local_experts]
+                )
+                w2_ref = tuple(
+                    weight.detach().requires_grad_(any(w2_needs))
+                    for weight in expert_weights[ctx.num_local_experts :]
+                )
+            with _flashinfer_nvtx_range("surrogate_recompute"):
+                output_ref = ctx.runner.bf16_surrogate(
+                    hidden_ref,
+                    weights_ref,
+                    w13_ref,
+                    w2_ref,
+                    ctx.tokens_per_expert,
+                    activation_in_fp32=ctx.activation_in_fp32,
+                    fused_activation=ctx.fused_activation,
+                )
 
         expert_weight_refs = (*w13_ref, *w2_ref)
         grad_inputs = (hidden_ref, weights_ref, *expert_weight_refs)
         requested_mask = (needs[0], needs[1], *weight_needs)
         requested = [tensor for tensor, need in zip(grad_inputs, requested_mask) if need]
-        computed = torch.autograd.grad(output_ref, requested, grad_output, allow_unused=True)
+        with _flashinfer_nvtx_range("surrogate_autograd_grad"):
+            computed = torch.autograd.grad(output_ref, requested, grad_output, allow_unused=True)
         computed_iter = iter(computed)
         grads = []
         for tensor, need in zip(grad_inputs, requested_mask):
@@ -1741,31 +1790,33 @@ def _run_dispatched_flashinfer_moe(
 ) -> tuple[torch.Tensor, None]:
     """Run local experts after Megatron's native dispatcher has sorted assignments."""
 
-    dispatch_mode = experts._flashinfer_moe_dispatch_mode
-    execution_precision = _flashinfer_moe_execution_precision(experts)
-    requested_backward_mode = experts._flashinfer_moe_backward_mode
-    backward_mode = _flashinfer_moe_effective_backward_mode(
-        execution_precision, requested_backward_mode
-    )
-    if hidden_states.dtype != torch.bfloat16:
-        raise TypeError(f"FlashInfer MoE expects BF16 hidden states, got {hidden_states.dtype}")
-    if not hidden_states.is_cuda:
-        raise RuntimeError("FlashInfer routed MoE requires NVIDIA Blackwell (SM100+)")
-    runner = _get_flashinfer_runner(experts, execution_precision, hidden_states.device)
-    topk_weights, topk_ids = _dispatched_topk_inputs(
-        permuted_probs,
-        tokens_per_expert,
-        local_expert_offset=runner.local_expert_offset,
-        num_local_experts=experts.num_local_experts,
-    )
-    if hidden_states.shape[0] != topk_weights.shape[0]:
-        raise ValueError(
-            "FlashInfer MoE dispatched hidden/probability row counts disagree: "
-            f"{hidden_states.shape[0]} != {topk_weights.shape[0]}"
+    with _flashinfer_nvtx_range("input_prep"):
+        dispatch_mode = experts._flashinfer_moe_dispatch_mode
+        execution_precision = _flashinfer_moe_execution_precision(experts)
+        requested_backward_mode = experts._flashinfer_moe_backward_mode
+        backward_mode = _flashinfer_moe_effective_backward_mode(
+            execution_precision, requested_backward_mode
         )
+        if hidden_states.dtype != torch.bfloat16:
+            raise TypeError(f"FlashInfer MoE expects BF16 hidden states, got {hidden_states.dtype}")
+        if not hidden_states.is_cuda:
+            raise RuntimeError("FlashInfer routed MoE requires NVIDIA Blackwell (SM100+)")
+        runner = _get_flashinfer_runner(experts, execution_precision, hidden_states.device)
+        topk_weights, topk_ids = _dispatched_topk_inputs(
+            permuted_probs,
+            tokens_per_expert,
+            local_expert_offset=runner.local_expert_offset,
+            num_local_experts=experts.num_local_experts,
+        )
+        if hidden_states.shape[0] != topk_weights.shape[0]:
+            raise ValueError(
+                "FlashInfer MoE dispatched hidden/probability row counts disagree: "
+                f"{hidden_states.shape[0]} != {topk_weights.shape[0]}"
+            )
 
-    token_counts = tuple(int(count) for count in tokens_per_expert.tolist())
-    w13_gate_up, w2 = _grouped_mlp_weight_parameters(experts)
+        token_counts = tuple(int(count) for count in tokens_per_expert.tolist())
+        w13_gate_up, w2 = _grouped_mlp_weight_parameters(experts)
+        weight_key = _source_weight_key(w13_gate_up, w2)
     output = _run_flashinfer_forward_with_surrogate(
         hidden_states,
         topk_weights,
@@ -1774,7 +1825,7 @@ def _run_dispatched_flashinfer_moe(
         w13_gate_up,
         w2,
         runner,
-        _source_weight_key(w13_gate_up, w2),
+        weight_key,
         backward_mode,
         activation_in_fp32=experts._flashinfer_moe_activation_in_fp32,
         fused_activation=experts._flashinfer_moe_fused_activation,
