@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 _ENV = "MILES_USE_FLASHINFER_MOE"
 _QUANTIZATION_ENV = "MILES_FLASHINFER_MOE_QUANTIZATION"
-_LOGGED_LAYERS: set[tuple[str, int]] = set()
+_LOGGED_LAYERS: set[tuple[str, str, int]] = set()
 _NVFP4_GROUP_SIZE = 16
 _TE_NVFP4_ROW_ALIGNMENT = 16
 _MXFP8_GROUP_SIZE = 32
@@ -61,6 +61,31 @@ def use_flashinfer_moe() -> bool:
     """Return whether the experimental routed-MoE path is enabled."""
 
     return os.environ.get(_ENV, "0") == "1"
+
+
+def flashinfer_moe_dispatch_mode(config) -> str:
+    """Resolve one explicit communication mode for the FlashInfer MoE path."""
+
+    if getattr(config, "moe_combine_in_fp32", False):
+        raise ValueError(
+            "FlashInfer MoE does not support FP32 combine because router gradients "
+            "would bypass the BF16 surrogate boundary"
+        )
+    dispatcher = config.moe_token_dispatcher_type
+    if dispatcher == "allgather":
+        return "allgather"
+    elif dispatcher == "alltoall":
+        return "alltoall"
+    elif dispatcher == "flex":
+        backend = getattr(config, "moe_flex_dispatcher_backend", "unknown")
+        raise NotImplementedError(
+            "FlashInfer MoE does not yet support the flex token dispatcher "
+            f"with {backend!r} backend"
+        )
+    else:
+        raise NotImplementedError(
+            f"FlashInfer MoE token dispatcher {dispatcher!r} has no execution branch"
+        )
 
 
 def _flashinfer_moe_quantization(config) -> str:
@@ -282,10 +307,19 @@ class FlashInferGroupedMLP(MegatronModule):
 
         self.register_load_state_dict_post_hook(remove_extra_states_check)
 
-    def forward(self, *_args, **_kwargs):
-        raise RuntimeError(
-            "FlashInferGroupedMLP only owns BF16 master parameters; execution must "
-            "go through the direct FlashInfer MoE path"
+    def forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ):
+        """Run FlashInfer on assignments already dispatched to local experts."""
+
+        return _run_dispatched_flashinfer_moe(
+            self,
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            permuted_probs,
         )
 
     def backward_dw(self):
@@ -482,6 +516,42 @@ def _grouped_mlp_weights(
         ]
     )
     return w13.contiguous(), w2.contiguous()
+
+
+def _dispatched_topk_inputs(
+    permuted_probs: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    *,
+    local_expert_offset: int,
+    num_local_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build singleton routed-kernel inputs for expert-dispatched assignments."""
+
+    if permuted_probs.ndim != 1:
+        raise ValueError(
+            "FlashInfer all-to-all expects one routing probability per dispatched row, "
+            f"got {tuple(permuted_probs.shape)}"
+        )
+    if tokens_per_expert.ndim != 1 or tokens_per_expert.numel() != num_local_experts:
+        raise ValueError(
+            "FlashInfer all-to-all expects one token count per local expert, "
+            f"got {tuple(tokens_per_expert.shape)} for {num_local_experts} experts"
+        )
+
+    counts = tokens_per_expert.to(
+        device=permuted_probs.device, dtype=torch.long, non_blocking=True
+    )
+    local_expert_ids = torch.arange(
+        local_expert_offset,
+        local_expert_offset + num_local_experts,
+        device=permuted_probs.device,
+        dtype=torch.int32,
+    )
+    topk_ids = torch.repeat_interleave(
+        local_expert_ids, counts, output_size=permuted_probs.shape[0]
+    ).unsqueeze(1)
+    topk_weights = permuted_probs.unsqueeze(1)
+    return topk_weights.contiguous(), topk_ids.contiguous()
 
 
 def _source_weight_key(experts: FlashInferGroupedMLP) -> tuple[int, ...]:
@@ -1267,6 +1337,11 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
     ):
         ctx.runner = runner
         ctx.save_for_backward(hidden_states, topk_weights, topk_ids, w13_gate_up, w2)
+        if hidden_states.shape[0] == 0:
+            # FlashInfer's routed launchers do not accept M=0. Keep this rank in
+            # the custom-autograd graph so backward still emits explicit zero
+            # gradients for inputs and locally owned expert weights.
+            return torch.empty_like(hidden_states)
         return runner.forward(
             hidden_states, topk_weights, topk_ids, w13_gate_up, w2, weight_key
         )
@@ -1312,9 +1387,94 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
         return grads[0], grads[1], None, grads[2], grads[3], None, None
 
 
-def _validate_layer(moe_layer, hidden_states: torch.Tensor, intermediate_tensors) -> str:
+def _get_flashinfer_runner(owner, experts, quantization: str):
+    """Return a cached runner for one module's contiguous local expert shard."""
+
+    runner_type = _flashinfer_moe_runner_type(quantization)
+    runner = getattr(owner, "_flashinfer_moe_runner", None)
+    if runner is None or runner.quantization != quantization:
+        runner = runner_type(
+            num_experts=experts.config.num_moe_experts,
+            local_expert_offset=get_pg_rank(experts.ep_group) * experts.num_local_experts,
+            local_num_experts=experts.num_local_experts,
+            hidden_size=experts.config.hidden_size,
+            intermediate_size=experts.config.moe_ffn_hidden_size,
+        )
+        owner._flashinfer_moe_runner = runner
+    return runner
+
+
+def _run_dispatched_flashinfer_moe(
+    experts: FlashInferGroupedMLP,
+    hidden_states: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    permuted_probs: torch.Tensor,
+) -> tuple[torch.Tensor, None]:
+    """Run local experts after Megatron's standard all-to-all dispatch."""
+
+    dispatch_mode = flashinfer_moe_dispatch_mode(experts.config)
+    if dispatch_mode != "alltoall":
+        raise RuntimeError(
+            "FlashInferGroupedMLP execution is reserved for the all-to-all branch, "
+            f"got {dispatch_mode!r}"
+        )
+
+    quantization = _flashinfer_moe_quantization(experts.config)
+    runner = _get_flashinfer_runner(experts, experts, quantization)
+    topk_weights, topk_ids = _dispatched_topk_inputs(
+        permuted_probs,
+        tokens_per_expert,
+        local_expert_offset=runner.local_expert_offset,
+        num_local_experts=experts.num_local_experts,
+    )
+    if hidden_states.shape[0] != topk_weights.shape[0]:
+        raise ValueError(
+            "FlashInfer all-to-all dispatched hidden/probability row counts disagree: "
+            f"{hidden_states.shape[0]} != {topk_weights.shape[0]}"
+        )
+
+    w13_gate_up, w2 = _grouped_mlp_weights(experts)
+    output = _FlashInferForwardBF16Backward.apply(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w13_gate_up,
+        w2,
+        runner,
+        _source_weight_key(experts),
+    )
+    if output.shape != hidden_states.shape:
+        raise RuntimeError(
+            "FlashInfer all-to-all local output shape mismatch: "
+            f"{tuple(output.shape)} != {tuple(hidden_states.shape)}"
+        )
+
+    log_key = (quantization, dispatch_mode, -1)
+    if log_key not in _LOGGED_LAYERS:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "FlashInfer MoE path active: Megatron all-to-all dispatch, routed TRT-LLM "
+            "top-k=1 local assignments, %s, BF16 surrogate backward (%s=1)",
+            _flashinfer_moe_description(quantization),
+            _ENV,
+        )
+        _LOGGED_LAYERS.add(log_key)
+
+    return output, None
+
+
+def validate_flashinfer_moe_layer(
+    moe_layer,
+    hidden_states: torch.Tensor,
+    intermediate_tensors,
+    padding_mask: Optional[torch.Tensor],
+) -> str:
+    """Validate common and dispatcher-specific FlashInfer MoE constraints."""
+
     config = moe_layer.config
     experts = moe_layer.experts
+    dispatch_mode = flashinfer_moe_dispatch_mode(config)
     quantization = _flashinfer_moe_quantization(config)
     if not isinstance(experts, FlashInferGroupedMLP):
         raise TypeError(
@@ -1334,6 +1494,8 @@ def _validate_layer(moe_layer, hidden_states: torch.Tensor, intermediate_tensors
         raise ValueError("FlashInfer MoE does not support SwiGLU clamp or linear offset")
     if config.moe_expert_capacity_factor is not None:
         raise ValueError("FlashInfer MoE does not support expert capacity or token dropping")
+    if dispatch_mode == "alltoall" and config.moe_router_padding_for_quantization:
+        raise ValueError("FlashInfer MoE all-to-all does not support router padding")
     if config.moe_apply_probs_on_input:
         raise ValueError("FlashInfer MoE requires routing weights in the fused finalize")
     if experts.tp_group.size() != 1:
@@ -1346,10 +1508,18 @@ def _validate_layer(moe_layer, hidden_states: torch.Tensor, intermediate_tensors
         for weight in linear.parameters()
     ):
         raise TypeError("FlashInfer MoE master weights must remain BF16")
+    if config.num_moe_experts > 2048:
+        raise ValueError("FlashInfer routed MoE supports at most 2048 global experts")
     if quantization == "nvfp4":
         if hidden_states.shape[-1] % 16 or config.moe_ffn_hidden_size % 16:
             raise ValueError("FlashInfer NVFP4 dimensions must be multiples of 16")
     elif quantization == "mxfp8":
+        kernel_topk = 1 if dispatch_mode == "alltoall" else config.moe_router_topk
+        if config.num_moe_experts % 4 or config.num_moe_experts <= kernel_topk:
+            raise ValueError(
+                "FlashInfer MXFP8 requires global experts divisible by 4 and greater "
+                f"than kernel top-k, got experts={config.num_moe_experts}, top-k={kernel_topk}"
+            )
         if hidden_states.shape[-1] % 128 or config.moe_ffn_hidden_size % 128:
             raise ValueError(
                 "FlashInfer MXFP8 hidden and intermediate dimensions must be multiples of 128"
@@ -1360,7 +1530,31 @@ def _validate_layer(moe_layer, hidden_states: torch.Tensor, intermediate_tensors
         )
     if not hidden_states.is_cuda or torch.cuda.get_device_capability(hidden_states.device)[0] < 10:
         raise RuntimeError("FlashInfer routed MoE requires NVIDIA Blackwell (SM100+)")
+    if padding_mask is not None and bool(padding_mask.any().item()):
+        raise ValueError("FlashInfer MoE does not yet support padded tokens")
     return quantization
+
+
+def _run_flashinfer_moe_alltoall(
+    moe_layer,
+    hidden_states: torch.Tensor,
+    padding_mask: Optional[torch.Tensor],
+    input_ids: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, None]:
+    """Run FlashInfer inside Megatron's standard all-to-all lifecycle."""
+
+    shared_expert_output = moe_layer.shared_experts_compute(hidden_states)
+    probs, routing_map = moe_layer.route(
+        hidden_states, padding_mask=padding_mask, input_ids=input_ids
+    )
+    hidden_states, probs = moe_layer.preprocess(hidden_states, probs, routing_map)
+    dispatched_input, probs = moe_layer.dispatch(hidden_states, probs)
+    output, mlp_bias = moe_layer.routed_experts_compute(dispatched_input, probs)
+    if mlp_bias is not None:
+        raise RuntimeError("FlashInfer MoE does not support expert bias")
+    output = moe_layer.combine(output)
+    output = moe_layer.postprocess(output, shared_expert_output)
+    return output, None
 
 
 def run_flashinfer_moe(
@@ -1372,22 +1566,19 @@ def run_flashinfer_moe(
 ) -> tuple[torch.Tensor, None]:
     """Run the exact routed FlashInfer forward and attach the BF16 surrogate backward."""
 
-    quantization = _validate_layer(moe_layer, hidden_states, intermediate_tensors)
-    runner_type = _flashinfer_moe_runner_type(quantization)
-    description = _flashinfer_moe_description(quantization)
-    runner = getattr(moe_layer, "_flashinfer_moe_runner", None)
-    if runner is None or runner.quantization != quantization:
-        runner = runner_type(
-            num_experts=moe_layer.config.num_moe_experts,
-            local_expert_offset=moe_layer.local_expert_indices[0],
-            local_num_experts=moe_layer.num_local_experts,
-            hidden_size=moe_layer.config.hidden_size,
-            intermediate_size=moe_layer.config.moe_ffn_hidden_size,
+    dispatch_mode = flashinfer_moe_dispatch_mode(moe_layer.config)
+    quantization = validate_flashinfer_moe_layer(
+        moe_layer, hidden_states, intermediate_tensors, padding_mask
+    )
+    if dispatch_mode == "alltoall":
+        return _run_flashinfer_moe_alltoall(
+            moe_layer, hidden_states, padding_mask, input_ids
         )
-        moe_layer._flashinfer_moe_runner = runner
+    elif dispatch_mode != "allgather":
+        raise AssertionError(f"Unreachable FlashInfer MoE dispatch mode: {dispatch_mode!r}")
 
-    if padding_mask is not None and bool(padding_mask.any().item()):
-        raise ValueError("FlashInfer MoE does not yet support padded tokens")
+    description = _flashinfer_moe_description(quantization)
+    runner = _get_flashinfer_runner(moe_layer, moe_layer.experts, quantization)
 
     shared_expert_output = moe_layer.shared_experts_compute(hidden_states)
     probs, routing_map = moe_layer.route(
@@ -1454,7 +1645,7 @@ def run_flashinfer_moe(
         routed_output = routed_output + shared_expert_output
 
     layer_number = moe_layer.layer_number or -1
-    log_key = (quantization, layer_number)
+    log_key = (quantization, dispatch_mode, layer_number)
     if log_key not in _LOGGED_LAYERS:
         log_single_rank(
             logger,
@@ -1472,7 +1663,9 @@ def run_flashinfer_moe(
 
 __all__ = [
     "FlashInferGroupedMLP",
+    "flashinfer_moe_dispatch_mode",
     "maybe_replace_flashinfer_moe_expert_spec",
     "run_flashinfer_moe",
     "use_flashinfer_moe",
+    "validate_flashinfer_moe_layer",
 ]

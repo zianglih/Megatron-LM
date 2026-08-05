@@ -51,11 +51,17 @@ When enabled, the MoE layer:
    on TE or the `grouped_gemm` package. Checkpoint, optimizer, and Miles raw
    weight-sync ownership remain in Megatron.
 2. Runs the normal Megatron router, including Miles rollout-routing replay.
-   When replay is active, the adapter reads the current replay stream's original
-   top-k IDs so the FlashInfer packed input preserves rollout slot order; routing
-   weights remain differentiable gathers from Megatron's dense probabilities.
-3. Gathers BF16 tokens, routing weights, and routing IDs across the expert
-   parallel group.
+3. Selects one explicit communication branch from
+   `moe_token_dispatcher_type`:
+   - `allgather` retains the original replicated-token parity path. When replay
+     is active, it reads the current replay stream's original top-k IDs so the
+     packed input preserves rollout slot order.
+   - `alltoall` uses Megatron's normal permutation, variable-split EP A2A, and
+     local-expert sort. Each received token-expert assignment becomes one
+     FlashInfer input row with `top_k=1`, a global expert ID reconstructed from
+     `tokens_per_expert`, and its differentiable routing probability.
+   - `flex` fails explicitly and names the selected DeepEP or HybridEP backend;
+     there is no fallback branch.
 4. Quantizes each current BF16 expert with the matching direct TE quantizer so
    the values and scales match Miles weight sync. NVFP4 uses per-tensor decode
    scales; MXFP8 uses compact rowwise UE8M0 scales. Both paths adapt Megatron's
@@ -63,9 +69,12 @@ When enabled, the MoE layer:
    format-specific weight/scale layout transforms used by SGLang.
 5. Quantizes activations per token with FlashInfer in the linear scale layout.
 6. Calls the pre-routed FlashInfer NVFP4 or MXFP8 operation with packed BF16
-   routing weights, local expert offset/count, `do_finalize=True`, and SwiGLU.
-7. Sums local-expert partial outputs across expert parallel ranks and slices
-   this rank's original tokens.
+   routing weights, global expert IDs, local expert offset/count,
+   `do_finalize=True`, and SwiGLU.
+7. Completes the matching communication branch. The replicated path sums
+   local-expert partial outputs and slices this rank's original tokens. The A2A
+   path uses Megatron's inverse local sort, reverse A2A, and final unpermute to
+   sum the original router top-k contributions.
 
 FlashInfer does not expose autograd for this fused forward. The custom autograd
 bridge therefore recomputes a whole local routed-expert module in BF16 during
@@ -76,9 +85,10 @@ Expert IDs and forward quantization are intentionally nondifferentiable.
 
 The expert-parallel communication remains part of the autograd boundary:
 
-- padded all-gather backward is a summing reduce-scatter for input and router
-  gradients;
-- output all-reduce backward is another sum;
+- in the replicated branch, padded all-gather backward is a summing
+  reduce-scatter and output all-reduce backward is another sum;
+- in the A2A branch, Megatron's autograd-aware reverse A2A carries dispatched
+  hidden-state and routing-probability gradients back to their source ranks;
 - local expert parameters receive only their local gradients.
 
 This backward is not the derivative of the quantized FlashInfer forward.
@@ -119,7 +129,7 @@ receives token-major activation scales, shuffled W3/W1 and W2 weights, and
 interleaved UE8M0 weight scales, matching SGLang's
 `flashinfer_trtllm_routed` backend.
 
-## Environment
+## Historical NVFP4 environment
 
 Local workspace:
 
@@ -166,12 +176,27 @@ per-token activations. The adapter mirrors that division of ownership.
   parallelism greater than one are rejected. Miles' all-`-1` replay padding
   rows are supported by applying the same deterministic expert-ID replacement
   as `ReplayManager`.
+- The A2A branch additionally rejects router quantization padding. It bypasses
+  the FlashInfer launch when a rank receives zero assignments while retaining
+  connected zero gradients and participation in the reverse A2A.
+- `moe_combine_in_fp32` is rejected for the FlashInfer path. Applying unit
+  weights in the fused kernel avoids double scaling, but router gradients then
+  flow around the BF16 surrogate boundary and depend on quantized expert
+  outputs. That mixed-gradient contract is intentionally not exposed.
+- DeepEP and HybridEP remain explicit unsupported `flex` branches. They can be
+  integrated later at the same dispatched-expert boundary. This change
+  validates both Megatron's standard `alltoall` dispatcher and the retained
+  replicated `allgather` branch.
 - The current MXFP8 path requires hidden and expert-intermediate dimensions to
   be multiples of 128. Shape padding can relax this in a later iteration.
 - The trainer run used EP4 while rollout data came from EP2. Ordinary NCCL
   all-reduce does not preserve the same partial-sum association across those
   topologies, so reusing the FlashInfer expert kernel alone cannot guarantee
   bitwise module parity.
+- The A2A path expands router top-k into singleton FlashInfer rows and lets
+  Megatron's final unpermute accumulate the contributions. Its accumulation
+  order therefore need not be bitwise identical to the fused top-k replicated
+  path even when each expert result agrees.
 - The replay side channel assumes the router consumes a replay entry. Hash
   routing and MTP paths that bypass Miles replay are outside this experiment.
 - The parameter names match Miles raw weight sync, but live SGLang weight
@@ -181,8 +206,8 @@ per-token activations. The adapter mirrors that division of ownership.
 
 ## Validation log
 
-Implementation and tests are intentionally left unstaged while this design is
-evaluated.
+The implementation, focused tests, and distributed smoke script are included
+in this draft so the exact validation can be reproduced during review.
 
 The first parameter-holder attempt reused legacy `GroupedMLP`. The requested
 image does not contain the optional `grouped_gemm` package, so that candidate
@@ -235,6 +260,69 @@ selection/error coverage for NVFP4 and MXFP8, bitwise prepared-layout parity
 with SGLang, and a routed SwiGLU MXFP8 forward with finite BF16 surrogate
 gradients at 128 global experts, 4 local experts, hidden size 2048, and
 intermediate size 768.
+
+### Megatron all-to-all extension
+
+The standard A2A branch was validated without reinstalling packages on the bare
+`radixark/miles:dev-202608041247` image. Changes were synchronized directly to
+the image's editable `/root/Megatron-LM`; no `/hai-workspace/Megatron-LM`
+checkout was used. The environment reported PyTorch 2.11.0+cu130,
+FlashInfer 0.6.14, and eight NVIDIA B200 GPUs.
+
+The focused unit file covers both routed quantizations through one common test
+surface. The model profile groups 32 experts, hidden size 7168, intermediate
+size 2048, and router top-k 8; token counts are independently parameterized at
+8 and 4096. A true eight-rank EP test parameterizes Megatron `alltoall` and
+`allgather`, runs the complete `MoELayer` forward and backward, and compares
+each FlashInfer result against a topology-identical BF16 reference. It also
+covers explicit dispatcher selection, DeepEP/HybridEP rejection, singleton
+global expert-ID construction, and an `M=0` custom-autograd path that skips
+FlashInfer while returning connected zero gradients and invalidating cached
+weights.
+
+The ordinary focused run passes every non-distributed case and skips only the
+eight cases that require an eight-rank launch:
+
+```text
+29 passed, 8 skipped, 25 warnings in 1.48s
+```
+
+The distributed matrix runs as:
+
+```bash
+NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 \
+python -m torch.distributed.run --standalone --nproc_per_node=8 \
+    -m pytest -xvs tests/unit_tests/extension/test_flashinfer_moe.py \
+    -k test_flashinfer_routed_forward_and_surrogate_backward
+```
+
+```text
+8 passed, 29 deselected, 41 warnings in 27.15s
+```
+
+Across the eight cases, NVFP4 forward relative L2 was at most `0.214520`
+against BF16 and MXFP8 was at most `0.070004`. Hidden-gradient relative L2 was
+at most `0.003635`; router and local-parameter gradient relative L2 values were
+`0.0` at the displayed precision. The quantization-specific forward limits are
+`0.25` for NVFP4 and `0.10` for MXFP8, and all surrogate-gradient relative L2
+limits are `0.01`. Deterministic routing leaves EP rank 7 with zero received
+assignments in every A2A case while verifying that inverse A2A still restores
+its locally originated token outputs.
+
+The checked-in distributed smoke runs the complete Megatron route, permutation,
+EP A2A, local FlashInfer `top_k=1`, inverse A2A, and final unpermute lifecycle:
+
+```bash
+torchrun --standalone --nproc-per-node=8 \
+    tests/manual_tests/flashinfer_moe_alltoall_smoke.py
+```
+
+Its deterministic asymmetric routing sends no assignments to EP rank 7 while
+still originating tokens there. The run completed the reverse A2A, recovered
+rank 7's outputs, and verified that the plugin's padded token all-gather and EP
+output all-reduce were not called. Against the same A2A lifecycle with BF16
+experts, the observed MXFP8 forward relative L2 was `0.070036`; maximum hidden,
+router, and local-parameter surrogate-gradient errors were all `0.0`.
 
 ### Quantized-weight contract
 
