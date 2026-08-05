@@ -35,6 +35,19 @@ MXFP8: --fp8-format e4m3 --fp8-recipe mxfp8
 NVFP4: --fp4-format e2m1 --fp4-recipe nvfp4
 ```
 
+The NVFP4 runner supports row-scaled activations and rowwise 1x16 weight
+scaling. Select that Transformer Engine recipe before starting Python:
+
+```bash
+export NVTE_NVFP4_DISABLE_RHT=1
+export NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=1
+export NVTE_NVFP4_DISABLE_2D_QUANTIZATION=1
+export NVTE_NVFP4_ROW_SCALED_ACTIVATION=1
+```
+
+Random Hadamard transforms, stochastic rounding, 2D 16x16 weight scaling, and
+non-row-scaled activations are rejected during static configuration validation.
+
 The plugin infers BF16 when neither quantization is active, or the model's
 quantized runner from the active format and recipe. At execution time it
 follows Transformer Engine's precision decision for the routed-expert FC1 and
@@ -179,6 +192,8 @@ plugin-specific profiling switch or any synchronization in production code.
 - plain BF16 routed execution
 - BF16 routed execution selected by TE for first/last layers in MXFP8 and
   NVFP4 models
+- NVFP4 row-scaled activations and rowwise 1x16 weight scaling, without RHT or
+  stochastic rounding
 - gated SwiGLU without bias, clamp, or linear offset
 - expert parallelism with `expert_tensor_parallel_size=1`
 - Megatron `allgather` and `alltoall` token dispatchers
@@ -198,7 +213,8 @@ another implementation.
 
 The focused tests compare the grouped surrogate with an independent BF16
 expert reference, including empty local experts, the supported activation
-paths, shared-expert preservation, and TE-driven runner selection. The
+paths, shared-expert preservation, TE-driven runner selection, and explicit
+acceptance and rejection of the supported NVFP4 recipe. The
 distributed numerical test exercises plain BF16, both quantizations, BF16
 boundary-layer execution, both Megatron dispatchers, and both backward operand
 settings.
@@ -219,6 +235,10 @@ Run the focused suite with:
 ```bash
 python3 -m pytest -q tests/unit_tests/extension/test_flashinfer_moe.py
 
+NVTE_NVFP4_DISABLE_RHT=1 \
+NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=1 \
+NVTE_NVFP4_DISABLE_2D_QUANTIZATION=1 \
+NVTE_NVFP4_ROW_SCALED_ACTIVATION=1 \
 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 \
 python3 -m torch.distributed.run --standalone --nproc_per_node=8 \
   -m pytest -q -s -x tests/unit_tests/extension/test_flashinfer_moe.py \

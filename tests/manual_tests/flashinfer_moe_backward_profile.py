@@ -9,6 +9,14 @@ import os
 import time
 import types
 
+for name in (
+    "NVTE_NVFP4_DISABLE_RHT",
+    "NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING",
+    "NVTE_NVFP4_DISABLE_2D_QUANTIZATION",
+    "NVTE_NVFP4_ROW_SCALED_ACTIVATION",
+):
+    os.environ.setdefault(name, "1")
+
 import torch
 import torch.nn.functional as F
 

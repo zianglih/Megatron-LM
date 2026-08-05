@@ -381,6 +381,34 @@ def test_flashinfer_experts_reuse_megatron_te_parameter_contract():
     assert issubclass(FlashInferGroupedMLP, TEGroupedMLP)
 
 
+def _flashinfer_validation_config(**updates):
+    arguments = {
+        "num_layers": 1,
+        "hidden_size": 128,
+        "num_attention_heads": 8,
+        "num_moe_experts": 4,
+        "moe_ffn_hidden_size": 128,
+        "moe_router_topk": 1,
+        "moe_router_pre_softmax": True,
+        "moe_token_dispatcher_type": "alltoall",
+        "moe_grouped_gemm": True,
+        "tensor_model_parallel_size": 1,
+        "expert_model_parallel_size": 1,
+        "expert_tensor_parallel_size": 1,
+        "add_bias_linear": False,
+        "gated_linear_unit": True,
+        "activation_func": F.silu,
+        "bf16": True,
+        "params_dtype": torch.bfloat16,
+        "fp8": "e4m3",
+        "fp8_recipe": "mxfp8",
+    }
+    config = TransformerConfig(**arguments)
+    for attribute, value in updates.items():
+        setattr(config, attribute, value)
+    return config
+
+
 @pytest.mark.parametrize(
     "updates,exception,message",
     [
@@ -417,31 +445,51 @@ def test_flashinfer_experts_reuse_megatron_te_parameter_contract():
     ],
 )
 def test_flashinfer_moe_rejects_unsupported_te_execution_paths(updates, exception, message):
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=128,
-        num_attention_heads=8,
-        num_moe_experts=4,
-        moe_ffn_hidden_size=128,
-        moe_router_topk=1,
-        moe_router_pre_softmax=True,
-        moe_token_dispatcher_type="alltoall",
-        moe_grouped_gemm=True,
-        tensor_model_parallel_size=1,
-        expert_model_parallel_size=1,
-        expert_tensor_parallel_size=1,
-        add_bias_linear=False,
-        gated_linear_unit=True,
-        activation_func=F.silu,
-        bf16=True,
-        params_dtype=torch.bfloat16,
-        fp8="e4m3",
-        fp8_recipe="mxfp8",
-    )
-    for attribute, value in updates.items():
-        setattr(config, attribute, value)
+    config = _flashinfer_validation_config(**updates)
 
     with pytest.raises(exception, match=message):
+        _validate_flashinfer_moe_config(config)
+
+
+def _mock_supported_nvfp4_recipe(monkeypatch):
+    recipe = SimpleNamespace(
+        disable_rht=True,
+        disable_stochastic_rounding=True,
+        disable_2d_quantization=True,
+        row_scaled_activation=True,
+    )
+    monkeypatch.setattr(
+        "miles_megatron_plugins.flashinfer_moe.get_fp4_recipe", lambda config: recipe
+    )
+    return recipe
+
+
+def test_flashinfer_moe_accepts_supported_nvfp4_recipe(monkeypatch):
+    _mock_supported_nvfp4_recipe(monkeypatch)
+    config = _flashinfer_validation_config(fp8=None, fp4="e2m1", fp4_recipe="nvfp4")
+
+    assert _validate_flashinfer_moe_config(config) == "nvfp4"
+
+
+@pytest.mark.parametrize(
+    "attribute,message",
+    [
+        pytest.param("disable_rht", "random Hadamard transforms", id="rht"),
+        pytest.param(
+            "disable_stochastic_rounding", "stochastic rounding", id="stochastic-rounding"
+        ),
+        pytest.param("disable_2d_quantization", "2D 16x16 weight scaling", id="2d-16x16-weights"),
+        pytest.param(
+            "row_scaled_activation", "only row-scaled activations", id="row-scaled-activation"
+        ),
+    ],
+)
+def test_flashinfer_moe_rejects_unsupported_nvfp4_recipe(monkeypatch, attribute, message):
+    recipe = _mock_supported_nvfp4_recipe(monkeypatch)
+    setattr(recipe, attribute, False)
+    config = _flashinfer_validation_config(fp8=None, fp4="e2m1", fp4_recipe="nvfp4")
+
+    with pytest.raises(ValueError, match=message):
         _validate_flashinfer_moe_config(config)
 
 

@@ -40,6 +40,7 @@ from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
     TERowParallelGroupedLinear,
 )
+from megatron.core.fp4_utils import get_fp4_recipe
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.transformer.moe.experts import TEGroupedMLP, _MoEActivationInFP32
 from megatron.core.transformer.spec_utils import ModuleSpec, get_module
@@ -393,6 +394,32 @@ def _flashinfer_moe_effective_backward_mode(
         )
 
 
+def _validate_flashinfer_nvfp4_recipe(config) -> None:
+    """Require the row-scaled NVFP4 recipe implemented by the FlashInfer runner."""
+
+    recipe = get_fp4_recipe(config)
+    if not recipe.disable_rht:
+        raise ValueError(
+            "FlashInfer NVFP4 does not support random Hadamard transforms (RHT); "
+            "set NVTE_NVFP4_DISABLE_RHT=1 before launching Python"
+        )
+    if not recipe.disable_stochastic_rounding:
+        raise ValueError(
+            "FlashInfer NVFP4 does not support stochastic rounding (SR); "
+            "set NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=1 before launching Python"
+        )
+    if not recipe.disable_2d_quantization:
+        raise ValueError(
+            "FlashInfer NVFP4 does not support 2D 16x16 weight scaling; "
+            "set NVTE_NVFP4_DISABLE_2D_QUANTIZATION=1 before launching Python"
+        )
+    if not recipe.row_scaled_activation:
+        raise ValueError(
+            "FlashInfer NVFP4 supports only row-scaled activations; "
+            "set NVTE_NVFP4_ROW_SCALED_ACTIVATION=1 before launching Python"
+        )
+
+
 def _validate_flashinfer_moe_config(config) -> str:
     """Validate model-static constraints before allocating expert parameters."""
 
@@ -447,6 +474,7 @@ def _validate_flashinfer_moe_config(config) -> str:
                 "FlashInfer MXFP8 hidden and intermediate dimensions must be multiples of 128"
             )
     elif quantization == "nvfp4":
+        _validate_flashinfer_nvfp4_recipe(config)
         if config.hidden_size % 16 or config.moe_ffn_hidden_size % 16:
             raise ValueError("FlashInfer NVFP4 dimensions must be multiples of 16")
     else:
