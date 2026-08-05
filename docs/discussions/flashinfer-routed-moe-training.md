@@ -20,7 +20,14 @@ Set:
 export MILES_USE_FLASHINFER_MOE=1
 ```
 
-Select exactly one quantization through the canonical Megatron precision
+Plain BF16 training needs only Megatron's normal BF16 configuration; neither an
+FP8 nor an FP4 recipe is required:
+
+```text
+BF16: --bf16
+```
+
+Quantized training selects one precision through the canonical Megatron
 arguments:
 
 ```text
@@ -28,14 +35,16 @@ MXFP8: --fp8-format e4m3 --fp8-recipe mxfp8
 NVFP4: --fp4-format e2m1 --fp4-recipe nvfp4
 ```
 
-The plugin infers the model's quantized runner from the active format and
-recipe. At execution time it follows Transformer Engine's precision decision
-for the routed-expert FC1 and FC2 modules: a quantized layer uses that runner,
-while a layer that TE keeps in BF16 uses FlashInfer's BF16 routed kernel. FC1
-and FC2 must agree on the execution precision. There is no implicit NVFP4
-fallback, and unsupported or simultaneous recipes are rejected explicitly.
+The plugin infers BF16 when neither quantization is active, or the model's
+quantized runner from the active format and recipe. At execution time it
+follows Transformer Engine's precision decision for the routed-expert FC1 and
+FC2 modules: a quantized layer uses that runner, while plain BF16 training or a
+layer that TE keeps in BF16 uses FlashInfer's BF16 routed kernel. FC1 and FC2
+must agree on the execution precision. There is no implicit NVFP4 fallback,
+and unsupported or simultaneous recipes are rejected explicitly.
 
-This directly supports Megatron's first/last-layer BF16 controls, for example:
+In quantized models, this directly supports Megatron's first/last-layer BF16
+controls, for example:
 
 ```text
 --first-last-layers-bf16
@@ -111,10 +120,11 @@ For each local routed-expert shard, the quantized forward path:
 3. adapts gate/up order and FlashInfer's shuffled weight layouts; and
 4. invokes the explicit MXFP8 or NVFP4 TRT-LLM routed kernel.
 
-When TE keeps the routed layer in BF16, the same BF16 master weights are
-materialized in FlashInfer's block-major layout and passed to its BF16 TRT-LLM
-routed kernel. This path is selected from TE's live execution context rather
-than a separate FlashInfer precision flag.
+For plain BF16 training, or when TE keeps a routed layer in a quantized model in
+BF16, the same BF16 master weights are materialized in FlashInfer's block-major
+layout and passed to its BF16 TRT-LLM routed kernel. This path is selected from
+the model configuration and TE's live execution context rather than a separate
+FlashInfer precision flag.
 
 Prepared quantized weights, or the BF16 block-major mirror, are cached until
 backward starts. Backward releases that forward-only mirror before the grouped
@@ -166,8 +176,9 @@ plugin-specific profiling switch or any synchronization in production code.
 
 - NVIDIA Blackwell (SM100 or newer)
 - BF16 master parameters and BF16 dispatched hidden states
-- BF16 routed execution selected by TE for first/last layers in MXFP8 and NVFP4
-  models
+- plain BF16 routed execution
+- BF16 routed execution selected by TE for first/last layers in MXFP8 and
+  NVFP4 models
 - gated SwiGLU without bias, clamp, or linear offset
 - expert parallelism with `expert_tensor_parallel_size=1`
 - Megatron `allgather` and `alltoall` token dispatchers
@@ -188,8 +199,9 @@ another implementation.
 The focused tests compare the grouped surrogate with an independent BF16
 expert reference, including empty local experts, the supported activation
 paths, shared-expert preservation, and TE-driven runner selection. The
-distributed numerical test exercises both quantizations, BF16 boundary-layer
-execution, both Megatron dispatchers, and both backward operand settings.
+distributed numerical test exercises plain BF16, both quantizations, BF16
+boundary-layer execution, both Megatron dispatchers, and both backward operand
+settings.
 
 For its 4,096-token quantized MXFP8 and NVFP4 cases, the distributed test also
 emits non-gating performance diagnostics. It routes assignments evenly across

@@ -4,7 +4,7 @@ import os
 import statistics
 import time
 import types
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -126,28 +126,27 @@ def test_flashinfer_moe_backward_mode_rejects_missing_or_noncanonical_te_overrid
 
 
 def test_flashinfer_moe_quantization_resolves_active_megatron_recipe():
-    config = SimpleNamespace(fp8="e4m3", fp8_recipe="mxfp8", fp4=None, fp4_recipe="nvfp4")
+    config = SimpleNamespace(fp8=None, fp8_recipe="mxfp8", fp4=None, fp4_recipe="nvfp4")
+    assert _flashinfer_moe_quantization(config) == "bf16"
+
+    config.fp8 = "e4m3"
     assert _flashinfer_moe_quantization(config) == "mxfp8"
 
     config.fp8 = None
     config.fp4 = "e2m1"
     assert _flashinfer_moe_quantization(config) == "nvfp4"
 
-    config.fp4 = None
-    with pytest.raises(ValueError, match="requires exactly one quantization"):
+    config.fp8 = "e4m3"
+    with pytest.raises(ValueError, match="cannot enable FP8 and FP4 together"):
         _flashinfer_moe_quantization(config)
 
-    config.fp8 = "e4m3"
+    config.fp4 = None
     config.fp8_recipe = "delayed"
     with pytest.raises(ValueError, match="does not support active FP8 recipe"):
         _flashinfer_moe_quantization(config)
 
-    config.fp8_recipe = "mxfp8"
-    config.fp4 = "e2m1"
-    with pytest.raises(ValueError, match="requires exactly one quantization"):
-        _flashinfer_moe_quantization(config)
-
     config.fp8 = None
+    config.fp4 = "e2m1"
     config.fp4_recipe = "custom"
     with pytest.raises(ValueError, match="does not support active FP4 recipe"):
         _flashinfer_moe_quantization(config)
@@ -156,6 +155,7 @@ def test_flashinfer_moe_quantization_resolves_active_megatron_recipe():
 @pytest.mark.parametrize(
     "context_quantized,module_quantized,configured,expected",
     [
+        pytest.param(False, False, "bf16", "bf16", id="plain-bf16"),
         pytest.param(False, False, "mxfp8", "bf16", id="first-last-bf16"),
         pytest.param(True, False, "nvfp4", "bf16", id="module-bf16-override"),
         pytest.param(True, True, "mxfp8", "mxfp8", id="mxfp8"),
@@ -189,6 +189,19 @@ def test_flashinfer_moe_execution_precision_rejects_mixed_expert_linears():
         "transformer_engine.pytorch.fp8.FP8GlobalStateManager.is_fp8_enabled", return_value=True
     ):
         with pytest.raises(ValueError, match="FC1 and FC2 to use the same precision"):
+            _flashinfer_moe_execution_precision(experts)
+
+
+def test_flashinfer_moe_execution_precision_rejects_unconfigured_quantization():
+    experts = SimpleNamespace(
+        linear_fc1=SimpleNamespace(will_execute_quantized=lambda _context: True),
+        linear_fc2=SimpleNamespace(will_execute_quantized=lambda _context: True),
+        _flashinfer_moe_quantization="bf16",
+    )
+    with mock.patch(
+        "transformer_engine.pytorch.fp8.FP8GlobalStateManager.is_fp8_enabled", return_value=True
+    ):
+        with pytest.raises(ValueError, match="without an MXFP8 or NVFP4 model precision"):
             _flashinfer_moe_execution_precision(experts)
 
 
@@ -1569,7 +1582,7 @@ def _distributed_layer_precision_context(layer: MoELayer, layer_no: int):
         return get_fp8_context(layer.config, layer_no)
     if layer.config.fp4 is not None:
         return get_fp4_context(layer.config, layer_no)
-    raise ValueError("distributed FlashInfer MoE test requires FP8 or FP4 context")
+    return nullcontext()
 
 
 def _run_distributed_layer_once(
@@ -1883,6 +1896,17 @@ def _global_abs_max(tensors) -> float:
     [
         pytest.param(
             SimpleNamespace(
+                configured="bf16",
+                execution="bf16",
+                runner_type=_FlashInferBF16Runner,
+                num_layers=1,
+                layer_no=0,
+                first_last_layers_bf16=False,
+            ),
+            id="bf16",
+        ),
+        pytest.param(
+            SimpleNamespace(
                 configured="mxfp8",
                 execution="bf16",
                 runner_type=_FlashInferBF16Runner,
@@ -1944,7 +1968,7 @@ def _global_abs_max(tensors) -> float:
 def test_flashinfer_routed_forward_and_surrogate_backward(
     monkeypatch, precision_case, moe_token_dispatcher_type, model_hyperparameters, num_tokens
 ):
-    """Compare quantized and boundary-BF16 runners with a full-layer BF16 oracle."""
+    """Compare plain-BF16, quantized, and boundary-BF16 runners with a BF16 oracle."""
 
     num_experts = model_hyperparameters.num_experts
     hidden_size = model_hyperparameters.hidden_size
@@ -1972,7 +1996,9 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         monkeypatch.setenv("MILES_USE_FLASHINFER_MOE", "1")
         if precision_case.configured == "nvfp4":
             _set_nvfp4_4over6_env(monkeypatch, flashinfer=True)
-        if precision_case.configured == "mxfp8":
+        if precision_case.configured == "bf16":
+            precision_config = {}
+        elif precision_case.configured == "mxfp8":
             precision_config = {"fp8": "e4m3", "fp8_recipe": "mxfp8"}
         elif precision_case.configured == "nvfp4":
             precision_config = {"fp4": "e2m1", "fp4_recipe": "nvfp4"}
@@ -2049,7 +2075,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
                 hidden_size,
                 intermediate_size,
                 top_k,
-                ("mxfp8", "nvfp4").index(precision_case.configured),
+                ("bf16", "mxfp8", "nvfp4").index(precision_case.configured),
                 ("bf16", "mxfp8", "nvfp4").index(precision_case.execution),
                 ("allgather", "alltoall").index(moe_token_dispatcher_type),
                 precision_case.layer_no,

@@ -4,7 +4,8 @@
 
 This module deliberately targets the rollout routed-MoE contracts for:
 
-* FlashInfer ``trtllm_bf16_routed_moe`` in TE-selected BF16 layer contexts
+* FlashInfer ``trtllm_bf16_routed_moe`` for plain BF16 models and TE-selected
+  BF16 layer contexts in quantized models
 * FlashInfer ``trtllm_fp8_block_scale_routed_moe`` with MXFP8
 * FlashInfer ``trtllm_fp4_block_scale_routed_moe`` with per-token NVFP4
 * contiguous expert-parallel expert ownership
@@ -328,12 +329,13 @@ def flashinfer_moe_dispatch_mode(config) -> str:
 
 
 def _flashinfer_moe_quantization(config) -> str:
-    """Resolve one explicitly supported routed-MoE quantization."""
+    """Resolve one explicitly supported routed-MoE execution precision."""
 
     if config.fp8 is not None and config.fp4 is not None:
-        raise ValueError(
-            "FlashInfer MoE requires exactly one quantization; both FP8 and FP4 are active"
-        )
+        raise ValueError("FlashInfer MoE cannot enable FP8 and FP4 together")
+
+    if config.fp8 is None and config.fp4 is None:
+        return "bf16"
     elif config.fp8 is not None:
         if config.fp8_recipe != Fp8Recipe.mxfp8:
             raise ValueError(
@@ -349,9 +351,8 @@ def _flashinfer_moe_quantization(config) -> str:
             )
         return "nvfp4"
     else:
-        raise ValueError(
-            "FlashInfer MoE requires exactly one quantization; neither FP8 with recipe "
-            "'mxfp8' nor FP4 with recipe 'nvfp4' is active"
+        raise NotImplementedError(
+            "FlashInfer MoE precision configuration has no execution branch"
         )
 
 
@@ -366,6 +367,11 @@ def _flashinfer_moe_execution_precision(experts) -> str:
             "FlashInfer MoE requires routed expert FC1 and FC2 to use the same precision"
         )
     if fc1_quantized:
+        if experts._flashinfer_moe_quantization == "bf16":
+            raise ValueError(
+                "FlashInfer MoE cannot execute quantized routed experts without an "
+                "MXFP8 or NVFP4 model precision"
+            )
         return experts._flashinfer_moe_quantization
     return "bf16"
 
@@ -425,7 +431,12 @@ def _validate_flashinfer_moe_config(config) -> str:
         raise TypeError("FlashInfer MoE master weights must remain BF16")
     if config.num_moe_experts > 2048:
         raise ValueError("FlashInfer routed MoE supports at most 2048 global experts")
-    if quantization == "mxfp8":
+    if quantization == "bf16":
+        if config.hidden_size % 128 or config.moe_ffn_hidden_size % 128:
+            raise ValueError(
+                "FlashInfer BF16 hidden and intermediate dimensions must be multiples of 128"
+            )
+    elif quantization == "mxfp8":
         if config.num_moe_experts % 4 or config.num_moe_experts <= 1:
             raise ValueError(
                 "FlashInfer MXFP8 requires global experts divisible by 4 and greater "
