@@ -8,11 +8,6 @@ from typing import Optional, Protocol, Union
 
 import torch
 
-from miles_megatron_plugins.flashinfer_moe import (
-    maybe_replace_flashinfer_moe_expert_spec,
-    run_flashinfer_moe,
-    use_flashinfer_moe,
-)
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
@@ -33,6 +28,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
+from miles_megatron_plugins.flashinfer_moe import maybe_replace_flashinfer_moe_expert_spec
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -402,15 +398,6 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors, padding_mask=None, input_ids=None):
-            if use_flashinfer_moe():
-                return run_flashinfer_moe(
-                    self,
-                    hidden_states,
-                    intermediate_tensors,
-                    padding_mask,
-                    input_ids,
-                )
-
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)

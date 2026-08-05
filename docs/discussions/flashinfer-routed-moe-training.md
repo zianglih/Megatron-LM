@@ -1,667 +1,158 @@
-# FlashInfer routed MoE in Megatron training
+# FlashInfer routed MoE training
 
-## Goal
+This extension keeps Megatron BF16 parameters, checkpoints, routing, token
+dispatch, and token combine as the source of truth while replacing the local
+expert forward with a FlashInfer low-precision routed-MoE kernel. It generalizes
+the FP32-activation work in
+[radixark/Megatron-LM#68](https://github.com/radixark/Megatron-LM/pull/68)
+to model-neutral NVFP4 and MXFP8 expert execution.
 
-Evaluate a stronger rollout-parity boundary than matching activation functions
-individually: use the same FlashInfer routed MoE forward in Megatron that SGLang
-uses for rollout, while retaining ordinary BF16 Megatron parameters and an
-explicitly approximate training backward.
+The implementation lives in `miles_megatron_plugins/flashinfer_moe.py`. The only
+Megatron-core integration is expert-spec selection during `MoELayer`
+construction.
 
-This experiment targets:
+## Enablement
 
-- `trtllm_fp4_block_scale_routed_moe`
-- per-token NVFP4 activation quantization
-- NVFP4 4-over-6 weight and activation quantization
-- `trtllm_fp8_block_scale_routed_moe`
-- MXFP8 weights and per-token MXFP8 activation quantization
-- routed SwiGLU experts
-- BF16 module input and output
-- selectable high-precision or forward-QDQ operands for the BF16 surrogate
-- expert tensor parallel size 1
-
-It does not introduce a weight or activation layout. It materializes the
-layouts already required by the FlashInfer TRT-LLM kernel.
-
-## Design
-
-The opt-in environment variable is:
+Set:
 
 ```bash
-MILES_USE_FLASHINFER_MOE=1
+export MILES_USE_FLASHINFER_MOE=1
 ```
 
-It defaults to disabled. When enabled, the adapter requires exactly one
-supported quantization. It resolves an active Megatron MXFP8 or NVFP4 recipe,
-or experiments can select either path explicitly:
+Select exactly one quantization through the active Megatron recipe or an
+explicit override:
 
 ```bash
-MILES_FLASHINFER_MOE_QUANTIZATION=nvfp4  # or mxfp8
+export MILES_FLASHINFER_MOE_QUANTIZATION=nvfp4  # or mxfp8
 ```
 
-There is no default quantization fallback. Other active recipes and missing or
-ambiguous selections fail before the routed kernel runs, and an environment
-selection cannot override a conflicting active recipe. New formats must add an
-explicit resolver, capability, validation, runner, and log-description branch.
+The override must agree with an active `fp4=nvfp4` or `fp8=mxfp8` recipe. There
+is no implicit NVFP4 fallback.
 
-The surrogate-backward operand mode is selected independently:
+Backward uses the original BF16 operands by default. To recompute with BF16
+values decoded from the exact forward quantized operands, set:
 
 ```bash
-MILES_FLASHINFER_MOE_DEQUANTIZED=0  # default: original BF16 operands
-MILES_FLASHINFER_MOE_DEQUANTIZED=1  # forward-derived visible QDQ operands
+export MILES_FLASHINFER_MOE_DEQUANTIZED=1
 ```
 
-Only `0`, `1`, or an unset variable are accepted. The setting does not change
-the FlashInfer forward. The default preserves the original behavior, analogous
-to Transformer Engine's `NVTE_BACKWARD_OVERRIDE=high_precision`. The opt-in
-mode follows the external-operand semantics of
-[Transformer Engine #2644](https://github.com/NVIDIA/TransformerEngine/pull/2644)
-`NVTE_BACKWARD_OVERRIDE=dequantized`: it uses the dequantized values represented
-by the activation and weight payloads that fed the forward.
+This is analogous to Transformer Engine's `NVTE_BACKWARD_OVERRIDE=dequantized`
+mode from
+[NVIDIA/TransformerEngine#2644](https://github.com/NVIDIA/TransformerEngine/pull/2644).
 
-When enabled, the MoE layer:
+## Dispatch and expert ownership
 
-1. Replaces `TEGroupedMLP` with a BF16 holder that preserves its per-expert
-   parameter naming contract during model construction. The concrete
-   `FlashInferGroupedMLP` is a plain per-expert parameter holder with
-   `linear_fc1.weightN` and `linear_fc2.weightN` parameters; it does not depend
-   on TE or the `grouped_gemm` package. Checkpoint, optimizer, and Miles raw
-   weight-sync ownership remain in Megatron.
-2. Runs the normal Megatron router, including Miles rollout-routing replay.
-3. Selects one explicit communication branch from
-   `moe_token_dispatcher_type`:
-   - `allgather` retains the original replicated-token parity path. When replay
-     is active, it reads the current replay stream's original top-k IDs so the
-     packed input preserves rollout slot order.
-   - `alltoall` uses Megatron's normal permutation, variable-split EP A2A, and
-     local-expert sort. Each received token-expert assignment becomes one
-     FlashInfer input row with `top_k=1`, a global expert ID reconstructed from
-     `tokens_per_expert`, and its differentiable routing probability.
-   - `flex` fails explicitly and names the selected DeepEP or HybridEP backend;
-     there is no fallback branch.
-4. Quantizes each current BF16 expert with the matching direct TE quantizer so
-   the values and scales match Miles weight sync. NVFP4 uses per-tensor decode
-   scales; MXFP8 uses compact rowwise UE8M0 scales. Both paths adapt Megatron's
-   `[gate, up]` rows to FlashInfer's W3/W1 contract and apply the same
-   format-specific weight/scale layout transforms used by SGLang.
-5. Quantizes activations per token with FlashInfer in the linear scale layout.
-6. Calls the pre-routed FlashInfer NVFP4 or MXFP8 operation with packed BF16
-   routing weights, global expert IDs, local expert offset/count,
-   `do_finalize=True`, and SwiGLU.
-7. Completes the matching communication branch. The replicated path sums
-   local-expert partial outputs and slices this rank's original tokens. The A2A
-   path uses Megatron's inverse local sort, reverse A2A, and final unpermute to
-   sum the original router top-k contributions.
+Both supported dispatchers use Megatron's normal lifecycle:
 
-FlashInfer does not expose autograd for this fused forward. The custom autograd
-bridge therefore recomputes a whole local routed-expert module in BF16 during
-backward and obtains gradients with `torch.autograd.grad`. The surrogate uses
-Megatron's `[gate, up]`, `silu(gate) * up`, probability-before-FC2 formula.
-It returns gradients for BF16 input, routing weights, and BF16 master weights.
-Expert IDs and forward quantization are intentionally nondifferentiable.
+```text
+router -> Megatron dispatch -> FlashInfer local experts -> Megatron combine
+```
 
-In dequantized mode, the adapter retains compact canonical Transformer Engine
-storage for the exact weight payloads used to construct FlashInfer W13/W2. For
-MXFP8 it wraps FlashInfer's exact per-token input payload; for NVFP4 it wraps
-the exact packed values and block scales with equivalent Transformer Engine
-row-scale metadata. These tensors are registered with Transformer Engine's
-saved-tensor helpers, then lazily decoded to BF16 only when backward starts.
-The adapter never overwrites the input or Megatron master parameters and does
-not keep an eager full-size BF16 weight mirror. This trades compact saved
-quantized payloads plus backward-time decode work for a surrogate whose
-operands reflect forward quantization.
+`alltoall` uses `MoEAlltoAllTokenDispatcher` unchanged. `allgather` uses
+`MoEAllGatherTokenDispatcher` unchanged. The plugin does not implement a
+collective, reconstruct routing, pad ranks, or reproduce the MoE layer forward.
 
-The expert-parallel communication remains part of the autograd boundary:
+Megatron hands the expert module rows already sorted by local expert, their
+`tokens_per_expert`, and the corresponding differentiable routing
+probabilities. The plugin converts those rows to a routed-kernel top-k of one;
+the model router can still use top-k greater than one because each assignment
+has already been expanded by the dispatcher.
 
-- in the replicated branch, padded all-gather backward is a summing
-  reduce-scatter and output all-reduce backward is another sum;
-- in the A2A branch, Megatron's autograd-aware reverse A2A carries dispatched
-  hidden-state and routing-probability gradients back to their source ranks;
-- local expert parameters receive only their local gradients.
+The expert class inherits Megatron's `TEGroupedMLP`, so parameter creation,
+names, initialization, and distributed-checkpoint mapping remain owned by
+Megatron. Only `forward` and delayed-weight-gradient handling are replaced.
 
-Neither backward mode is the derivative of the fused quantized FlashInfer
-forward. Dequantized mode changes the surrogate operands, but the recompute
-still uses ordinary BF16 SwiGLU and GEMMs. Gradient fidelity is an accepted
-limitation of this experiment.
+## Forward and backward
 
-## Exact NVFP4 rollout settings
+For each local expert shard, the forward path:
 
-The controlled GLM-5.2 experiment uses:
+1. reads the existing per-expert BF16 `weightN` parameters without stacking a
+   second BF16 copy;
+2. quantizes through Transformer Engine using the same rowwise contracts as
+   Miles weight sync;
+3. adapts gate/up order and FlashInfer's shuffled weight layouts; and
+4. invokes the explicit NVFP4 or MXFP8 TRT-LLM routed kernel.
+
+The quantized weights are cached until backward. The cache is conservatively
+invalidated after every training backward because optimizer updates through
+`param.data` are not guaranteed to advance a parameter version counter.
+
+Both backward modes recompute a BF16 SwiGLU expert graph and differentiate that
+surrogate:
+
+- `high_precision` saves references to the original BF16 activation and master
+  parameters.
+- `dequantized` saves the compact forward activation payload and eagerly decodes
+  each weight immediately after it is quantized. The decoded per-expert weights
+  are shared by outstanding forward graphs, and the temporary canonical
+  quantized weight storage is released expert by expert. Activation decode is
+  deferred until its backward to limit memory growth with pipeline overlap.
+
+The surrogate is intentionally not the mathematical derivative of the fused
+quantized forward. The choice only controls which forward operands seed the
+BF16 recomputation.
+
+## Supported surface
+
+- NVIDIA Blackwell (SM100 or newer)
+- BF16 master parameters and BF16 dispatched hidden states
+- NVFP4 and MXFP8
+- gated SwiGLU without bias, clamp, or linear offset
+- expert parallelism with `expert_tensor_parallel_size=1`
+- Megatron `alltoall` and `allgather` token dispatchers
+- dropless routing without router quantization padding
+- up to 2,048 global experts
+
+The extension rejects unsupported branches before the kernel launch. In
+particular, flex dispatch (`deepep` or `hybridep`), ETP greater than one, shared
+expert overlap, latent MoE projections, expert bias, non-SwiGLU activations,
+capacity/drop routing, FP32 combine, and unknown quantization recipes are not
+silently redirected to another implementation.
+
+## Validation
+
+The distributed numerical test is parameterized over:
+
+- 8 and 4,096 input tokens;
+- 32 experts, hidden size 7,168, intermediate size 2,048, router top-k 8;
+- NVFP4 and MXFP8; and
+- Megatron all-to-all and all-gather.
+
+On one 8xB200 bare devbox, all eight distributed cases passed. The fused
+forward was compared with a distributed BF16 reference, and both backward modes
+were compared with their corresponding ordinary-autograd BF16 surrogate. The
+worst observed forward relative L2 was below 0.215 for NVFP4 and 0.071 for
+MXFP8; surrogate hidden-gradient relative L2 was below 0.004, with router and
+parameter-gradient comparisons matching at the reported precision.
+
+The focused single-process suite passed 38 tests with 8 distributed cases
+skipped outside torchrun:
 
 ```bash
-NVTE_NVFP4_4OVER6=all
-NVTE_NVFP4_4OVER6_E4M3_USE_256=all
-NVTE_NVFP4_4OVER6_ERR_MODE=MSE
-NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH=0
-NVTE_USE_FAST_MATH=0
-FLASHINFER_NVFP4_4OVER6=1
-FLASHINFER_NVFP4_4OVER6_E4M3_USE_256=1
-FLASHINFER_NVFP4_4OVER6_ERR_MODE=MSE
-FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH=0
-FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1
-SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1
-TRTLLM_DISABLE_FP4_QUANT_FAST_MATH=1
-```
+python3 -m pytest -q tests/unit_tests/extension/test_flashinfer_moe.py
 
-The `NVTE_*` settings own per-tensor weight quantization. The
-`FLASHINFER_*` settings own per-token activation quantization. The module does
-not enter TE autocast, a TE recipe, or a global TE quantization context.
-
-The initial comparison used SGLang `flashinfer_trtllm_routed`, SGL-kernel DSA
-top-k, Miles Torch top-k, and fixed rollout-routing replay. The activation-only
-toggle is disabled on both sides because this path bypasses Megatron's
-routed-expert activation implementation. A later controlled run using
-FlashInfer DSA top-k on both sides is recorded below.
-
-The MXFP8 path instead uses TE's rowwise `MXFP8Quantizer` for BF16 master
-weights and FlashInfer's `mxfp8_quantize` for per-token activations. The kernel
-receives token-major activation scales, shuffled W3/W1 and W2 weights, and
-interleaved UE8M0 weight scales, matching SGLang's
-`flashinfer_trtllm_routed` backend.
-
-## Historical NVFP4 environment
-
-Local workspace:
-
-```text
-/Users/ziangli/playground/cute-dsl-nvfp4
-```
-
-Megatron branch and starting revision:
-
-```text
-agent-flashinfer-fast-swiglu-megatron
-5096ccd6c
-```
-
-Required remote image and hardware:
-
-```text
-radixark/miles:dev-202607281246
-queue: hell
-8 x NVIDIA B200
-```
-
-No FlashInfer source refresh or modification is required. The requested image
-initially provided FlashInfer 0.6.12 and was later upgraded to the published
-0.6.13 wheels without a source checkout or build. Miles serializes the rollout
-weights with TE, while SGLang uses FlashInfer's CUDA NVFP4 quantizer for
-per-token activations. The adapter mirrors that division of ownership.
-
-## Initial limitations
-
-- The quantized weight mirror uses a parameter storage/version cache. The
-  surrogate backward invalidates it before the optimizer can update BF16 master
-  weights, because Megatron optimizer copies through `param.data` do not
-  necessarily increment `Parameter._version`. A production implementation
-  should refresh persistent buffers in place instead of reallocating them.
-- Without Miles routing replay, top-k slot order is recovered from Megatron's
-  dense selected probabilities. Models whose correction bias changes selected
-  expert ordering independently of routing weights need an explicit router
-  top-k side channel for the non-replay case.
-- FlashInfer tactic selection/cache parity with the rollout process is not yet
-  controlled.
-- A nonempty Megatron `padding_mask`, token dropping/capacity, shared-expert
-  overlap, latent MoE, expert bias, SwiGLU clamp/offset, and expert tensor
-  parallelism greater than one are rejected. Miles' all-`-1` replay padding
-  rows are supported by applying the same deterministic expert-ID replacement
-  as `ReplayManager`.
-- The path requires SM100+, BF16 hidden states and master weights, at most 2048
-  global experts, and routing probabilities applied inside the fused expert
-  finalization (`moe_apply_probs_on_input=False`). NVFP4 hidden/intermediate
-  dimensions must be multiples of 16. MXFP8 requires those dimensions to be
-  multiples of 128 and the global expert count to be divisible by 4 and greater
-  than the FlashInfer kernel top-k.
-- The A2A branch additionally rejects router quantization padding. It bypasses
-  the FlashInfer launch when a rank receives zero assignments while retaining
-  connected zero gradients and participation in the reverse A2A.
-- `moe_combine_in_fp32` is rejected for the FlashInfer path. Applying unit
-  weights in the fused kernel avoids double scaling, but router gradients then
-  flow around the BF16 surrogate boundary and depend on quantized expert
-  outputs. That mixed-gradient contract is intentionally not exposed.
-- DeepEP and HybridEP remain explicit unsupported `flex` branches. They can be
-  integrated later at the same dispatched-expert boundary. This change
-  validates both Megatron's standard `alltoall` dispatcher and the retained
-  replicated `allgather` branch.
-- The trainer run used EP4 while rollout data came from EP2. Ordinary NCCL
-  all-reduce does not preserve the same partial-sum association across those
-  topologies, so reusing the FlashInfer expert kernel alone cannot guarantee
-  bitwise module parity.
-- The A2A path expands router top-k into singleton FlashInfer rows and lets
-  Megatron's final unpermute accumulate the contributions. Its accumulation
-  order therefore need not be bitwise identical to the fused top-k replicated
-  path even when each expert result agrees.
-- The replay side channel assumes the router consumes a replay entry. Hash
-  routing and MTP paths that bypass Miles replay are outside this experiment.
-- The parameter names match Miles raw weight sync, but live SGLang weight
-  transfer and optimizer-state resume have not yet been exercised.
-- Partial MoE CUDA graph capture is rejected. Full-layer activation
-  checkpointing may re-run the FlashInfer forward and must be measured.
-- FlashInfer does not expose the quantized post-SwiGLU intermediate produced
-  inside the fused kernel. Dequantized mode therefore covers the externally
-  visible input activation plus W13/W2 payloads; the surrogate's internal
-  activation remains the result of its BF16 recompute.
-- Dequantized mode retains compact quantized forward operands until backward
-  and decodes them on the backward critical path. The diagnostic below
-  characterizes one representative shape; target workloads still require
-  independent measurement, and no general performance improvement is claimed.
-- The opt-in path requires Transformer Engine's saved quantized-storage API
-  and fails explicitly when the active image does not provide it.
-- The current distributed numerical test uses TP1/EP8/ETP1, sequence parallel
-  off, unfused permutation, and no shared experts. TP+EP, fused permutation,
-  shared experts, activation checkpointing, optimizer steps/resume, and
-  end-to-end training remain unvalidated. No A2A-versus-allgather throughput or
-  memory conclusion is claimed.
-
-## Validation log
-
-The implementation, focused tests, and distributed smoke script are included
-in this draft so the exact validation can be reproduced during review.
-
-The first parameter-holder attempt reused legacy `GroupedMLP`. The requested
-image does not contain the optional `grouped_gemm` package, so that candidate
-failed during model construction before checkpoint loading. The final design
-uses the plain per-expert holder described above. It preserves the TE-compatible
-checkpoint names without constructing TE or grouped-GEMM layers; TE is called
-only as the standalone weight quantizer.
-
-The initial remote environment was:
-
-```text
-devbox: flashinfer-moe-parity
-image: radixark/miles:dev-202607281246
-queue: hell
-hardware: 8 x NVIDIA B200
-PyTorch: 2.11.0+cu130
-FlashInfer: 0.6.12
-SGLang: 0.5.16.dev34+gf7ea06e
-Miles: 5cc5ff96413b82a2d14befcde0376ece6e36dce2
-Megatron base: 5096ccd6c
-```
-
-The local Megatron implementation, MoE hook, test, and Miles comparison script
-were SHA-256 checked against `/root/Megatron-LM` and `/root/miles` immediately
-before the run. No FlashInfer source was synchronized or rebuilt.
-
-Targeted Blackwell validation:
-
-```text
-16 passed, 27 warnings in 1.39s
-```
-
-This includes the exact FlashInfer per-token NVFP4 + 4-over-6 forward, a
-nonzero-loss BF16 surrogate backward with finite gradients, replay slot-order
-preservation, replay padding normalization, and explicit zero gradients when an
-EP rank has no locally routed tokens. It also bitwise-compares the local TE
-helper with Miles for odd-row padding and paired gate/up quantization.
-
-The MXFP8 extension was validated separately on the bare
-`radixark/miles:dev-202608041247` image with FlashInfer 0.6.14 and an NVIDIA
-B200. The full routed-MoE unit file passed without installing or rebuilding any
-packages:
-
-```text
-24 passed, 25 warnings in 2.19s
-```
-
-This adds bitwise TE-versus-Miles MXFP8 weight and scale checks, explicit
-selection/error coverage for NVFP4 and MXFP8, bitwise prepared-layout parity
-with SGLang, and a routed SwiGLU MXFP8 forward with finite BF16 surrogate
-gradients at 128 global experts, 4 local experts, hidden size 2048, and
-intermediate size 768.
-
-### Megatron all-to-all extension
-
-The standard A2A branch was validated without reinstalling packages on the bare
-`radixark/miles:dev-202608041247` image. Changes were synchronized directly to
-the image's editable `/root/Megatron-LM`; no `/hai-workspace/Megatron-LM`
-checkout was used. The environment reported PyTorch 2.11.0+cu130,
-FlashInfer 0.6.14, and eight NVIDIA B200 GPUs.
-
-The focused unit file covers both routed quantizations through one common test
-surface. The model profile groups 32 experts, hidden size 7168, intermediate
-size 2048, and router top-k 8; token counts are independently parameterized at
-8 and 4096. A true eight-rank EP test parameterizes Megatron `alltoall` and
-`allgather`, runs the complete `MoELayer` forward and backward, and compares
-each FlashInfer result against a topology-identical BF16 reference. It also
-covers explicit dispatcher selection, DeepEP/HybridEP rejection, singleton
-global expert-ID construction, and an `M=0` custom-autograd path that skips
-FlashInfer while returning connected zero gradients and invalidating cached
-weights. Reference and quantized backwards receive the same deterministic,
-nonuniform upstream gradient; relative-L2 and scale-aware maximum errors are
-checked for hidden, routing-logit, and local-parameter gradients.
-
-The test installs deterministic differentiable routing so every rank executes
-the same collective schedule and the final EP rank receives zero assignments.
-It therefore checks gradients of the injected routing logits, not parameters of
-Megatron's real router; router top-k and Miles replay are covered structurally
-but are not exercised by this distributed runtime test. The BF16 reference
-replaces only the fused-kernel autograd boundary, so it intentionally shares
-the adapter's dispatcher and expert-ID reconstruction. Focused helper tests
-cover that reconstruction separately, but the numerical comparison is not an
-independent oracle for the shared packing code.
-
-The ordinary focused run passes every non-distributed case and deselects only
-the eight cases that require an eight-rank launch:
-
-```text
-43 passed, 8 deselected, 25 warnings in 2.30s
-```
-
-The distributed matrix runs as:
-
-```bash
 NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 \
-python -m torch.distributed.run --standalone --nproc_per_node=8 \
-    -m pytest -xvs tests/unit_tests/extension/test_flashinfer_moe.py \
-    -k test_flashinfer_routed_forward_and_surrogate_backward
+python3 -m torch.distributed.run --standalone --nproc_per_node=8 \
+  -m pytest -q -x tests/unit_tests/extension/test_flashinfer_moe.py \
+  -k test_flashinfer_routed_forward_and_surrogate_backward
 ```
 
-```text
-8 passed, 43 deselected (slowest rank: 29.27s)
-```
+The non-gating profile in
+`tests/manual_tests/flashinfer_moe_backward_profile.py` reports end-to-end step
+latency, peak allocated memory, post-forward live memory, and peak memory with
+one and four outstanding forward graphs for every dispatcher/quantization pair.
 
-Across the eight cases, NVFP4 forward relative L2 was at most `0.214520`
-against BF16 and MXFP8 was at most `0.070004`. The worst per-token relative L2
-values were `0.243297` and `0.083410`, respectively. High-precision and
-dequantized hidden-gradient relative L2 against their matching references were
-at most `0.003731` and `0.003576`; routing-logit and local-parameter relative
-L2 values were `0.0` at the displayed precision. The two backward modes shared
-the same forward within relative L2 `0.004384` and maximum difference
-`0.03125`; the nonzero A2A difference reflects nondeterministic collective or
-kernel ordering across separate launches. The quantization-specific
-global/per-token forward limits are `0.25`/`0.30` for NVFP4 and `0.10`/`0.15`
-for MXFP8. All matching-reference surrogate-gradient relative L2 limits are
-`0.01`, with an additional scale-aware maximum-error check. Deterministic
-routing leaves EP rank 7 with zero received assignments in every A2A case
-while verifying the exact global assignment count and that inverse A2A
-restores its locally originated token outputs.
+One B200 sample at 4,096 tokens produced:
 
-The checked-in distributed smoke runs the complete Megatron route, permutation,
-EP A2A, local FlashInfer `top_k=1`, inverse A2A, and final unpermute lifecycle:
+| Dispatcher | Quantization | High-precision ms | Dequantized ms | 1-graph peak delta MiB | 4-graph live delta MiB | 4-graph peak delta MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| all-to-all | NVFP4 | 105.05 | 112.01 | +480.18 | -1,135.45 | -470.87 |
+| all-to-all | MXFP8 | 99.48 | 99.66 | +600.03 | -656.01 | -143.99 |
+| all-gather | NVFP4 | 117.65 | 119.51 | +480.07 | -1,134.70 | -526.73 |
+| all-gather | MXFP8 | 127.51 | 119.32 | +600.03 | -655.99 | -143.99 |
 
-```bash
-torchrun --standalone --nproc-per-node=8 \
-    tests/manual_tests/flashinfer_moe_alltoall_smoke.py
-```
-
-Its deterministic asymmetric routing sends no assignments to EP rank 7 while
-still originating tokens there. The run completed the reverse A2A, recovered
-rank 7's outputs, and verified that the plugin's padded token all-gather and EP
-output all-reduce were not called. Against the same A2A lifecycle with BF16
-experts, the observed MXFP8 forward relative L2 was `0.070036`; maximum hidden,
-routing-logit, and local-parameter surrogate-gradient errors were all
-`0.000000` at the displayed precision.
-
-### Dequantized-backward validation and profile
-
-The focused tests independently decode MXFP8, standard NVFP4, and NVFP4
-4-over-6 payloads with E4M3 maxima 448 and 256. They verify the canonical
-weight payloads, source-tensor nonmutation, strict environment parsing,
-no-grad cache behavior, retained-graph restoration, and two outstanding
-forwards for both quantizations. Each distributed case then runs a BF16
-reference, high-precision FlashInfer, a decoded-operand ordinary-autograd
-reference, and dequantized FlashInfer. It checks each backward against its
-matching reference and reports the expected dequantized-versus-high-precision
-gradient difference separately.
-
-The checked-in non-gating profile uses the same EP8, 32-expert, hidden-size
-7168, intermediate-size 2048, top-k 8, and 4096-token setup. It warms each mode
-and reports the maximum rank latency and allocated-memory peak over three full
-forward/backward iterations:
-
-```bash
-NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 \
-python -m torch.distributed.run --standalone --nproc_per_node=8 \
-    tests/manual_tests/flashinfer_moe_backward_profile.py
-```
-
-| Quantization | Dispatcher | High precision | Dequantized | Latency delta | Peak delta |
-| --- | --- | ---: | ---: | ---: | ---: |
-| NVFP4 | all-to-all | 112.896 ms | 115.838 ms | +2.61% | +239.98 MiB |
-| MXFP8 | all-to-all | 106.978 ms | 108.819 ms | +1.72% | +437.28 MiB |
-| NVFP4 | all-gather | 119.877 ms | 119.416 ms | -0.38% | +95.36 MiB |
-| MXFP8 | all-gather | 113.608 ms | 114.022 ms | +0.36% | +173.25 MiB |
-
-This is a short diagnostic sample, not a throughput claim. The peak deltas
-include the canonical low-precision weight payloads, activation payloads, and
-backward-time BF16 reconstruction. Lazy reconstruction avoids the earlier
-candidate's persistent 336 MiB BF16 weight mirror per layer/rank, but the
-retained canonical low-precision mirrors and decode work are still material.
-
-### Quantized-weight contract
-
-Miles raw weight sync jointly quantizes gate/up BF16 tensors with TE's
-`NVFP4Quantizer`, then SGLang consumes those serialized packed weights, block
-scales, and per-tensor decode scales. A B200 audit of FlashInfer 0.6.13 and TE
-2.17 under strict 4-over-6/MSE, E4M3 max 256, and disabled candidate fast math
-confirmed that the producer contract differs by quantization mode:
-
-```text
-Per-token, (32, 128), 200 samples: 0 packed/scales/decode mismatches
-Per-token, (128, 2048), 40 samples: 0 packed/scales/decode mismatches
-Per-tensor, (32, 128), 200 samples: 2 samples mismatched
-Per-tensor, (128, 2048), 40 samples: 11 samples mismatched
-```
-
-The small per-tensor case differed by 16 packed bytes and two block-scale bytes
-across 51,200 blocks. The strict implementations are mathematically equivalent,
-but their global-decode arithmetic ordering can change a near-tie by a few
-FP32 ULPs. The module therefore uses FlashInfer only for aligned per-token
-activation quantization and TE for per-tensor weights. FC1 is quantized once in
-`[gate, up]` order before its packed data and scales are reordered to
-`[up, gate]`; no new memory layout is introduced.
-
-Miles' complete NVFP4 quantizer unit file also passed on the same environment:
-
-```text
-633 passed, 24 warnings in 6.59s
-```
-
-Audit artifacts:
-
-```text
-logs/nvfp4_te_fi_contract_20260729_191500/run.log
-logs/miles_nvfp4_quantizer_unit_20260729_192000/run.log
-logs/flashinfer_moe_te_weights_unit_final_20260729_184400/run.log
-```
-
-### Paired model run
-
-This is the historical FlashInfer-0.6.12, FlashInfer-quantized-weight result
-before the weight producer was corrected to match Miles.
-
-The paired GLM-5.2 five-layer run used two byte-identical fixed rollout files,
-TP4/EP4/ETP1, full activation recomputation, Miles routing replay, SGL-kernel
-rollout top-k, Torch trainer top-k, and zero BF16 boundary layers. Both variants
-loaded the original distributed checkpoint and completed both training
-backwards. The one-time runtime marker confirmed the FlashInfer path was active
-on both routed-MoE layers.
-
-| Metric | Megatron mean | FlashInfer mean | Relative delta |
-| --- | ---: | ---: | ---: |
-| `train/train_rollout_logprob_abs_diff` | 0.0152137894 | 0.0152012068 | -0.083% |
-| `train/train_rollout_kl` | 0.0002127190 | 0.0002114670 | -0.589% |
-| `train/kl_loss` | 0.0001833101 | 0.0001843832 | +0.585% |
-
-The result is numerically neutral at this sample size: it demonstrates that the
-standalone FlashInfer-forward/BF16-backward module works with routing replay,
-not that it closes rollout parity. The fixed data has zero advantages and the
-run used `--debug-disable-optimizer`; model-level backward control flow ran, but
-this comparison does not validate optimizer updates, live weight sync, or
-quantized-cache invalidation after an update.
-
-Local artifacts:
-
-```text
-logs/flashinfer_moe_unit_final_20260729_174500/run.log
-logs/flashinfer_moe_weight_quant_audit_20260729_175100/run.log
-logs/flashinfer_moe_numerical_final_20260729_174700/comparison/results.json
-logs/flashinfer_moe_numerical_final_20260729_174700/comparison/flashinfer/run.log
-logs/flashinfer_moe_numerical_final_20260729_174700/comparison/megatron/run.log
-```
-
-### FlashInfer 0.6.13 wheel rerun
-
-This is the historical FlashInfer-quantized-weight rerun before the weight
-producer was corrected to match Miles.
-
-FlashInfer was replaced using only the published CUDA 13 wheels:
-
-```bash
-python3 -m pip uninstall -y \
-    flashinfer flashinfer-python flashinfer-cubin flashinfer-jit-cache
-python3 -m pip install \
-    'flashinfer-python[cu13]==0.6.13' \
-    'flashinfer-cubin==0.6.13'
-python3 -m pip install 'flashinfer-jit-cache==0.6.13' \
-    --index-url https://flashinfer.ai/whl/cu130
-python3 -m pip install --no-deps nvidia-cudnn-cu13==9.22.0.52
-flashinfer show-config
-```
-
-Preflight immediately before the rerun reported:
-
-```text
-FlashInfer Python: 0.6.13
-FlashInfer cubin: 0.6.13
-FlashInfer JIT cache: 0.6.13+cu130
-PyTorch: 2.11.0+cu130
-cuDNN package: 9.22.0.52
-torch.backends.cudnn.version(): 92200
-```
-
-No FlashInfer repository was synchronized, installed editable, or built. The
-same two fixed rollout files and the same experiment configuration were reused,
-including strict 4-over-6 candidate scoring
-(`NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH=0` and
-`FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH=0`). Both variants completed both
-backwards, and the one-time markers again confirmed the FlashInfer routed MoE
-path on layers 4 and 5.
-
-| Metric | Megatron mean | FlashInfer 0.6.13 mean | Relative delta |
-| --- | ---: | ---: | ---: |
-| `train/train_rollout_logprob_abs_diff` | 0.0152137894 | 0.0152615779 | +0.314% |
-| `train/train_rollout_kl` | 0.0002127190 | 0.0002142042 | +0.698% |
-| `train/kl_loss` | 0.0001833101 | 0.0001843008 | +0.540% |
-
-This two-rollout comparison does not show a numerical improvement from the
-FlashInfer-forward variant after the wheel upgrade. The sample remains too
-small for a general quality conclusion, but all three tracked means moved
-slightly away from the rollout baseline in this controlled replay. Quantizer
-contract debugging is intentionally deferred.
-
-Local artifacts:
-
-```text
-logs/flashinfer_0613_install_20260729_180000/run.log
-logs/flashinfer_moe_numerical_0613_20260729_185000/run.log
-logs/flashinfer_moe_numerical_0613_20260729_185000/comparison/results.json
-logs/flashinfer_moe_numerical_0613_20260729_185000/comparison/flashinfer/run.log
-logs/flashinfer_moe_numerical_0613_20260729_185000/comparison/megatron/run.log
-```
-
-### TE weight-quantizer rerun
-
-The final prototype directly uses TE 2.17 for each expert's per-tensor weights,
-keeps FlashInfer 0.6.13 for per-token activations and fused forward, and does
-not use TE quantization context. The same two fixed rollout files, TP4/EP4/ETP1
-topology, routing replay, zero BF16 boundary layers, and disabled optimizer were
-used. Runtime markers confirmed the FlashInfer path on both routed layers, and
-both forwards and surrogate backwards completed.
-
-| Metric | Megatron mean | TE-weight FlashInfer mean | Relative delta |
-| --- | ---: | ---: | ---: |
-| `train/train_rollout_logprob_abs_diff` | 0.0152137894 | 0.0151186958 | -0.625% |
-| `train/train_rollout_kl` | 0.0002127190 | 0.0002107913 | -0.906% |
-| `train/kl_loss` | 0.0001833101 | 0.0001805730 | -1.493% |
-
-All three tracked means improved in this paired replay. The sample is only two
-rollouts, so this is evidence that the corrected weight contract helps this
-controlled case, not a general quality conclusion. It still does not isolate
-the remaining GEMM, expert-parallel reduction, permutation, or topology
-differences.
-
-Final artifacts:
-
-```text
-logs/flashinfer_moe_te_weights_numerical_final_20260729_184700/run.log
-logs/flashinfer_moe_te_weights_numerical_final_20260729_184700/comparison/results.json
-logs/flashinfer_moe_te_weights_numerical_final_20260729_184700/comparison/flashinfer/run.log
-logs/flashinfer_moe_te_weights_numerical_final_20260729_184700/comparison/megatron/run.log
-```
-
-### FlashInfer DSA top-k with large tie-break
-
-The general numerical script was changed to use FlashInfer DSA top-k for both
-rollout and trainer:
-
-```text
---sglang-dsa-topk-backend flashinfer
---miles-dsa-topk-backend flashinfer
-SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK=large
-SGLANG_DSA_FUSE_TOPK=0
-```
-
-`large` maps to FlashInfer `tie_break=2` in both owning adapters. Disabling the
-SGLang fused path makes rollout call the unfused `flashinfer.top_k`, avoiding
-the known fused SGLang integration bug. A B200 preflight with eight equal
-scores returned indices `[6, 7]` from both the Miles and SGLang adapters,
-confirming that the large-index tie-break was active.
-
-A fixed replay cannot exercise SGLang, so the experiment used three fresh
-processes:
-
-1. A live Megatron-MoE run generated two rollout files with SGLang FlashInfer
-   top-k, large tie-break, and top-k fusion disabled.
-2. The files were replayed through the ordinary Megatron MoE with Miles
-   FlashInfer top-k.
-3. The byte-identical files were replayed through the FlashInfer MoE with Miles
-   FlashInfer top-k.
-
-The two fixture SHA-256 values were:
-
-```text
-0.pt  85780c802ed12b91ea9ec73fdeec2666af9ee020accee3e7eca6daa9b20f9715
-1.pt  5e2af94cc7cd80484894fb7edc00753111503029e47ee6b4c9bd3758bc94ae3a
-```
-
-Both trainer variants used TP4/EP4/ETP1, routing replay, zero BF16 boundary
-layers, and a disabled optimizer. Indexer replay remained disabled so Miles
-actually executed FlashInfer top-k. The candidate log emitted the one-time
-runtime marker for both routed layers, confirming the FlashInfer routed
-TRT-LLM, per-token NVFP4, 4-over-6 forward and BF16 surrogate backward.
-
-| Metric | Megatron mean | FlashInfer mean | Relative delta |
-| --- | ---: | ---: | ---: |
-| `train/train_rollout_logprob_abs_diff` | 0.0150603754 | 0.0151270670 | +0.443% |
-| `train/train_rollout_kl` | 0.0002101068 | 0.0002090524 | -0.502% |
-| `train/kl_loss` | 0.0001882156 | 0.0001842414 | -2.112% |
-
-This paired result is mixed: the log-probability absolute-difference mean
-regressed slightly, while both KL means improved. The earlier SGL-kernel/Torch
-top-k replay improved all three means by 0.625%, 0.906%, and 1.493%,
-respectively. Those percentages are each valid within their own fixed fixture,
-but comparing absolute means across the two experiments is only contextual:
-the generated rollout tensors and top-k configuration differ, so the
-cross-fixture movement cannot be attributed to FlashInfer MoE or top-k alone.
-
-The run used FlashInfer 0.6.13 published CUDA 13 wheels, PyTorch 2.11.0+cu130,
-and the same TE 2.17 per-tensor weight quantizer. Immediately before the paired
-run, the numerical script and FlashInfer MoE implementation hashes were:
-
-```text
-tools/run_numerical_comparison.py
-  d199d23f8792242b08ac42e4bdf9b9992cc3561512860b30d808d10670fc88d9
-miles_megatron_plugins/flashinfer_moe.py
-  2ac1a9786f5d9c1c230669addb7070bf93916ba7aad43cd62e81431a8f006765
-```
-
-Artifacts:
-
-```text
-logs/topk_large_rollout_fixture_20260729_191100/run.log
-logs/topk_large_rollout_fixture_20260729_191100/fixture/megatron/dump_details/rollout_data/0.pt
-logs/topk_large_rollout_fixture_20260729_191100/fixture/megatron/dump_details/rollout_data/1.pt
-logs/flashinfer_moe_topk_large_numerical_20260729_191500/run.log
-logs/flashinfer_moe_topk_large_numerical_20260729_191500/comparison/results.json
-```
+The dequantized mode pays for one cached BF16 QDQ weight shard, so its
+single-graph peak is higher. With four outstanding graphs, retaining compact
+activation payloads instead of BF16 dispatched activations outweighed that
+fixed cost in every measured case. These are non-gating single-run profile
+numbers, not a performance guarantee.

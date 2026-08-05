@@ -12,11 +12,10 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.experts import GroupedMLP
+from megatron.core.transformer.moe.experts import GroupedMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from miles_megatron_plugins import flashinfer_moe as flashinfer_moe_module
 from miles_megatron_plugins.flashinfer_moe import (
     _bf16_local_routed_experts,
     _dispatched_topk_inputs,
@@ -29,16 +28,13 @@ from miles_megatron_plugins.flashinfer_moe import (
     FlashInferGroupedMLP,
     DEQUANTIZED_BACKWARD,
     HIGH_PRECISION_BACKWARD,
-    _dequantize_weight_payloads,
-    _grouped_mlp_weights,
+    _grouped_mlp_weight_parameters,
     _pack_topk_ids,
-    _rollout_replay_topk_ids,
     _run_flashinfer_forward_with_surrogate,
     _te_mxfp8_quantize_gated_weight,
     _te_mxfp8_quantize_weight,
     _te_nvfp4_quantize_gated_weight,
     _te_nvfp4_quantize_weight,
-    _topk_from_dense_routing,
     dequantize_mxfp8_activation,
     dequantize_nvfp4_activation,
     flashinfer_moe_backward_mode,
@@ -161,7 +157,7 @@ def test_flashinfer_moe_dispatch_checks_supported_runner_capabilities():
     assert "MXFP8" in _flashinfer_moe_description("mxfp8")
 
 
-def test_flashinfer_moe_selects_non_te_grouped_parameters(monkeypatch):
+def test_flashinfer_moe_selects_extension_experts_without_mutating_source(monkeypatch):
     class OtherExperts:
         pass
 
@@ -172,64 +168,13 @@ def test_flashinfer_moe_selects_non_te_grouped_parameters(monkeypatch):
 
     assert replacement is not original
     assert replacement.experts.module is FlashInferGroupedMLP
+    assert replacement.experts.submodules is not None
     assert original.experts.module is OtherExperts
+    assert original.experts.submodules is None
 
 
-def test_flashinfer_parameter_holder_bypasses_grouped_gemm_runtime():
-    assert not issubclass(FlashInferGroupedMLP, GroupedMLP)
-    assert not hasattr(FlashInferGroupedMLP, "finish_init")
-
-
-def test_dense_routing_conversion_preserves_selected_weight_gradients():
-    probs = torch.tensor(
-        [[0.0, 0.7, 0.3, 0.0], [0.4, 0.0, 0.0, 0.6]], dtype=torch.float32, requires_grad=True
-    )
-    routing_map = probs.detach() != 0
-
-    weights, ids = _topk_from_dense_routing(probs, routing_map, top_k=2)
-
-    torch.testing.assert_close(ids, torch.tensor([[1, 2], [3, 0]], dtype=torch.int32))
-    torch.testing.assert_close(weights, torch.tensor([[0.7, 0.3], [0.6, 0.4]]))
-    weights.sum().backward()
-    torch.testing.assert_close(probs.grad, routing_map.to(torch.float32))
-
-
-def test_dense_routing_conversion_preserves_rollout_replay_slot_order():
-    probs = torch.tensor([[0.0, 0.2, 0.8, 0.0]], dtype=torch.float32)
-    routing_map = probs != 0
-    replay_ids = torch.tensor([[1, 2]], dtype=torch.int64)
-
-    weights, ids = _topk_from_dense_routing(
-        probs, routing_map, top_k=2, ordered_topk_ids=replay_ids
-    )
-
-    torch.testing.assert_close(ids, replay_ids.to(torch.int32))
-    torch.testing.assert_close(weights, torch.tensor([[0.2, 0.8]]))
-
-
-def test_dense_routing_conversion_matches_miles_padding_normalization():
-    probs = torch.tensor([[0.6, 0.4, 0.0], [0.0, 0.2, 0.8]], dtype=torch.float32)
-    routing_map = probs != 0
-    replay_ids = torch.tensor([[-1, -1], [2, 1]], dtype=torch.int64)
-
-    weights, ids = _topk_from_dense_routing(
-        probs, routing_map, top_k=2, ordered_topk_ids=replay_ids
-    )
-
-    torch.testing.assert_close(ids, torch.tensor([[0, 1], [2, 1]], dtype=torch.int32))
-    torch.testing.assert_close(weights, torch.tensor([[0.6, 0.4], [0.8, 0.2]]))
-
-
-def test_rollout_replay_ids_follow_current_replay_stage(monkeypatch):
-    from miles.utils.replay_base import routing_replay_manager
-
-    replay_ids = torch.tensor([[7, 3]], dtype=torch.int64)
-    replay = SimpleNamespace(forward_index=1, backward_index=0, top_indices_list=[replay_ids])
-    layer = SimpleNamespace(router=SimpleNamespace(routing_replay=replay))
-    monkeypatch.setattr(routing_replay_manager, "enabled", True)
-    monkeypatch.setattr(routing_replay_manager, "stage", "replay_forward")
-
-    assert _rollout_replay_topk_ids(layer) is replay_ids
+def test_flashinfer_experts_reuse_megatron_te_parameter_contract():
+    assert issubclass(FlashInferGroupedMLP, TEGroupedMLP)
 
 
 def test_pack_topk_ids_matches_flashinfer_packed_contract():
@@ -257,7 +202,7 @@ def test_dispatched_topk_inputs_use_global_expert_ids_and_preserve_probability_g
     torch.testing.assert_close(probs.grad, torch.ones_like(probs))
 
 
-def test_grouped_mlp_weight_view_preserves_megatron_gate_up_order():
+def test_grouped_mlp_weight_parameters_do_not_materialize_stacked_copies():
     num_experts, hidden_size, intermediate_size = 2, 3, 2
     weight1 = torch.arange(
         num_experts * 2 * intermediate_size * hidden_size, dtype=torch.float32
@@ -271,10 +216,15 @@ def test_grouped_mlp_weight_view_preserves_megatron_gate_up_order():
         linear_fc2=SimpleNamespace(**{f"weight{i}": weight2[i] for i in range(num_experts)}),
     )
 
-    w13, w2 = _grouped_mlp_weights(experts)
+    w13, w2 = _grouped_mlp_weight_parameters(experts)
 
-    torch.testing.assert_close(w13, weight1)
-    torch.testing.assert_close(w2, weight2)
+    assert all(
+        weight is getattr(experts.linear_fc1, f"weight{expert}")
+        for expert, weight in enumerate(w13)
+    )
+    assert all(
+        weight is getattr(experts.linear_fc2, f"weight{expert}") for expert, weight in enumerate(w2)
+    )
 
 
 def test_bf16_surrogate_matches_megatron_expert_formula_and_gradients():
@@ -283,10 +233,9 @@ def test_bf16_surrogate_matches_megatron_expert_formula_and_gradients():
     w13 = torch.tensor([[[1.0, 0.0], [0.0, 2.0], [3.0, 0.0], [0.0, -4.0]]], requires_grad=True)
     w2 = torch.tensor([[[2.0, -1.0], [0.5, 3.0]]], requires_grad=True)
     topk_weights = torch.tensor([[0.25], [0.75]], requires_grad=True)
-    topk_ids = torch.zeros((2, 1), dtype=torch.int32)
 
     actual = _bf16_local_routed_experts(
-        hidden, topk_weights, topk_ids, w13, w2, local_expert_offset=0
+        hidden, topk_weights, tuple(w13.unbind()), tuple(w2.unbind()), (2,)
     )
     gate, up = F.linear(hidden, w13[0]).chunk(2, dim=-1)
     expected = F.linear((F.silu(gate) * up * topk_weights).to(hidden.dtype), w2[0])
@@ -315,26 +264,10 @@ def test_bf16_surrogate_matches_megatron_expert_formula_and_gradients():
         torch.testing.assert_close(actual_grad, expected_grad)
 
 
-def test_bf16_surrogate_returns_zero_grads_when_rank_has_no_routed_tokens():
-    hidden = torch.randn(3, 4, requires_grad=True)
-    topk_weights = torch.randn(3, 1, requires_grad=True)
-    topk_ids = torch.ones((3, 1), dtype=torch.int32)
-    w13 = torch.randn(1, 8, 4, requires_grad=True)
-    w2 = torch.randn(1, 4, 4, requires_grad=True)
-
-    output = _bf16_local_routed_experts(
-        hidden, topk_weights, topk_ids, w13, w2, local_expert_offset=0
-    )
-    output.sum().backward()
-
-    for tensor in (hidden, topk_weights, w13, w2):
-        assert tensor.grad is not None
-        torch.testing.assert_close(tensor.grad, torch.zeros_like(tensor))
-
-
 def test_flashinfer_autograd_skips_empty_forward_and_invalidates_on_backward():
     class FakeRunner:
         local_expert_offset = 4
+        local_num_experts = 2
 
         def __init__(self):
             self.forward_calls = 0
@@ -355,7 +288,15 @@ def test_flashinfer_autograd_skips_empty_forward_and_invalidates_on_backward():
     w2 = torch.randn((2, 4, 4), requires_grad=True)
 
     output = _FlashInferForwardBF16Backward.apply(
-        hidden, topk_weights, topk_ids, w13, w2, runner, (0, 0, 0, 0), DEQUANTIZED_BACKWARD
+        hidden,
+        topk_weights,
+        topk_ids,
+        (0, 0),
+        runner,
+        (0, 0, 0, 0),
+        DEQUANTIZED_BACKWARD,
+        *w13.unbind(),
+        *w2.unbind(),
     )
 
     assert output.shape == hidden.shape
@@ -391,6 +332,7 @@ def test_flashinfer_autograd_uses_selected_forward_operands(backward_mode):
 
     class FakeRunner:
         local_expert_offset = 0
+        local_num_experts = 1
 
         def __init__(self):
             self.invalidate_calls = 0
@@ -401,8 +343,8 @@ def test_flashinfer_autograd_uses_selected_forward_operands(backward_mode):
             return SimpleNamespace(
                 output=hidden_states.detach().clone(),
                 backward_hidden_states=FakeStorage(dequantized_hidden),
-                backward_w13=(FakeStorage(dequantized_w13[0]),),
-                backward_w2=(FakeStorage(dequantized_w2[0]),),
+                backward_w13=(dequantized_w13[0],),
+                backward_w2=(dequantized_w2[0],),
             )
 
         def invalidate_weights(self):
@@ -418,7 +360,15 @@ def test_flashinfer_autograd_uses_selected_forward_operands(backward_mode):
     grad_output = torch.tensor([[0.5, -0.25], [1.25, 0.75]])
 
     output = _FlashInferForwardBF16Backward.apply(
-        hidden, topk_weights, topk_ids, w13, w2, runner, (0, 0, 0, 0), backward_mode
+        hidden,
+        topk_weights,
+        topk_ids,
+        (2,),
+        runner,
+        (0, 0, 0, 0),
+        backward_mode,
+        *w13.unbind(),
+        *w2.unbind(),
     )
     torch.autograd.backward(output, grad_output, retain_graph=True)
     torch.autograd.backward(output, grad_output)
@@ -436,10 +386,9 @@ def test_flashinfer_autograd_uses_selected_forward_operands(backward_mode):
     reference_output = _bf16_local_routed_experts(
         reference_hidden,
         reference_weights,
-        topk_ids,
-        reference_w13,
-        reference_w2,
-        local_expert_offset=0,
+        tuple(reference_w13.unbind()),
+        tuple(reference_w2.unbind()),
+        (2,),
     )
     torch.autograd.backward(reference_output, grad_output, retain_graph=True)
     torch.autograd.backward(reference_output, grad_output)
@@ -478,7 +427,15 @@ def test_flashinfer_dequantized_mode_avoids_backward_payloads_under_no_grad(num_
 
     with torch.no_grad():
         output = _run_flashinfer_forward_with_surrogate(
-            hidden, topk_weights, topk_ids, w13, w2, runner, (1,), DEQUANTIZED_BACKWARD
+            hidden,
+            topk_weights,
+            topk_ids,
+            (num_tokens,),
+            tuple(w13.unbind()),
+            tuple(w2.unbind()),
+            runner,
+            (1,),
+            DEQUANTIZED_BACKWARD,
         )
 
     expected = hidden if num_tokens == 0 else hidden + 1
@@ -760,8 +717,8 @@ def test_flashinfer_prepares_exact_dequantized_forward_weights(monkeypatch, runn
     expected_w13 = w13_quantized.dequantize(dtype=torch.bfloat16)[:256, :128]
     expected_w2 = w2_quantized.dequantize(dtype=torch.bfloat16)[:128, :128]
 
-    actual_w13 = prepared.backward_w13[0].dequantize(dtype=torch.bfloat16)[:256, :128]
-    actual_w2 = prepared.backward_w2[0].dequantize(dtype=torch.bfloat16)[:128, :128]
+    actual_w13 = prepared.backward_w13[0]
+    actual_w2 = prepared.backward_w2[0]
     torch.testing.assert_close(actual_w13, expected_w13, rtol=0, atol=0)
     torch.testing.assert_close(actual_w2, expected_w2, rtol=0, atol=0)
     assert torch.count_nonzero(actual_w13 != w13[0]).item() > 0
@@ -821,7 +778,15 @@ def test_flashinfer_dequantized_autograd_supports_outstanding_forwards(monkeypat
 
     outputs = [
         _FlashInferForwardBF16Backward.apply(
-            hidden, topk_weights, topk_ids, w13, w2, runner, (1,), DEQUANTIZED_BACKWARD
+            hidden,
+            topk_weights,
+            topk_ids,
+            (8,),
+            runner,
+            (1,),
+            DEQUANTIZED_BACKWARD,
+            *w13.unbind(),
+            *w2.unbind(),
         )
         for _ in range(2)
     ]
@@ -945,42 +910,72 @@ def _install_distributed_route(
 
 
 def _bf16_flashinfer_apply(
-    hidden_states, topk_weights, topk_ids, w13_gate_up, w2, runner, _weight_key, _backward_mode
+    hidden_states,
+    topk_weights,
+    _topk_ids,
+    tokens_per_expert,
+    runner,
+    _weight_key,
+    _backward_mode,
+    *expert_weights,
 ):
     """Replace only the fused kernel boundary for a topology-identical reference."""
 
+    w13_gate_up = expert_weights[: runner.local_num_experts]
+    w2 = expert_weights[runner.local_num_experts :]
+    if hidden_states.shape[0] == 0:
+        zero = hidden_states.sum() + topk_weights.sum()
+        for weight in expert_weights:
+            zero = zero + weight.reshape(-1)[0] * 0
+        return torch.empty_like(hidden_states) + zero
     return _bf16_local_routed_experts(
-        hidden_states, topk_weights, topk_ids, w13_gate_up, w2, runner.local_expert_offset
+        hidden_states, topk_weights, w13_gate_up, w2, tokens_per_expert
     )
 
 
 def _dequantized_flashinfer_apply(
-    hidden_states, topk_weights, topk_ids, w13_gate_up, w2, runner, weight_key, backward_mode
+    hidden_states,
+    topk_weights,
+    topk_ids,
+    tokens_per_expert,
+    runner,
+    weight_key,
+    backward_mode,
+    *expert_weights,
 ):
     """Build an ordinary-autograd reference from forward-derived QDQ operands."""
 
     assert backward_mode == DEQUANTIZED_BACKWARD
+    w13_gate_up = expert_weights[: runner.local_num_experts]
+    w2 = expert_weights[runner.local_num_experts :]
     if hidden_states.shape[0] == 0:
-        surrogate = _bf16_local_routed_experts(
-            hidden_states, topk_weights, topk_ids, w13_gate_up, w2, runner.local_expert_offset
+        return _bf16_flashinfer_apply(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            tokens_per_expert,
+            runner,
+            weight_key,
+            backward_mode,
+            *expert_weights,
         )
-        return torch.empty_like(hidden_states) + (surrogate - surrogate.detach())
     with torch.no_grad():
         result = runner.forward(
             hidden_states, topk_weights, topk_ids, w13_gate_up, w2, weight_key, backward_mode
         )
         decoded_hidden = result.backward_hidden_states.dequantize(dtype=hidden_states.dtype)
-        decoded_w13 = _dequantize_weight_payloads(
-            result.backward_w13, tuple(w13_gate_up.shape), dtype=w13_gate_up.dtype
-        )
-        decoded_w2 = _dequantize_weight_payloads(
-            result.backward_w2, tuple(w2.shape), dtype=w2.dtype
-        )
+        decoded_w13 = result.backward_w13
+        decoded_w2 = result.backward_w2
     hidden_ref = decoded_hidden.detach() + (hidden_states - hidden_states.detach())
-    w13_ref = decoded_w13.detach() + (w13_gate_up - w13_gate_up.detach())
-    w2_ref = decoded_w2.detach() + (w2 - w2.detach())
+    w13_ref = tuple(
+        decoded.detach() + (source - source.detach())
+        for decoded, source in zip(decoded_w13, w13_gate_up)
+    )
+    w2_ref = tuple(
+        decoded.detach() + (source - source.detach()) for decoded, source in zip(decoded_w2, w2)
+    )
     surrogate = _bf16_local_routed_experts(
-        hidden_ref, topk_weights, topk_ids, w13_ref, w2_ref, runner.local_expert_offset
+        hidden_ref, topk_weights, w13_ref, w2_ref, tokens_per_expert
     )
     return result.output.detach() + (surrogate - surrogate.detach())
 
@@ -1027,23 +1022,6 @@ def _run_distributed_layer_once(
                 )
             elif surrogate_reference is not None:
                 raise ValueError(f"unknown distributed surrogate reference {surrogate_reference!r}")
-            if dispatch_mode == "alltoall":
-                stack.enter_context(
-                    mock.patch.object(
-                        flashinfer_moe_module._PaddedEPAllGather,
-                        "apply",
-                        side_effect=AssertionError(
-                            "plugin padded all-gather used in all-to-all mode"
-                        ),
-                    )
-                )
-                stack.enter_context(
-                    mock.patch.object(
-                        flashinfer_moe_module._EPAllReduceSum,
-                        "apply",
-                        side_effect=AssertionError("plugin EP all-reduce used in all-to-all mode"),
-                    )
-                )
             output, bias = layer(hidden)
     finally:
         if hook is not None:
@@ -1051,8 +1029,7 @@ def _run_distributed_layer_once(
 
     torch.autograd.backward(output, grad_seed)
     if surrogate_reference == DEQUANTIZED_BACKWARD:
-        owner = layer.experts if dispatch_mode == "alltoall" else layer
-        owner._flashinfer_moe_runner.invalidate_weights()
+        layer.experts._flashinfer_moe_runner.invalidate_weights()
     parameter_grads = []
     missing_grads = int(hidden.grad is None) + int(route_logits.grad is None)
     hidden_grad = torch.zeros_like(hidden) if hidden.grad is None else hidden.grad
@@ -1382,8 +1359,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             torch.distributed.all_gather(output_nonzero_tensors, output_nonzero)
             output_nonzero_by_rank = [value.item() for value in output_nonzero_tensors]
 
-        owner = layer.experts if moe_token_dispatcher_type == "alltoall" else layer
-        actual_runner = getattr(owner, "_flashinfer_moe_runner", None)
+        actual_runner = getattr(layer.experts, "_flashinfer_moe_runner", None)
         runner_cache_cleared = (
             isinstance(actual_runner, runner_type)
             and actual_runner._prepared is None

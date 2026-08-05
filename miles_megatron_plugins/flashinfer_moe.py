@@ -23,27 +23,19 @@ import copy
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn.functional as F
-from torch.nn.parameter import Parameter
 
-from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
-from megatron.core.tensor_parallel.layers import (
-    _initialize_affine_weight_cpu,
-    _initialize_affine_weight_gpu,
-    set_tensor_model_parallel_attributes,
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelGroupedLinear,
+    TERowParallelGroupedLinear,
 )
-from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.spec_utils import ModuleSpec, get_module
-from megatron.core.transformer.utils import (
-    ensure_metadata_has_dp_cp_group,
-    make_sharded_tensors_for_checkpoint,
-    sharded_state_dict_default,
-)
-from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
+from megatron.core.utils import get_pg_rank, log_single_rank
 
 
 logger = logging.getLogger(__name__)
@@ -71,9 +63,7 @@ def flashinfer_moe_backward_mode() -> str:
     elif value == "1":
         return DEQUANTIZED_BACKWARD
     else:
-        raise ValueError(
-            f"Unsupported {_DEQUANTIZED_ENV}={value!r}; expected '0' or '1'"
-        )
+        raise ValueError(f"Unsupported {_DEQUANTIZED_ENV}={value!r}; expected '0' or '1'")
 
 
 def _require_dequantized_backward_support(quantization: str) -> None:
@@ -113,12 +103,7 @@ def _require_dequantized_backward_support(quantization: str) -> None:
     _VALIDATED_DEQUANTIZED_SUPPORT.add(quantization)
 
 
-def _padded_linear_scales(
-    scales: torch.Tensor,
-    *,
-    rows: int,
-    scale_columns: int,
-) -> torch.Tensor:
+def _padded_linear_scales(scales: torch.Tensor, *, rows: int, scale_columns: int) -> torch.Tensor:
     """Adapt compact FlashInfer scales to TE's row-padded linear layout."""
 
     if scales.numel() != rows * scale_columns:
@@ -128,29 +113,16 @@ def _padded_linear_scales(
         )
     padded_rows = ((rows + 127) // 128) * 128
     padded_columns = ((scale_columns + 3) // 4) * 4
-    padded = torch.empty(
-        (padded_rows, padded_columns),
-        device=scales.device,
-        dtype=torch.uint8,
-    )
-    padded[:rows, :scale_columns].copy_(
-        scales.view(torch.uint8).reshape(rows, scale_columns)
-    )
+    padded = torch.empty((padded_rows, padded_columns), device=scales.device, dtype=torch.uint8)
+    padded[:rows, :scale_columns].copy_(scales.view(torch.uint8).reshape(rows, scale_columns))
     return padded
 
 
-def _mxfp8_activation_storage(
-    data: torch.Tensor,
-    scales: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-):
+def _mxfp8_activation_storage(data: torch.Tensor, scales: torch.Tensor, *, dtype: torch.dtype):
     """Wrap the exact FlashInfer rowwise MXFP8 payload for deferred decode."""
 
     from transformer_engine.pytorch.constants import DType
-    from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import (
-        MXFP8TensorStorage,
-    )
+    from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import MXFP8TensorStorage
 
     if data.ndim != 2 or data.shape[1] % _MXFP8_GROUP_SIZE:
         raise ValueError(
@@ -161,9 +133,7 @@ def _mxfp8_activation_storage(
     if rows == 0:
         raise ValueError("FlashInfer MXFP8 storage requires at least one row")
     linear_scales = _padded_linear_scales(
-        scales,
-        rows=rows,
-        scale_columns=columns // _MXFP8_GROUP_SIZE,
+        scales, rows=rows, scale_columns=columns // _MXFP8_GROUP_SIZE
     )
     return MXFP8TensorStorage(
         data.view(torch.uint8),
@@ -178,18 +148,13 @@ def _mxfp8_activation_storage(
 
 
 def dequantize_mxfp8_activation(
-    data: torch.Tensor,
-    scales: torch.Tensor,
-    *,
-    dtype: torch.dtype,
+    data: torch.Tensor, scales: torch.Tensor, *, dtype: torch.dtype
 ) -> torch.Tensor:
     """GPU-dequantize the exact rowwise MXFP8 activation used by FlashInfer."""
 
     if data.shape[0] == 0:
         return torch.empty_like(data, dtype=dtype)
-    return _mxfp8_activation_storage(data, scales, dtype=dtype).dequantize(
-        dtype=dtype
-    )
+    return _mxfp8_activation_storage(data, scales, dtype=dtype).dequantize(dtype=dtype)
 
 
 def _nvfp4_activation_storage(
@@ -204,20 +169,14 @@ def _nvfp4_activation_storage(
     """Wrap exact NVFP4 q/block scales with equivalent TE row metadata."""
 
     from transformer_engine.pytorch.constants import DType
-    from transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage import (
-        NVFP4TensorStorage,
-    )
+    from transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage import NVFP4TensorStorage
 
     if data.ndim != 2:
-        raise ValueError(
-            f"FlashInfer NVFP4 activation must be [M, K/2], got {tuple(data.shape)}"
-        )
+        raise ValueError(f"FlashInfer NVFP4 activation must be [M, K/2], got {tuple(data.shape)}")
     rows, packed_columns = data.shape
     columns = packed_columns * 2
     if columns % _NVFP4_GROUP_SIZE:
-        raise ValueError(
-            f"FlashInfer NVFP4 activation K={columns} must be divisible by 16"
-        )
+        raise ValueError(f"FlashInfer NVFP4 activation K={columns} must be divisible by 16")
     if per_token_scale.numel() != rows:
         raise ValueError(
             "FlashInfer NVFP4 per-token scale count mismatch: "
@@ -226,15 +185,11 @@ def _nvfp4_activation_storage(
     if rows == 0:
         raise ValueError("FlashInfer NVFP4 storage requires at least one row")
     linear_scales = _padded_linear_scales(
-        scales,
-        rows=rows,
-        scale_columns=columns // _NVFP4_GROUP_SIZE,
+        scales, rows=rows, scale_columns=columns // _NVFP4_GROUP_SIZE
     )
     # TE derives the row decode scale as amax / (E4M3_MAX * E2M1_MAX).
     # FlashInfer returns that decode scale directly, so reconstruct the amax.
-    row_amax = per_token_scale.to(torch.float32).reshape(rows) * float(
-        e4m3_max * 6
-    )
+    row_amax = per_token_scale.to(torch.float32).reshape(rows) * float(e4m3_max * 6)
     return NVFP4TensorStorage(
         data.view(torch.uint8),
         linear_scales,
@@ -264,51 +219,26 @@ def dequantize_nvfp4_activation(
     """Decode FlashInfer NVFP4 q data through equivalent TE row metadata."""
 
     if data.shape[0] == 0:
-        return torch.empty(
-            (0, data.shape[1] * 2), device=data.device, dtype=dtype
-        )
+        return torch.empty((0, data.shape[1] * 2), device=data.device, dtype=dtype)
     return _nvfp4_activation_storage(
-        data,
-        scales,
-        per_token_scale,
-        dtype=dtype,
-        e4m3_max=e4m3_max,
-        use_4over6=use_4over6,
+        data, scales, per_token_scale, dtype=dtype, e4m3_max=e4m3_max, use_4over6=use_4over6
     ).dequantize(dtype=dtype)
 
 
-def _dequantize_weight_payloads(
-    payloads: tuple[object, ...],
-    shape: tuple[int, ...],
-    *,
-    dtype: torch.dtype,
+def _dequantize_weight_payload(
+    payload: object, shape: torch.Size, *, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Materialize exact forward-QDQ expert weights only when backward starts."""
+    """Decode one forward-QDQ weight and discard any quantization padding."""
 
-    if len(payloads) != shape[0]:
+    decoded = payload.dequantize(dtype=dtype)
+    if len(decoded.shape) != len(shape) or any(
+        decoded_size < output_size for decoded_size, output_size in zip(decoded.shape, shape)
+    ):
         raise ValueError(
-            "FlashInfer MoE saved weight payload count mismatch: "
-            f"got {len(payloads)}, expected {shape[0]}"
+            "Decoded FlashInfer MoE weight is smaller than its master shape: "
+            f"got {tuple(decoded.shape)}, expected at least {tuple(shape)}"
         )
-    if not payloads:
-        raise ValueError("FlashInfer MoE requires at least one local expert")
-    device = payloads[0]._rowwise_data.device
-    result = torch.empty(shape, device=device, dtype=dtype)
-    for expert, payload in enumerate(payloads):
-        destination = result[expert]
-        decoded = payload.dequantize(dtype=dtype)
-        if len(decoded.shape) != len(destination.shape) or any(
-            decoded_size < output_size
-            for decoded_size, output_size in zip(decoded.shape, destination.shape)
-        ):
-            raise ValueError(
-                "Decoded FlashInfer MoE weight is smaller than its master shape: "
-                f"got {tuple(decoded.shape)}, expected at least {tuple(destination.shape)}"
-            )
-        destination.copy_(
-            decoded[tuple(slice(0, size) for size in destination.shape)]
-        )
-    return result
+    return decoded[tuple(slice(0, size) for size in shape)].contiguous()
 
 
 def _quantized_storage_shell(storage):
@@ -382,9 +312,7 @@ def _flashinfer_moe_quantization(config) -> str:
         configured.append("nvfp4")
 
     if len(configured) > 1:
-        raise ValueError(
-            f"FlashInfer MoE requires exactly one quantization, got {configured}"
-        )
+        raise ValueError(f"FlashInfer MoE requires exactly one quantization, got {configured}")
     if override:
         if configured and configured[0] != override:
             raise ValueError(
@@ -400,174 +328,61 @@ def _flashinfer_moe_quantization(config) -> str:
     return configured[0]
 
 
-class _FlashInferGroupedLinearParameters(torch.nn.Module):
-    """Per-expert BF16 parameters with TEGroupedLinear-compatible names."""
+def _validate_flashinfer_moe_config(config) -> str:
+    """Validate model-static constraints before allocating expert parameters."""
 
-    def __init__(
-        self,
-        *,
-        num_experts,
-        input_size,
-        output_size,
-        parallel_mode,
-        config,
-        init_method,
-        pg_collection,
-    ):
-        super().__init__()
-        if config.expert_tensor_parallel_size != 1:
-            raise ValueError("FlashInfer MoE currently requires expert tensor parallel size 1")
-
-        self.num_experts = num_experts
-        self.parallel_mode = parallel_mode
-        self._pg_collection = pg_collection
-        self._tp_group = pg_collection.expt_tp
-        partition_dim = 0 if parallel_mode == "column" else 1
-        shape = (output_size, input_size)
-        device = None if config.use_cpu_initialization else torch.cuda.current_device()
-
-        for expert in range(num_experts):
-            weight = Parameter(
-                torch.empty(
-                    *shape,
-                    device=device,
-                    dtype=config.params_dtype,
-                )
+    flashinfer_moe_dispatch_mode(config)
+    quantization = _flashinfer_moe_quantization(config)
+    if getattr(config, "moe_shared_expert_overlap", False):
+        raise ValueError("FlashInfer MoE does not support shared-expert overlap")
+    if config.moe_latent_size is not None:
+        raise ValueError("FlashInfer MoE does not support latent MoE projections")
+    if config.add_bias_linear:
+        raise ValueError("FlashInfer MoE does not support expert bias")
+    if not config.gated_linear_unit or config.activation_func is not F.silu:
+        raise ValueError("FlashInfer MoE currently supports gated SwiGLU only")
+    if config.activation_func_clamp_value is not None or config.glu_linear_offset != 0.0:
+        raise ValueError("FlashInfer MoE does not support SwiGLU clamp or linear offset")
+    if config.moe_expert_capacity_factor is not None:
+        raise ValueError("FlashInfer MoE does not support expert capacity or token dropping")
+    if config.moe_router_padding_for_quantization:
+        raise ValueError("FlashInfer MoE does not support router padding")
+    if config.moe_apply_probs_on_input:
+        raise ValueError("FlashInfer MoE requires routing weights in the fused finalize")
+    if config.expert_tensor_parallel_size != 1:
+        raise ValueError("FlashInfer MoE currently requires expert tensor parallel size 1")
+    if config.params_dtype != torch.bfloat16:
+        raise TypeError("FlashInfer MoE master weights must remain BF16")
+    if config.num_moe_experts > 2048:
+        raise ValueError("FlashInfer routed MoE supports at most 2048 global experts")
+    if quantization == "nvfp4":
+        if config.hidden_size % 16 or config.moe_ffn_hidden_size % 16:
+            raise ValueError("FlashInfer NVFP4 dimensions must be multiples of 16")
+    elif quantization == "mxfp8":
+        if config.num_moe_experts % 4 or config.num_moe_experts <= 1:
+            raise ValueError(
+                "FlashInfer MXFP8 requires global experts divisible by 4 and greater "
+                f"than dispatched kernel top-k 1, got {config.num_moe_experts}"
             )
-            if config.perform_initialization:
-                if config.use_cpu_initialization:
-                    _initialize_affine_weight_cpu(
-                        weight,
-                        output_size,
-                        input_size,
-                        shape[partition_dim],
-                        partition_dim=partition_dim,
-                        init_method=init_method,
-                        params_dtype=config.params_dtype,
-                        rank=0,
-                        world_size=1,
-                    )
-                else:
-                    _initialize_affine_weight_gpu(
-                        weight,
-                        init_method,
-                        partition_dim=partition_dim,
-                        is_expert=True,
-                    )
-            else:
-                set_tensor_model_parallel_attributes(
-                    tensor=weight,
-                    is_parallel=True,
-                    dim=partition_dim,
-                    stride=1,
-                )
-            setattr(weight, "allreduce", not (config.expert_model_parallel_size > 1))
-            self.register_parameter(f"weight{expert}", weight)
-
-    def sharded_state_dict(
-        self, prefix="", sharded_offsets=(), metadata=None
-    ):
-        """Mirror TEGroupedLinear's per-expert EP/ETP checkpoint mapping."""
-
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
-        singleton_local_shards = metadata.get("singleton_local_shards", False)
-        num_global_experts = get_pg_size(self._pg_collection.ep) * self.num_experts
-        local_expert_offset = get_pg_rank(self._pg_collection.ep) * self.num_experts
-        ep_axis = len(sharded_offsets)
-        tp_axis = 0 if self.parallel_mode == "column" else 1
-        sharded_state_dict = {}
-
-        for local_expert in range(self.num_experts):
-            global_expert = local_expert_offset + local_expert
-            state_dict = {
-                f"{local_expert}.weight": getattr(
-                    self, f"weight{local_expert}"
-                ),
-                f"{local_expert}._extra_state": None,
-            }
-            if singleton_local_shards:
-                expert_prefix = f"{global_expert}.{prefix}"
-                expert_offsets = sharded_offsets
-            else:
-                expert_prefix = prefix
-                expert_offsets = (
-                    *sharded_offsets,
-                    (ep_axis, global_expert, num_global_experts),
-                )
-            sub_sd = make_sharded_tensors_for_checkpoint(
-                state_dict,
-                "",
-                {f"{local_expert}.weight": tp_axis},
-                expert_offsets,
-                tp_group=self._tp_group,
-                dp_cp_group=metadata["dp_cp_group"],
+        if config.hidden_size % 128 or config.moe_ffn_hidden_size % 128:
+            raise ValueError(
+                "FlashInfer MXFP8 hidden and intermediate dimensions must be multiples of 128"
             )
-            replace_prefix_for_sharding(
-                sub_sd, f"{local_expert}.", expert_prefix
-            )
-            sharded_state_dict[f"{prefix}weight{local_expert}"] = sub_sd[
-                f"{local_expert}.weight"
-            ]
-            extra_state_suffix = "" if local_expert == 0 else str(local_expert)
-            sharded_state_dict[f"{prefix}_extra_state{extra_state_suffix}"] = (
-                sub_sd[f"{local_expert}._extra_state"]
-            )
-
-        for sharded_value in sharded_state_dict.values():
-            replica_id = sharded_value.replica_id
-            if getattr(sharded_value, "is_data_parallel_fully_shard", False):
-                expert_dp_rank = 0
-            else:
-                expert_dp_rank = get_pg_rank(self._pg_collection.expt_dp)
-            sharded_value.replica_id = (*replica_id[:2], expert_dp_rank)
-        return sharded_state_dict
+    else:
+        raise NotImplementedError(
+            f"FlashInfer MoE quantization {quantization!r} has no validation branch"
+        )
+    return quantization
 
 
-class FlashInferGroupedMLP(MegatronModule):
-    """TE-compatible BF16 master parameters without TE or grouped GEMM."""
+class FlashInferGroupedMLP(TEGroupedMLP):
+    """Megatron TE expert parameters with a FlashInfer compute boundary."""
 
-    def __init__(self, num_local_experts, config, pg_collection=None):
-        super().__init__(config=config)
-        self.config = config
-        self.num_local_experts = num_local_experts
+    def __init__(self, num_local_experts, config, submodules, pg_collection=None):
+        _validate_flashinfer_moe_config(config)
         if pg_collection is None:
             raise ValueError("FlashInferGroupedMLP requires a ProcessGroupCollection")
-        if config.add_bias_linear:
-            raise ValueError("FlashInferGroupedMLP does not support expert bias")
-        if config.moe_latent_size is not None:
-            raise ValueError("FlashInferGroupedMLP does not support latent MoE projections")
-
-        self.ep_group = pg_collection.ep
-        self.tp_group = pg_collection.expt_tp
-        self.dp_group = pg_collection.expt_dp
-        fc1_output_size = config.moe_ffn_hidden_size
-        if config.gated_linear_unit:
-            fc1_output_size *= 2
-        self.linear_fc1 = _FlashInferGroupedLinearParameters(
-            num_experts=num_local_experts,
-            input_size=config.hidden_size,
-            output_size=fc1_output_size,
-            parallel_mode="column",
-            config=config,
-            init_method=config.init_method,
-            pg_collection=pg_collection,
-        )
-        self.linear_fc2 = _FlashInferGroupedLinearParameters(
-            num_experts=num_local_experts,
-            input_size=config.moe_ffn_hidden_size,
-            output_size=config.hidden_size,
-            parallel_mode="row",
-            config=config,
-            init_method=config.output_layer_init_method,
-            pg_collection=pg_collection,
-        )
-
-        def remove_extra_states_check(_module, incompatible_keys):
-            for key in list(incompatible_keys.unexpected_keys):
-                if "_extra_state" in key:
-                    incompatible_keys.unexpected_keys.remove(key)
-
-        self.register_load_state_dict_post_hook(remove_extra_states_check)
+        super().__init__(num_local_experts, config, submodules, pg_collection=pg_collection)
 
     def forward(
         self,
@@ -578,69 +393,15 @@ class FlashInferGroupedMLP(MegatronModule):
         """Run FlashInfer on assignments already dispatched to local experts."""
 
         return _run_dispatched_flashinfer_moe(
-            self,
-            permuted_local_hidden_states,
-            tokens_per_expert,
-            permuted_probs,
+            self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
         )
 
     def backward_dw(self):
-        """No delayed TE weight-gradient work exists for plain BF16 parameters."""
-
-    def sharded_state_dict(
-        self, prefix="", sharded_offsets=(), metadata=None
-    ):
-        """Match TEGroupedMLP's global expert checkpoint keys."""
-
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
-        singleton_local_shards = metadata.get("singleton_local_shards", False)
-        sharded_state_dict = {}
-        for name, module in self._modules.items():
-            sub_sd = sharded_state_dict_default(
-                module,
-                f"{name}.",
-                sharded_offsets,
-                metadata,
-                tp_group=self.tp_group,
-            )
-            if name == "linear_fc1" and self.config.gated_linear_unit:
-                num_global_experts = (
-                    get_pg_size(self.ep_group) * self.num_local_experts
-                )
-                local_expert_offset = (
-                    get_pg_rank(self.ep_group) * self.num_local_experts
-                )
-                ep_axis = len(sharded_offsets)
-                for local_expert in range(self.num_local_experts):
-                    if singleton_local_shards:
-                        expert_offsets = sharded_offsets
-                    else:
-                        expert_offsets = (
-                            *sharded_offsets,
-                            (
-                                ep_axis,
-                                local_expert_offset + local_expert,
-                                num_global_experts,
-                            ),
-                        )
-                    key = f"{name}.weight{local_expert}"
-                    sub_sd[key] = apply_swiglu_sharded_factory(
-                        sub_sd[key], expert_offsets, singleton_local_shards
-                    )
-            if singleton_local_shards:
-                replace_prefix_for_sharding(sub_sd, "", f"{prefix}experts.")
-            else:
-                replace_prefix_for_sharding(
-                    sub_sd, f"{name}.", f"{prefix}experts.{name}."
-                )
-            sharded_state_dict.update(
-                {f"{prefix}{key}": value for key, value in sub_sd.items()}
-            )
-        return sharded_state_dict
+        """Custom autograd produces weight gradients without delayed TE work."""
 
 
 def maybe_replace_flashinfer_moe_expert_spec(submodules):
-    """Select non-TE BF16 expert parameters when the FlashInfer path is enabled."""
+    """Replace only expert compute while retaining Megatron's TE parameter contract."""
 
     if not use_flashinfer_moe():
         return submodules
@@ -652,132 +413,42 @@ def maybe_replace_flashinfer_moe_expert_spec(submodules):
         return submodules
 
     replacement = copy.copy(submodules)
-    replacement.experts = ModuleSpec(module=FlashInferGroupedMLP)
-    return replacement
-
-
-def _topk_from_dense_routing(
-    probs: torch.Tensor,
-    routing_map: torch.Tensor,
-    top_k: int,
-    ordered_topk_ids: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Recover precomputed routed-kernel inputs from Megatron's dense router output."""
-
-    if probs.ndim != 2 or routing_map.shape != probs.shape:
-        raise ValueError(
-            "FlashInfer MoE expects dense [tokens, experts] probabilities and routing map, "
-            f"got {tuple(probs.shape)} and {tuple(routing_map.shape)}"
-        )
-    if routing_map.dtype != torch.bool:
-        routing_map = routing_map.bool()
-    selected_per_token = routing_map.sum(dim=-1)
-    if not torch.all(selected_per_token == top_k):
-        raise ValueError(
-            "FlashInfer MoE does not support token dropping or padded routing; "
-            f"expected {top_k} selected experts per token"
-        )
-
-    if ordered_topk_ids is not None:
-        ordered_topk_ids = ordered_topk_ids.to(
-            device=probs.device, dtype=torch.long, non_blocking=True
-        )
-        if ordered_topk_ids.shape != (probs.shape[0], top_k):
-            raise ValueError(
-                "Rollout-routing-replay IDs do not match the local routed tokens: "
-                f"got {tuple(ordered_topk_ids.shape)}, expected {(probs.shape[0], top_k)}"
-            )
-        # Miles stores padding rows as all -1, then replaces them with a valid
-        # deterministic range inside ReplayManager before building routing_map.
-        # Apply the same replacement to the saved stream whose slot order we
-        # recover here.
-        all_invalid = (ordered_topk_ids == -1).all(dim=-1)
-        if torch.any(all_invalid):
-            padding_ids = (
-                torch.arange(top_k, device=probs.device, dtype=torch.long)
-                % probs.shape[1]
-            )
-            ordered_topk_ids = torch.where(
-                all_invalid.unsqueeze(-1), padding_ids, ordered_topk_ids
-            )
-        if torch.any(ordered_topk_ids < 0) or torch.any(
-            ordered_topk_ids >= probs.shape[1]
-        ):
-            raise ValueError("FlashInfer MoE found invalid rollout-routing-replay expert IDs")
-        if not torch.all(routing_map.gather(1, ordered_topk_ids)):
-            raise ValueError(
-                "Rollout-routing-replay IDs disagree with Megatron's dense routing map"
-            )
-        topk_weights = probs.gather(1, ordered_topk_ids)
-        return (
-            topk_weights.contiguous(),
-            ordered_topk_ids.to(torch.int32).contiguous(),
-        )
-
-    masked_probs = probs.masked_fill(~routing_map, torch.finfo(probs.dtype).min)
-    topk_weights, topk_ids = torch.topk(masked_probs, k=top_k, dim=-1, sorted=True)
-    return topk_weights.contiguous(), topk_ids.to(torch.int32).contiguous()
-
-
-def _rollout_replay_topk_ids(moe_layer) -> Optional[torch.Tensor]:
-    """Return the exact top-k slot order consumed by Miles routing replay."""
-
-    try:
-        from miles.utils.replay_base import routing_replay_manager
-    except ImportError:
-        return None
-
-    if not routing_replay_manager.enabled:
-        return None
-    replay = getattr(moe_layer.router, "routing_replay", None)
-    if replay is None:
-        raise RuntimeError(
-            "Miles rollout-routing-replay was enabled after model construction; "
-            "the FlashInfer MoE router has no registered replay stream"
-        )
-
-    if routing_replay_manager.stage == "replay_forward":
-        index = replay.forward_index - 1
-    elif routing_replay_manager.stage == "replay_backward":
-        index = replay.backward_index - 1
-    elif routing_replay_manager.stage == "record":
-        index = len(replay.top_indices_list) - 1
+    if isinstance(submodules.experts, ModuleSpec):
+        expert_spec = copy.copy(submodules.experts)
+        expert_spec.module = FlashInferGroupedMLP
     else:
-        return None
-    if index < 0 or index >= len(replay.top_indices_list):
-        raise RuntimeError(
-            "Miles rollout-routing-replay did not produce top-k IDs for the current MoE layer"
+        expert_spec = ModuleSpec(module=FlashInferGroupedMLP)
+    if expert_spec.submodules is None:
+        if TEColumnParallelGroupedLinear is None or TERowParallelGroupedLinear is None:
+            raise RuntimeError("FlashInfer MoE requires Transformer Engine grouped linears")
+        expert_spec.submodules = MLPSubmodules(
+            linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
         )
-    return replay.top_indices_list[index]
+    replacement.experts = expert_spec
+    return replacement
 
 
 def _pack_topk_ids(topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
     """Mirror SGLang's ``PackTopkIds`` packed BF16 routing representation."""
 
-    weight_bits = (
-        topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
-    )
+    weight_bits = topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
     return ((topk_ids.to(torch.int32) << 16) | weight_bits).contiguous()
 
 
-def _grouped_mlp_weights(
+def _grouped_mlp_weight_parameters(
     experts: FlashInferGroupedMLP,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return Megatron-order BF16 weights as [E, 2I, H] and [E, H, I]."""
+) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+    """Return expert parameters without materializing a stacked BF16 copy."""
 
-    w13 = torch.stack(
-        [
-            getattr(experts.linear_fc1, f"weight{expert}")
-            for expert in range(experts.num_local_experts)
-        ]
+    w13 = tuple(
+        getattr(experts.linear_fc1, f"weight{expert}")
+        for expert in range(experts.num_local_experts)
     )
-    w2 = torch.stack(
-        [
-            getattr(experts.linear_fc2, f"weight{expert}")
-            for expert in range(experts.num_local_experts)
-        ]
+    w2 = tuple(
+        getattr(experts.linear_fc2, f"weight{expert}")
+        for expert in range(experts.num_local_experts)
     )
-    return w13.contiguous(), w2.contiguous()
+    return w13, w2
 
 
 def _dispatched_topk_inputs(
@@ -791,18 +462,16 @@ def _dispatched_topk_inputs(
 
     if permuted_probs.ndim != 1:
         raise ValueError(
-            "FlashInfer all-to-all expects one routing probability per dispatched row, "
+            "FlashInfer MoE expects one routing probability per dispatched row, "
             f"got {tuple(permuted_probs.shape)}"
         )
     if tokens_per_expert.ndim != 1 or tokens_per_expert.numel() != num_local_experts:
         raise ValueError(
-            "FlashInfer all-to-all expects one token count per local expert, "
+            "FlashInfer MoE expects one token count per local expert, "
             f"got {tuple(tokens_per_expert.shape)} for {num_local_experts} experts"
         )
 
-    counts = tokens_per_expert.to(
-        device=permuted_probs.device, dtype=torch.long, non_blocking=True
-    )
+    counts = tokens_per_expert.to(device=permuted_probs.device, dtype=torch.long, non_blocking=True)
     local_expert_ids = torch.arange(
         local_expert_offset,
         local_expert_offset + num_local_experts,
@@ -827,113 +496,38 @@ def _source_weight_key(experts: FlashInferGroupedMLP) -> tuple[int, ...]:
     return tuple(key)
 
 
-class _PaddedEPAllGather(torch.autograd.Function):
-    """Padded EP all-gather whose backward is a summing reduce-scatter."""
-
-    @staticmethod
-    def forward(ctx, local_tensor, max_tokens, token_counts, ep_group, ep_rank, ep_size):
-        ctx.max_tokens = max_tokens
-        ctx.token_counts = token_counts
-        ctx.ep_group = ep_group
-        ctx.ep_rank = ep_rank
-        ctx.ep_size = ep_size
-
-        padded = local_tensor.new_zeros((max_tokens, *local_tensor.shape[1:]))
-        padded[: local_tensor.shape[0]].copy_(local_tensor)
-        gathered = [torch.empty_like(padded) for _ in range(ep_size)]
-        torch.distributed.all_gather(gathered, padded, group=ep_group)
-        return torch.cat(gathered, dim=0)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        chunks = grad_output.contiguous().view(
-            ctx.ep_size, ctx.max_tokens, *grad_output.shape[1:]
-        )
-        grad_local_padded = torch.empty_like(chunks[ctx.ep_rank])
-        torch.distributed.reduce_scatter(
-            grad_local_padded,
-            [chunk.contiguous() for chunk in chunks.unbind(0)],
-            group=ctx.ep_group,
-        )
-        local_tokens = ctx.token_counts[ctx.ep_rank]
-        return grad_local_padded[:local_tokens], None, None, None, None, None
-
-
-class _EPAllReduceSum(torch.autograd.Function):
-    """EP sum for local-expert partials, with the same sum in backward."""
-
-    @staticmethod
-    def forward(ctx, local_output, ep_group):
-        ctx.ep_group = ep_group
-        output = local_output.clone()
-        torch.distributed.all_reduce(output, group=ep_group)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        grad_input = grad_output.contiguous().clone()
-        torch.distributed.all_reduce(grad_input, group=ctx.ep_group)
-        return grad_input, None
-
-
-def _all_gather_token_counts(
-    local_tokens: int, device: torch.device, ep_group, ep_size: int
-) -> tuple[int, tuple[int, ...]]:
-    local_count = torch.tensor([local_tokens], dtype=torch.int64, device=device)
-    gathered_counts = [torch.empty_like(local_count) for _ in range(ep_size)]
-    torch.distributed.all_gather(gathered_counts, local_count, group=ep_group)
-    counts = tuple(int(count.item()) for count in gathered_counts)
-    return max(counts), counts
-
-
-def _all_gather_padded_no_grad(
-    local_tensor: torch.Tensor, max_tokens: int, ep_group, ep_size: int
-) -> torch.Tensor:
-    padded = local_tensor.new_zeros((max_tokens, *local_tensor.shape[1:]))
-    padded[: local_tensor.shape[0]].copy_(local_tensor)
-    gathered = [torch.empty_like(padded) for _ in range(ep_size)]
-    torch.distributed.all_gather(gathered, padded, group=ep_group)
-    return torch.cat(gathered, dim=0)
-
-
 def _bf16_local_routed_experts(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    w13_gate_up: torch.Tensor,
-    w2: torch.Tensor,
-    local_expert_offset: int,
+    w13_gate_up: Sequence[torch.Tensor],
+    w2: Sequence[torch.Tensor],
+    tokens_per_expert: Sequence[int],
 ) -> torch.Tensor:
-    """High-precision surrogate for this rank's local routed experts."""
+    """BF16 surrogate over Megatron's expert-sorted dispatched rows."""
 
-    output = hidden_states.new_zeros(hidden_states.shape)
-    # Keep every custom-autograd input connected even if this EP rank owns no
-    # selected experts. This makes every rank enter the matching backward
-    # collectives with explicit zero gradients instead of returning ``None``.
-    output = output + (
-        hidden_states.sum()
-        + topk_weights.sum()
-        + w13_gate_up.sum()
-        + w2.sum()
-    ) * 0
+    if len(w13_gate_up) != len(w2) or len(w13_gate_up) != len(tokens_per_expert):
+        raise ValueError("FlashInfer MoE expert weights and token counts must align")
+    if sum(tokens_per_expert) != hidden_states.shape[0]:
+        raise ValueError(
+            "FlashInfer MoE dispatched token counts do not match hidden rows: "
+            f"{sum(tokens_per_expert)} != {hidden_states.shape[0]}"
+        )
 
-    for local_expert in range(w13_gate_up.shape[0]):
-        global_expert = local_expert_offset + local_expert
-        token_indices, slots = torch.where(topk_ids == global_expert)
-        if token_indices.numel() == 0:
+    outputs = []
+    start = 0
+    for local_expert, count in enumerate(tokens_per_expert):
+        if count == 0:
             continue
-
-        fc1 = F.linear(hidden_states[token_indices], w13_gate_up[local_expert])
+        end = start + count
+        fc1 = F.linear(hidden_states[start:end], w13_gate_up[local_expert])
         gate, up = fc1.chunk(2, dim=-1)
         activated = F.silu(gate) * up
         # Megatron applies routing probabilities before FC2 and rounds back to BF16.
-        activated = (
-            activated * topk_weights[token_indices, slots].unsqueeze(-1)
-        ).to(activated.dtype)
-        expert_output = F.linear(activated, w2[local_expert])
-        output = output.index_add(0, token_indices, expert_output)
+        activated = (activated * topk_weights[start:end]).to(activated.dtype)
+        outputs.append(F.linear(activated, w2[local_expert]))
+        start = end
 
-    return output
+    return torch.cat(outputs, dim=0)
 
 
 @dataclass
@@ -945,50 +539,34 @@ class _PreparedWeights:
     output1_scale: torch.Tensor
     output1_gate_scale: torch.Tensor
     output2_scale: torch.Tensor
-    backward_w13: Optional[tuple[object, ...]] = None
-    backward_w2: Optional[tuple[object, ...]] = None
+    backward_w13: Optional[tuple[torch.Tensor, ...]] = None
+    backward_w2: Optional[tuple[torch.Tensor, ...]] = None
 
 
 def _te_nvfp4_weight_e4m3_max() -> int:
     use_4over6 = os.environ.get("NVTE_NVFP4_4OVER6", "").strip().lower()
-    use_256 = os.environ.get(
-        "NVTE_NVFP4_4OVER6_E4M3_USE_256", "all"
-    ).strip().lower()
+    use_256 = os.environ.get("NVTE_NVFP4_4OVER6_E4M3_USE_256", "all").strip().lower()
     if use_4over6 in ("weights", "all") and use_256 in ("weights", "all"):
         return 256
     return 448
 
 
-def _te_nvfp4_global_decode_scale(
-    global_amax: torch.Tensor, e4m3_max: int
-) -> torch.Tensor:
+def _te_nvfp4_global_decode_scale(global_amax: torch.Tensor, e4m3_max: int) -> torch.Tensor:
     encode_scale = torch.div(
-        torch.tensor(
-            float(e4m3_max * 6),
-            device=global_amax.device,
-            dtype=torch.float32,
-        ),
+        torch.tensor(float(e4m3_max * 6), device=global_amax.device, dtype=torch.float32),
         global_amax.to(torch.float32),
     )
     encode_scale = torch.minimum(
         encode_scale,
         torch.tensor(
-            torch.finfo(torch.float32).max,
-            device=global_amax.device,
-            dtype=torch.float32,
+            torch.finfo(torch.float32).max, device=global_amax.device, dtype=torch.float32
         ),
     )
-    encode_scale = torch.where(
-        encode_scale == 0.0, torch.ones_like(encode_scale), encode_scale
-    )
+    encode_scale = torch.where(encode_scale == 0.0, torch.ones_like(encode_scale), encode_scale)
     return torch.reciprocal(encode_scale)
 
 
-def _te_nvfp4_quantize_weight(
-    weight: torch.Tensor,
-    *,
-    return_quantized: bool = False,
-):
+def _te_nvfp4_quantize_weight(weight: torch.Tensor, *, return_quantized: bool = False):
     """Quantize one expert matrix with Miles' TE weight-sync contract."""
 
     from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
@@ -998,27 +576,13 @@ def _te_nvfp4_quantize_weight(
     pad_rows = (-num_rows) % _TE_NVFP4_ROW_ALIGNMENT
     if pad_rows:
         weight = torch.cat(
-            (
-                weight,
-                torch.zeros(
-                    (pad_rows, num_cols),
-                    device=weight.device,
-                    dtype=weight.dtype,
-                ),
-            ),
+            (weight, torch.zeros((pad_rows, num_cols), device=weight.device, dtype=weight.dtype)),
             dim=0,
         )
 
-    use_4over6 = (
-        os.environ.get("NVTE_NVFP4_4OVER6", "").strip().lower()
-        in ("weights", "all")
-    )
+    use_4over6 = os.environ.get("NVTE_NVFP4_4OVER6", "").strip().lower() in ("weights", "all")
     e4m3_max = _te_nvfp4_weight_e4m3_max()
-    err_mode = (
-        os.environ.get("NVTE_NVFP4_4OVER6_ERR_MODE", "MAE")
-        .strip()
-        .upper()
-    )
+    err_mode = os.environ.get("NVTE_NVFP4_4OVER6_ERR_MODE", "MAE").strip().upper()
     quantizer = NVFP4Quantizer(
         rowwise=True,
         columnwise=False,
@@ -1054,15 +618,11 @@ def _te_nvfp4_quantize_weight(
 
 
 def _te_nvfp4_quantize_gated_weight(
-    gate_up_weight: torch.Tensor,
-    *,
-    return_quantized: bool = False,
+    gate_up_weight: torch.Tensor, *, return_quantized: bool = False
 ):
     """Quantize shared-scale gate/up rows, then adapt to FlashInfer order."""
 
-    result = _te_nvfp4_quantize_weight(
-        gate_up_weight, return_quantized=return_quantized
-    )
+    result = _te_nvfp4_quantize_weight(gate_up_weight, return_quantized=return_quantized)
     if return_quantized:
         qweight, block_scale, global_scale, quantized = result
     else:
@@ -1085,23 +645,19 @@ class _PreparedMXFP8Weights:
     gemm1_scales: torch.Tensor
     gemm2_weights: torch.Tensor
     gemm2_scales: torch.Tensor
-    backward_w13: Optional[tuple[object, ...]] = None
-    backward_w2: Optional[tuple[object, ...]] = None
+    backward_w13: Optional[tuple[torch.Tensor, ...]] = None
+    backward_w2: Optional[tuple[torch.Tensor, ...]] = None
 
 
 @dataclass
 class _FlashInferForwardResult:
     output: torch.Tensor
     backward_hidden_states: Optional[object]
-    backward_w13: Optional[tuple[object, ...]]
-    backward_w2: Optional[tuple[object, ...]]
+    backward_w13: Optional[tuple[torch.Tensor, ...]]
+    backward_w2: Optional[tuple[torch.Tensor, ...]]
 
 
-def _te_mxfp8_quantize_weight(
-    weight: torch.Tensor,
-    *,
-    return_quantized: bool = False,
-):
+def _te_mxfp8_quantize_weight(weight: torch.Tensor, *, return_quantized: bool = False):
     """Quantize one expert matrix with Miles' rowwise MXFP8 contract."""
 
     from transformer_engine.pytorch import MXFP8Quantizer
@@ -1112,35 +668,22 @@ def _te_mxfp8_quantize_weight(
     weight = weight.contiguous()
     num_rows, num_cols = weight.shape
     if num_cols % _MXFP8_GROUP_SIZE:
-        raise ValueError(
-            f"MXFP8 expert K={num_cols} must be divisible by {_MXFP8_GROUP_SIZE}"
-        )
+        raise ValueError(f"MXFP8 expert K={num_cols} must be divisible by {_MXFP8_GROUP_SIZE}")
     pad_rows = (-num_rows) % _TE_MXFP8_ROW_ALIGNMENT
     if pad_rows:
         weight = torch.cat(
-            (
-                weight,
-                torch.zeros(
-                    (pad_rows, num_cols),
-                    device=weight.device,
-                    dtype=weight.dtype,
-                ),
-            ),
+            (weight, torch.zeros((pad_rows, num_cols), device=weight.device, dtype=weight.dtype)),
             dim=0,
         )
 
     quantizer = MXFP8Quantizer(
-        fp8_dtype=TE_DType[torch.float8_e4m3fn],
-        rowwise=True,
-        columnwise=False,
+        fp8_dtype=TE_DType[torch.float8_e4m3fn], rowwise=True, columnwise=False
     )
     quantizer.internal = True
     quantized = quantizer.quantize(weight)
     qweight = quantized._rowwise_data[:num_rows, :num_cols]
     qweight = qweight.contiguous().view(torch.float8_e4m3fn)
-    scale = quantized._rowwise_scale_inv[
-        :num_rows, : num_cols // _MXFP8_GROUP_SIZE
-    ].contiguous()
+    scale = quantized._rowwise_scale_inv[:num_rows, : num_cols // _MXFP8_GROUP_SIZE].contiguous()
     result = (qweight, scale.view(torch.uint8))
     if return_quantized:
         return (*result, quantized)
@@ -1148,15 +691,11 @@ def _te_mxfp8_quantize_weight(
 
 
 def _te_mxfp8_quantize_gated_weight(
-    gate_up_weight: torch.Tensor,
-    *,
-    return_quantized: bool = False,
+    gate_up_weight: torch.Tensor, *, return_quantized: bool = False
 ):
     """Quantize Megatron [gate, up] rows and adapt them to TRT-LLM [up, gate]."""
 
-    result = _te_mxfp8_quantize_weight(
-        gate_up_weight, return_quantized=return_quantized
-    )
+    result = _te_mxfp8_quantize_weight(gate_up_weight, return_quantized=return_quantized)
     if return_quantized:
         qweight, scale, quantized = result
     else:
@@ -1218,8 +757,8 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
 
     def _prepare_weights(
         self,
-        w13_gate_up: torch.Tensor,
-        w2: torch.Tensor,
+        w13_gate_up: Sequence[torch.Tensor],
+        w2: Sequence[torch.Tensor],
         weight_key: tuple[int, ...],
         backward_mode: str = HIGH_PRECISION_BACKWARD,
     ) -> _PreparedWeights:
@@ -1255,35 +794,37 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
             w13_result = _te_nvfp4_quantize_gated_weight(
                 w13_gate_up[expert], return_quantized=dequantized_backward
             )
-            w2_result = _te_nvfp4_quantize_weight(
-                w2[expert], return_quantized=dequantized_backward
-            )
+            w2_result = _te_nvfp4_quantize_weight(w2[expert], return_quantized=dequantized_backward)
             if dequantized_backward:
                 w13_q, w13_sf, w13_decode, w13_quantized = w13_result
                 w2_q, w2_sf, w2_decode, w2_quantized = w2_result
-                backward_w13.append(w13_quantized)
-                backward_w2.append(w2_quantized)
+                backward_w13.append(
+                    _dequantize_weight_payload(
+                        w13_quantized, w13_gate_up[expert].shape, dtype=w13_gate_up[expert].dtype
+                    )
+                )
+                backward_w2.append(
+                    _dequantize_weight_payload(
+                        w2_quantized, w2[expert].shape, dtype=w2[expert].dtype
+                    )
+                )
+                del w13_quantized, w2_quantized
             else:
                 w13_q, w13_sf, w13_decode = w13_result
                 w2_q, w2_sf, w2_decode = w2_result
-            w13_q = w13_q.reshape(
-                2 * self.intermediate_size, self.hidden_size // 2
-            ).view(torch.uint8)
+            w13_q = w13_q.reshape(2 * self.intermediate_size, self.hidden_size // 2).view(
+                torch.uint8
+            )
             w13_sf = w13_sf.view(torch.float8_e4m3fn).reshape(
                 2 * self.intermediate_size, self.hidden_size // 16
             )
-            w2_q = w2_q.reshape(
-                self.hidden_size, self.intermediate_size // 2
-            ).view(torch.uint8)
+            w2_q = w2_q.reshape(self.hidden_size, self.intermediate_size // 2).view(torch.uint8)
             w2_sf = w2_sf.view(torch.float8_e4m3fn).reshape(
                 self.hidden_size, self.intermediate_size // 16
             )
 
             weight_indices = _maybe_get_cached_w3_w1_permute_indices(
-                self._permute_cache,
-                w13_q,
-                epilogue_tile_m,
-                is_gated_act_gemm=True,
+                self._permute_cache, w13_q, epilogue_tile_m, is_gated_act_gemm=True
             ).to(w13_q.device)
             scale_indices = _maybe_get_cached_w3_w1_permute_indices(
                 self._permute_cache,
@@ -1294,25 +835,18 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
             ).to(w13_sf.device)
             gemm1_weights.append(w13_q[weight_indices].contiguous())
             gemm1_scales.append(
-                nvfp4_block_scale_interleave(
-                    w13_sf.view(torch.uint8)[scale_indices].contiguous()
-                )
+                nvfp4_block_scale_interleave(w13_sf.view(torch.uint8)[scale_indices].contiguous())
             )
 
             weight_indices = get_w2_permute_indices_with_cache(
                 self._permute_cache, w2_q, epilogue_tile_m
             ).to(w2_q.device)
             scale_indices = get_w2_permute_indices_with_cache(
-                self._permute_cache,
-                w2_sf.view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
+                self._permute_cache, w2_sf.view(torch.uint8), epilogue_tile_m, num_elts_per_sf=16
             ).to(w2_sf.device)
             gemm2_weights.append(w2_q[weight_indices].contiguous())
             gemm2_scales.append(
-                nvfp4_block_scale_interleave(
-                    w2_sf.view(torch.uint8)[scale_indices].contiguous()
-                )
+                nvfp4_block_scale_interleave(w2_sf.view(torch.uint8)[scale_indices].contiguous())
             )
             output1_scales.append(w13_decode)
             output2_scales.append(w2_decode)
@@ -1322,19 +856,11 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
             gemm1_weights=torch.stack(gemm1_weights),
             gemm1_scales=torch.stack(gemm1_scales)
             .view(torch.float8_e4m3fn)
-            .reshape(
-                self.local_num_experts,
-                2 * self.intermediate_size,
-                self.hidden_size // 16,
-            ),
+            .reshape(self.local_num_experts, 2 * self.intermediate_size, self.hidden_size // 16),
             gemm2_weights=torch.stack(gemm2_weights),
             gemm2_scales=torch.stack(gemm2_scales)
             .view(torch.float8_e4m3fn)
-            .reshape(
-                self.local_num_experts,
-                self.hidden_size,
-                self.intermediate_size // 16,
-            ),
+            .reshape(self.local_num_experts, self.hidden_size, self.intermediate_size // 16),
             output1_scale=output1_scale,
             output1_gate_scale=output1_scale.clone(),
             output2_scale=torch.stack(output2_scales).to(torch.float32),
@@ -1357,8 +883,8 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        w13_gate_up: torch.Tensor,
-        w2: torch.Tensor,
+        w13_gate_up: Sequence[torch.Tensor],
+        w2: Sequence[torch.Tensor],
         weight_key: tuple[int, ...],
         backward_mode: str,
     ) -> _FlashInferForwardResult:
@@ -1366,14 +892,9 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
         from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
         from flashinfer.utils import device_support_pdl
 
-        prepared = self._prepare_weights(
-            w13_gate_up, w2, weight_key, backward_mode
-        )
+        prepared = self._prepare_weights(w13_gate_up, w2, weight_key, backward_mode)
         input_global_scale = torch.full(
-            (1,),
-            1.0 / (self._e4m3_max() * 6.0),
-            dtype=torch.float32,
-            device=hidden_states.device,
+            (1,), 1.0 / (self._e4m3_max() * 6.0), dtype=torch.float32, device=hidden_states.device
         )
         hidden_fp4, hidden_scales, per_token_scale = nvfp4_quantize(
             hidden_states.contiguous(),
@@ -1419,8 +940,7 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
             do_finalize=True,
             activation_type=ActivationType.Swiglu.value,
             tune_max_num_tokens=tune_max_tokens,
-            enable_pdl=hidden_states.shape[0] <= 8192
-            and device_support_pdl(hidden_states.device),
+            enable_pdl=hidden_states.shape[0] <= 8192 and device_support_pdl(hidden_states.device),
         )[0]
         backward_hidden_states = None
         if backward_mode == DEQUANTIZED_BACKWARD:
@@ -1447,8 +967,8 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
 
     def _prepare_weights(
         self,
-        w13_gate_up: torch.Tensor,
-        w2: torch.Tensor,
+        w13_gate_up: Sequence[torch.Tensor],
+        w2: Sequence[torch.Tensor],
         weight_key: tuple[int, ...],
         backward_mode: str = HIGH_PRECISION_BACKWARD,
     ) -> _PreparedMXFP8Weights:
@@ -1462,9 +982,7 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
             return self._prepared
 
         from flashinfer import block_scale_interleave
-        from flashinfer.fused_moe.core import (
-            get_reorder_rows_for_gated_act_gemm_row_indices,
-        )
+        from flashinfer.fused_moe.core import get_reorder_rows_for_gated_act_gemm_row_indices
         from flashinfer.utils import (
             get_shuffle_matrix_a_row_indices,
             get_shuffle_matrix_sf_a_row_indices,
@@ -1485,29 +1003,30 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
             w13_result = _te_mxfp8_quantize_gated_weight(
                 w13_gate_up[expert], return_quantized=dequantized_backward
             )
-            w2_result = _te_mxfp8_quantize_weight(
-                w2[expert], return_quantized=dequantized_backward
-            )
+            w2_result = _te_mxfp8_quantize_weight(w2[expert], return_quantized=dequantized_backward)
             if dequantized_backward:
                 w13_q, w13_sf, w13_quantized = w13_result
                 w2_q, w2_sf, w2_quantized = w2_result
-                backward_w13.append(w13_quantized)
-                backward_w2.append(w2_quantized)
+                backward_w13.append(
+                    _dequantize_weight_payload(
+                        w13_quantized, w13_gate_up[expert].shape, dtype=w13_gate_up[expert].dtype
+                    )
+                )
+                backward_w2.append(
+                    _dequantize_weight_payload(
+                        w2_quantized, w2[expert].shape, dtype=w2[expert].dtype
+                    )
+                )
+                del w13_quantized, w2_quantized
             else:
                 w13_q, w13_sf = w13_result
                 w2_q, w2_sf = w2_result
-            w13_u8 = w13_q.reshape(
-                2 * self.intermediate_size, self.hidden_size
-            ).view(torch.uint8)
+            w13_u8 = w13_q.reshape(2 * self.intermediate_size, self.hidden_size).view(torch.uint8)
             w13_sf = w13_sf.reshape(
                 2 * self.intermediate_size, self.hidden_size // _MXFP8_GROUP_SIZE
             )
-            w2_u8 = w2_q.reshape(
-                self.hidden_size, self.intermediate_size
-            ).view(torch.uint8)
-            w2_sf = w2_sf.reshape(
-                self.hidden_size, self.intermediate_size // _MXFP8_GROUP_SIZE
-            )
+            w2_u8 = w2_q.reshape(self.hidden_size, self.intermediate_size).view(torch.uint8)
+            w2_sf = w2_sf.reshape(self.hidden_size, self.intermediate_size // _MXFP8_GROUP_SIZE)
 
             cache_key = (
                 tuple(w13_u8.shape),
@@ -1520,44 +1039,24 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
             indices = self._permute_cache.get(cache_key)
             if indices is None:
                 indices = (
-                    get_reorder_rows_for_gated_act_gemm_row_indices(w13_u8).to(
-                        w13_u8.device
-                    ),
-                    get_shuffle_matrix_a_row_indices(
-                        w13_u8, epilogue_tile_m
-                    ).to(w13_u8.device),
-                    get_shuffle_matrix_a_row_indices(w2_u8, epilogue_tile_m).to(
-                        w2_u8.device
-                    ),
-                    get_shuffle_matrix_sf_a_row_indices(
-                        w13_sf, epilogue_tile_m
-                    ).to(w13_sf.device),
-                    get_shuffle_matrix_sf_a_row_indices(
-                        w2_sf, epilogue_tile_m
-                    ).to(w2_sf.device),
+                    get_reorder_rows_for_gated_act_gemm_row_indices(w13_u8).to(w13_u8.device),
+                    get_shuffle_matrix_a_row_indices(w13_u8, epilogue_tile_m).to(w13_u8.device),
+                    get_shuffle_matrix_a_row_indices(w2_u8, epilogue_tile_m).to(w2_u8.device),
+                    get_shuffle_matrix_sf_a_row_indices(w13_sf, epilogue_tile_m).to(w13_sf.device),
+                    get_shuffle_matrix_sf_a_row_indices(w2_sf, epilogue_tile_m).to(w2_sf.device),
                 )
                 self._permute_cache[cache_key] = indices
-            (
-                gated_rows,
-                w13_weight_rows,
-                w2_weight_rows,
-                w13_scale_rows,
-                w2_scale_rows,
-            ) = indices
+            (gated_rows, w13_weight_rows, w2_weight_rows, w13_scale_rows, w2_scale_rows) = indices
 
             w13_u8 = w13_u8.index_select(0, gated_rows)
             w13_sf = w13_sf.index_select(0, gated_rows)
-            gemm1_weights.append(
-                w13_u8.index_select(0, w13_weight_rows).contiguous()
-            )
+            gemm1_weights.append(w13_u8.index_select(0, w13_weight_rows).contiguous())
             gemm1_scales.append(
                 block_scale_interleave(
                     w13_sf.index_select(0, w13_scale_rows).contiguous()
                 ).reshape_as(w13_sf)
             )
-            gemm2_weights.append(
-                w2_u8.index_select(0, w2_weight_rows).contiguous()
-            )
+            gemm2_weights.append(w2_u8.index_select(0, w2_weight_rows).contiguous())
             gemm2_scales.append(
                 block_scale_interleave(
                     w2_sf.index_select(0, w2_scale_rows).contiguous()
@@ -1588,25 +1087,18 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        w13_gate_up: torch.Tensor,
-        w2: torch.Tensor,
+        w13_gate_up: Sequence[torch.Tensor],
+        w2: Sequence[torch.Tensor],
         weight_key: tuple[int, ...],
         backward_mode: str,
     ) -> _FlashInferForwardResult:
         from flashinfer import ActivationType, RoutingMethodType, mxfp8_quantize
-        from flashinfer.fused_moe import (
-            Fp8QuantizationType,
-            trtllm_fp8_block_scale_routed_moe,
-        )
+        from flashinfer.fused_moe import Fp8QuantizationType, trtllm_fp8_block_scale_routed_moe
         from flashinfer.tllm_enums import WeightLayout
         from flashinfer.utils import device_support_pdl
 
-        prepared = self._prepare_weights(
-            w13_gate_up, w2, weight_key, backward_mode
-        )
-        hidden_q, hidden_sf = mxfp8_quantize(
-            hidden_states.contiguous(), False, backend="cute-dsl"
-        )
+        prepared = self._prepare_weights(w13_gate_up, w2, weight_key, backward_mode)
+        hidden_q, hidden_sf = mxfp8_quantize(hidden_states.contiguous(), False, backend="cute-dsl")
         hidden_sf = hidden_sf.view(torch.uint8).reshape(
             hidden_states.shape[0], self.hidden_size // _MXFP8_GROUP_SIZE
         )
@@ -1633,8 +1125,7 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
             use_shuffled_weight=True,
             weight_layout=WeightLayout.MajorK.value,
             do_finalize=True,
-            enable_pdl=hidden_states.shape[0] <= 8192
-            and device_support_pdl(hidden_states.device),
+            enable_pdl=hidden_states.shape[0] <= 8192 and device_support_pdl(hidden_states.device),
             tune_max_num_tokens=tune_max_tokens,
             fp8_quantization_type=Fp8QuantizationType.MxFp8,
             activation_type=ActivationType.Swiglu.value,
@@ -1643,9 +1134,7 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
         backward_hidden_states = None
         if backward_mode == DEQUANTIZED_BACKWARD:
             backward_hidden_states = _mxfp8_activation_storage(
-                hidden_q,
-                hidden_sf,
-                dtype=hidden_states.dtype,
+                hidden_q, hidden_sf, dtype=hidden_states.dtype
             )
         return _FlashInferForwardResult(
             output=output,
@@ -1673,13 +1162,8 @@ def _flashinfer_moe_runner_type(quantization: str):
     elif quantization == "mxfp8":
         try:
             from flashinfer import block_scale_interleave, mxfp8_quantize
-            from flashinfer.fused_moe import (
-                Fp8QuantizationType,
-                trtllm_fp8_block_scale_routed_moe,
-            )
-            from flashinfer.fused_moe.core import (
-                get_reorder_rows_for_gated_act_gemm_row_indices,
-            )
+            from flashinfer.fused_moe import Fp8QuantizationType, trtllm_fp8_block_scale_routed_moe
+            from flashinfer.fused_moe.core import get_reorder_rows_for_gated_act_gemm_row_indices
             from flashinfer.tllm_enums import WeightLayout
             from flashinfer.utils import (
                 get_shuffle_matrix_a_row_indices,
@@ -1728,70 +1212,61 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
         hidden_states,
         topk_weights,
         topk_ids,
-        w13_gate_up,
-        w2,
+        tokens_per_expert,
         runner,
         weight_key,
         backward_mode,
+        *expert_weights,
     ):
         ctx.runner = runner
+        num_local_experts = runner.local_num_experts
+        if len(expert_weights) != 2 * num_local_experts:
+            raise ValueError(
+                "FlashInfer MoE expected two weights per local expert, got "
+                f"{len(expert_weights)} for {num_local_experts} experts"
+            )
+        ctx.num_local_experts = num_local_experts
+        ctx.tokens_per_expert = tuple(int(count) for count in tokens_per_expert)
+        if len(ctx.tokens_per_expert) != num_local_experts:
+            raise ValueError(
+                "FlashInfer MoE expected one token count per local expert, got "
+                f"{len(ctx.tokens_per_expert)} for {num_local_experts} experts"
+            )
         ctx.saved_quantized_operands = False
+        w13_gate_up = expert_weights[:num_local_experts]
+        w2 = expert_weights[num_local_experts:]
         if hidden_states.shape[0] == 0:
             # FlashInfer's routed launchers do not accept M=0. Keep this rank in
             # the custom-autograd graph so backward still emits explicit zero
             # gradients for inputs and locally owned expert weights.
-            ctx.save_for_backward(
-                hidden_states, topk_weights, topk_ids, w13_gate_up, w2
-            )
+            ctx.save_for_backward(hidden_states, topk_weights, *expert_weights)
             return torch.empty_like(hidden_states)
         result = runner.forward(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            w13_gate_up,
-            w2,
-            weight_key,
-            backward_mode,
+            hidden_states, topk_weights, topk_ids, w13_gate_up, w2, weight_key, backward_mode
         )
         if backward_mode == HIGH_PRECISION_BACKWARD:
-            ctx.save_for_backward(
-                hidden_states, topk_weights, topk_ids, w13_gate_up, w2
-            )
+            ctx.save_for_backward(hidden_states, topk_weights, *expert_weights)
         elif backward_mode == DEQUANTIZED_BACKWARD:
             backward_hidden_states = result.backward_hidden_states
             backward_w13 = result.backward_w13
             backward_w2 = result.backward_w2
             if any(
-                tensor is None
-                for tensor in (backward_hidden_states, backward_w13, backward_w2)
+                tensor is None for tensor in (backward_hidden_states, backward_w13, backward_w2)
             ):
                 raise RuntimeError(
                     "FlashInfer MoE dequantized backward is missing a forward operand"
                 )
-            from transformer_engine.pytorch.quantized_tensor import (
-                prepare_for_saving,
-            )
+            from transformer_engine.pytorch.quantized_tensor import prepare_for_saving
 
             ctx.backward_dtype = hidden_states.dtype
-            ctx.backward_w13_shape = tuple(w13_gate_up.shape)
-            ctx.backward_w2_shape = tuple(w2.shape)
-            quantized_operands = (
-                _quantized_storage_shell(backward_hidden_states),
-                topk_weights,
-                topk_ids,
-                *(_quantized_storage_shell(payload) for payload in backward_w13),
-                *(_quantized_storage_shell(payload) for payload in backward_w2),
-            )
-            tensors_to_save, tensor_objects = prepare_for_saving(
-                *quantized_operands
-            )
-            ctx.save_for_backward(*tensors_to_save)
+            quantized_operands = (_quantized_storage_shell(backward_hidden_states), topk_weights)
+            tensors_to_save, tensor_objects = prepare_for_saving(*quantized_operands)
+            ctx.quantized_tensor_count = len(tensors_to_save)
+            ctx.save_for_backward(*tensors_to_save, *backward_w13, *backward_w2)
             ctx.tensor_objects = tensor_objects
             ctx.saved_quantized_operands = True
         else:
-            raise ValueError(
-                f"Unsupported FlashInfer MoE backward mode {backward_mode!r}"
-            )
+            raise ValueError(f"Unsupported FlashInfer MoE backward mode {backward_mode!r}")
         return result.output
 
     @staticmethod
@@ -1799,37 +1274,22 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
         if ctx.saved_quantized_operands:
             from transformer_engine.pytorch.quantized_tensor import restore_from_saved
 
-            # Restore into per-backward metadata clones. The context retains
-            # payload-free shells for retain_graph=True, while the actual q
-            # tensors remain owned only by ctx.saved_tensors and can be freed
-            # by autograd after an ordinary backward.
             tensor_objects = [
-                None
-                if tensor_object is None
-                else _quantized_storage_shell(tensor_object)
+                None if tensor_object is None else _quantized_storage_shell(tensor_object)
                 for tensor_object in ctx.tensor_objects
             ]
-            restored = restore_from_saved(tensor_objects, ctx.saved_tensors)
-            hidden_storage, topk_weights, topk_ids = restored[:3]
-            split = 3 + ctx.backward_w13_shape[0]
-            w13_payloads = tuple(restored[3:split])
-            w2_payloads = tuple(restored[split:])
+            restored = restore_from_saved(
+                tensor_objects, ctx.saved_tensors[: ctx.quantized_tensor_count]
+            )
+            hidden_storage, topk_weights = restored
             hidden_states = hidden_storage.dequantize(dtype=ctx.backward_dtype)
-            w13_gate_up = _dequantize_weight_payloads(
-                w13_payloads,
-                ctx.backward_w13_shape,
-                dtype=ctx.backward_dtype,
-            )
-            w2 = _dequantize_weight_payloads(
-                w2_payloads,
-                ctx.backward_w2_shape,
-                dtype=ctx.backward_dtype,
-            )
+            expert_weights = ctx.saved_tensors[ctx.quantized_tensor_count :]
         else:
-            hidden_states, topk_weights, topk_ids, w13_gate_up, w2 = (
-                ctx.saved_tensors
-            )
+            hidden_states, topk_weights, *expert_weights = ctx.saved_tensors
+        w13_gate_up = expert_weights[: ctx.num_local_experts]
+        w2 = expert_weights[ctx.num_local_experts :]
         needs = ctx.needs_input_grad
+        weight_needs = needs[7:]
         if hidden_states.shape[0] == 0:
             # Avoid launching a full BF16 expert recompute just to manufacture
             # explicit zeros on an EP rank with no dispatched assignments.
@@ -1838,53 +1298,53 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
                 torch.zeros_like(hidden_states) if needs[0] else None,
                 torch.zeros_like(topk_weights) if needs[1] else None,
                 None,
-                torch.zeros_like(w13_gate_up) if needs[3] else None,
-                torch.zeros_like(w2) if needs[4] else None,
                 None,
                 None,
                 None,
+                None,
+                *(
+                    torch.zeros_like(weight) if need else None
+                    for weight, need in zip(expert_weights, weight_needs)
+                ),
             )
 
         with torch.enable_grad():
             hidden_ref = hidden_states.detach().requires_grad_(needs[0])
             weights_ref = topk_weights.detach().requires_grad_(needs[1])
-            w13_ref = w13_gate_up.detach().requires_grad_(needs[3])
-            w2_ref = w2.detach().requires_grad_(needs[4])
+            expert_weight_refs = tuple(
+                weight.detach().requires_grad_(need)
+                for weight, need in zip(expert_weights, weight_needs)
+            )
+            w13_ref = expert_weight_refs[: ctx.num_local_experts]
+            w2_ref = expert_weight_refs[ctx.num_local_experts :]
             output_ref = _bf16_local_routed_experts(
-                hidden_ref,
-                weights_ref,
-                topk_ids,
-                w13_ref,
-                w2_ref,
-                ctx.runner.local_expert_offset,
+                hidden_ref, weights_ref, w13_ref, w2_ref, ctx.tokens_per_expert
             )
 
-        grad_inputs = [hidden_ref, weights_ref, w13_ref, w2_ref]
-        requested_mask = (needs[0], needs[1], needs[3], needs[4])
-        requested = [
-            tensor for tensor, need in zip(grad_inputs, requested_mask) if need
-        ]
-        computed = torch.autograd.grad(
-            output_ref,
-            requested,
-            grad_output,
-            allow_unused=True,
-        )
+        grad_inputs = (hidden_ref, weights_ref, *expert_weight_refs)
+        requested_mask = (needs[0], needs[1], *weight_needs)
+        requested = [tensor for tensor, need in zip(grad_inputs, requested_mask) if need]
+        computed = torch.autograd.grad(output_ref, requested, grad_output, allow_unused=True)
         computed_iter = iter(computed)
-        grads = [
-            next(computed_iter) if need else None for need in requested_mask
-        ]
+        grads = []
+        for tensor, need in zip(grad_inputs, requested_mask):
+            if not need:
+                grads.append(None)
+                continue
+            grad = next(computed_iter)
+            grads.append(torch.zeros_like(tensor) if grad is None else grad)
         # Megatron optimizers can update ``param.data`` without incrementing the
         # owning Parameter's version counter. Invalidate after every training
         # backward so the next forward cannot reuse pre-update quantized weights.
         ctx.runner.invalidate_weights()
-        return grads[0], grads[1], None, grads[2], grads[3], None, None, None
+        return grads[0], grads[1], None, None, None, None, None, *grads[2:]
 
 
 def _run_flashinfer_forward_with_surrogate(
     hidden_states,
     topk_weights,
     topk_ids,
+    tokens_per_expert,
     w13_gate_up,
     w2,
     runner,
@@ -1893,36 +1353,29 @@ def _run_flashinfer_forward_with_surrogate(
 ):
     """Attach custom autograd only when this invocation can require backward."""
 
+    expert_weights = (*w13_gate_up, *w2)
     needs_backward = torch.is_grad_enabled() and any(
-        tensor.requires_grad
-        for tensor in (hidden_states, topk_weights, w13_gate_up, w2)
+        tensor.requires_grad for tensor in (hidden_states, topk_weights, *expert_weights)
     )
     if needs_backward:
         return _FlashInferForwardBF16Backward.apply(
             hidden_states,
             topk_weights,
             topk_ids,
-            w13_gate_up,
-            w2,
+            tokens_per_expert,
             runner,
             weight_key,
             backward_mode,
+            *expert_weights,
         )
 
     if hidden_states.shape[0] == 0:
         return torch.empty_like(hidden_states)
 
     # The output is independent of the backward operand mode. Avoid retaining
-    # an additional canonical low-precision payload cache when no backward can
-    # consume it; the ordinary FlashInfer mirror remains reusable for inference.
+    # backward-only QDQ buffers when no backward can consume them.
     return runner.forward(
-        hidden_states,
-        topk_weights,
-        topk_ids,
-        w13_gate_up,
-        w2,
-        weight_key,
-        HIGH_PRECISION_BACKWARD,
+        hidden_states, topk_weights, topk_ids, w13_gate_up, w2, weight_key, HIGH_PRECISION_BACKWARD
     ).output
 
 
@@ -1949,16 +1402,24 @@ def _run_dispatched_flashinfer_moe(
     tokens_per_expert: torch.Tensor,
     permuted_probs: torch.Tensor,
 ) -> tuple[torch.Tensor, None]:
-    """Run local experts after Megatron's standard all-to-all dispatch."""
+    """Run local experts after Megatron's native dispatcher has sorted assignments."""
 
     dispatch_mode = flashinfer_moe_dispatch_mode(experts.config)
-    if dispatch_mode != "alltoall":
-        raise RuntimeError(
-            "FlashInferGroupedMLP execution is reserved for the all-to-all branch, "
-            f"got {dispatch_mode!r}"
-        )
+    quantization = _validate_flashinfer_moe_config(experts.config)
+    backward_mode = flashinfer_moe_backward_mode()
+    if backward_mode == DEQUANTIZED_BACKWARD:
+        _require_dequantized_backward_support(quantization)
+    if hidden_states.dtype != torch.bfloat16:
+        raise TypeError(f"FlashInfer MoE expects BF16 hidden states, got {hidden_states.dtype}")
+    if not hidden_states.is_cuda or torch.cuda.get_device_capability(hidden_states.device)[0] < 10:
+        raise RuntimeError("FlashInfer routed MoE requires NVIDIA Blackwell (SM100+)")
+    if any(
+        weight.dtype != torch.bfloat16
+        for linear in (experts.linear_fc1, experts.linear_fc2)
+        for weight in linear.parameters()
+    ):
+        raise TypeError("FlashInfer MoE master weights must remain BF16")
 
-    quantization = _flashinfer_moe_quantization(experts.config)
     runner = _get_flashinfer_runner(experts, experts, quantization)
     topk_weights, topk_ids = _dispatched_topk_inputs(
         permuted_probs,
@@ -1968,16 +1429,17 @@ def _run_dispatched_flashinfer_moe(
     )
     if hidden_states.shape[0] != topk_weights.shape[0]:
         raise ValueError(
-            "FlashInfer all-to-all dispatched hidden/probability row counts disagree: "
+            "FlashInfer MoE dispatched hidden/probability row counts disagree: "
             f"{hidden_states.shape[0]} != {topk_weights.shape[0]}"
         )
 
-    w13_gate_up, w2 = _grouped_mlp_weights(experts)
-    backward_mode = flashinfer_moe_backward_mode()
+    token_counts = tuple(int(count) for count in tokens_per_expert.tolist())
+    w13_gate_up, w2 = _grouped_mlp_weight_parameters(experts)
     output = _run_flashinfer_forward_with_surrogate(
         hidden_states,
         topk_weights,
         topk_ids,
+        token_counts,
         w13_gate_up,
         w2,
         runner,
@@ -1986,7 +1448,7 @@ def _run_dispatched_flashinfer_moe(
     )
     if output.shape != hidden_states.shape:
         raise RuntimeError(
-            "FlashInfer all-to-all local output shape mismatch: "
+            "FlashInfer MoE local output shape mismatch: "
             f"{tuple(output.shape)} != {tuple(hidden_states.shape)}"
         )
 
@@ -1995,9 +1457,10 @@ def _run_dispatched_flashinfer_moe(
         log_single_rank(
             logger,
             logging.WARNING,
-            "FlashInfer MoE path active: Megatron all-to-all dispatch, routed TRT-LLM "
+            "FlashInfer MoE path active: Megatron %s dispatch, routed TRT-LLM "
             "top-k=1 local assignments, %s, %s BF16 surrogate backward "
             "(%s=1, %s=%d)",
+            dispatch_mode,
             _flashinfer_moe_description(quantization),
             backward_mode,
             _ENV,
@@ -2009,216 +1472,9 @@ def _run_dispatched_flashinfer_moe(
     return output, None
 
 
-def validate_flashinfer_moe_layer(
-    moe_layer,
-    hidden_states: torch.Tensor,
-    intermediate_tensors,
-    padding_mask: Optional[torch.Tensor],
-) -> str:
-    """Validate common and dispatcher-specific FlashInfer MoE constraints."""
-
-    config = moe_layer.config
-    experts = moe_layer.experts
-    dispatch_mode = flashinfer_moe_dispatch_mode(config)
-    quantization = _flashinfer_moe_quantization(config)
-    backward_mode = flashinfer_moe_backward_mode()
-    if backward_mode == DEQUANTIZED_BACKWARD:
-        _require_dequantized_backward_support(quantization)
-    if not isinstance(experts, FlashInferGroupedMLP):
-        raise TypeError(
-            f"{_ENV}=1 requires FlashInferGroupedMLP BF16 parameters, got {type(experts)}"
-        )
-    if intermediate_tensors is not None:
-        raise ValueError("FlashInfer MoE does not support partial-layer CUDA graph execution")
-    if moe_layer.shared_expert_overlap:
-        raise ValueError("FlashInfer MoE does not support shared-expert overlap")
-    if config.moe_latent_size is not None:
-        raise ValueError("FlashInfer MoE does not support latent MoE projections")
-    if config.add_bias_linear:
-        raise ValueError("FlashInfer MoE does not support expert bias")
-    if not config.gated_linear_unit or config.activation_func is not F.silu:
-        raise ValueError("FlashInfer MoE currently supports gated SwiGLU only")
-    if config.activation_func_clamp_value is not None or config.glu_linear_offset != 0.0:
-        raise ValueError("FlashInfer MoE does not support SwiGLU clamp or linear offset")
-    if config.moe_expert_capacity_factor is not None:
-        raise ValueError("FlashInfer MoE does not support expert capacity or token dropping")
-    if dispatch_mode == "alltoall" and config.moe_router_padding_for_quantization:
-        raise ValueError("FlashInfer MoE all-to-all does not support router padding")
-    if config.moe_apply_probs_on_input:
-        raise ValueError("FlashInfer MoE requires routing weights in the fused finalize")
-    if experts.tp_group.size() != 1:
-        raise ValueError("FlashInfer MoE currently requires expert tensor parallel size 1")
-    if hidden_states.dtype != torch.bfloat16:
-        raise TypeError(f"FlashInfer MoE expects BF16 hidden states, got {hidden_states.dtype}")
-    if any(
-        weight.dtype != torch.bfloat16
-        for linear in (experts.linear_fc1, experts.linear_fc2)
-        for weight in linear.parameters()
-    ):
-        raise TypeError("FlashInfer MoE master weights must remain BF16")
-    if config.num_moe_experts > 2048:
-        raise ValueError("FlashInfer routed MoE supports at most 2048 global experts")
-    if quantization == "nvfp4":
-        if hidden_states.shape[-1] % 16 or config.moe_ffn_hidden_size % 16:
-            raise ValueError("FlashInfer NVFP4 dimensions must be multiples of 16")
-    elif quantization == "mxfp8":
-        kernel_topk = 1 if dispatch_mode == "alltoall" else config.moe_router_topk
-        if config.num_moe_experts % 4 or config.num_moe_experts <= kernel_topk:
-            raise ValueError(
-                "FlashInfer MXFP8 requires global experts divisible by 4 and greater "
-                f"than kernel top-k, got experts={config.num_moe_experts}, top-k={kernel_topk}"
-            )
-        if hidden_states.shape[-1] % 128 or config.moe_ffn_hidden_size % 128:
-            raise ValueError(
-                "FlashInfer MXFP8 hidden and intermediate dimensions must be multiples of 128"
-            )
-    else:
-        raise NotImplementedError(
-            f"FlashInfer MoE quantization {quantization!r} has no validation branch"
-        )
-    if not hidden_states.is_cuda or torch.cuda.get_device_capability(hidden_states.device)[0] < 10:
-        raise RuntimeError("FlashInfer routed MoE requires NVIDIA Blackwell (SM100+)")
-    if padding_mask is not None and bool(padding_mask.any().item()):
-        raise ValueError("FlashInfer MoE does not yet support padded tokens")
-    return quantization
-
-
-def _run_flashinfer_moe_alltoall(
-    moe_layer,
-    hidden_states: torch.Tensor,
-    padding_mask: Optional[torch.Tensor],
-    input_ids: Optional[torch.Tensor],
-) -> tuple[torch.Tensor, None]:
-    """Run FlashInfer inside Megatron's standard all-to-all lifecycle."""
-
-    shared_expert_output = moe_layer.shared_experts_compute(hidden_states)
-    probs, routing_map = moe_layer.route(
-        hidden_states, padding_mask=padding_mask, input_ids=input_ids
-    )
-    hidden_states, probs = moe_layer.preprocess(hidden_states, probs, routing_map)
-    dispatched_input, probs = moe_layer.dispatch(hidden_states, probs)
-    output, mlp_bias = moe_layer.routed_experts_compute(dispatched_input, probs)
-    if mlp_bias is not None:
-        raise RuntimeError("FlashInfer MoE does not support expert bias")
-    output = moe_layer.combine(output)
-    output = moe_layer.postprocess(output, shared_expert_output)
-    return output, None
-
-
-def run_flashinfer_moe(
-    moe_layer,
-    hidden_states: torch.Tensor,
-    intermediate_tensors,
-    padding_mask: Optional[torch.Tensor],
-    input_ids: Optional[torch.Tensor],
-) -> tuple[torch.Tensor, None]:
-    """Run the exact FlashInfer forward and attach the selected BF16 surrogate."""
-
-    dispatch_mode = flashinfer_moe_dispatch_mode(moe_layer.config)
-    quantization = validate_flashinfer_moe_layer(
-        moe_layer, hidden_states, intermediate_tensors, padding_mask
-    )
-    if dispatch_mode == "alltoall":
-        return _run_flashinfer_moe_alltoall(
-            moe_layer, hidden_states, padding_mask, input_ids
-        )
-    elif dispatch_mode != "allgather":
-        raise AssertionError(f"Unreachable FlashInfer MoE dispatch mode: {dispatch_mode!r}")
-
-    description = _flashinfer_moe_description(quantization)
-    backward_mode = flashinfer_moe_backward_mode()
-    runner = _get_flashinfer_runner(moe_layer, moe_layer.experts, quantization)
-
-    shared_expert_output = moe_layer.shared_experts_compute(hidden_states)
-    probs, routing_map = moe_layer.route(
-        hidden_states, padding_mask=padding_mask, input_ids=input_ids
-    )
-    topk_weights, topk_ids = _topk_from_dense_routing(
-        probs,
-        routing_map,
-        moe_layer.config.moe_router_topk,
-        ordered_topk_ids=_rollout_replay_topk_ids(moe_layer),
-    )
-
-    hidden_shape = hidden_states.shape
-    local_hidden = hidden_states.reshape(-1, hidden_shape[-1])
-    ep_group = moe_layer.ep_group
-    ep_size = torch.distributed.get_world_size(ep_group)
-    ep_rank = torch.distributed.get_rank(ep_group)
-    max_tokens, token_counts = _all_gather_token_counts(
-        local_hidden.shape[0], local_hidden.device, ep_group, ep_size
-    )
-    if max_tokens == 0:
-        routed_output = torch.zeros_like(hidden_states)
-        return (
-            routed_output
-            if shared_expert_output is None
-            else routed_output + shared_expert_output,
-            None,
-        )
-
-    if ep_size > 1:
-        global_hidden = _PaddedEPAllGather.apply(
-            local_hidden, max_tokens, token_counts, ep_group, ep_rank, ep_size
-        )
-        global_topk_weights = _PaddedEPAllGather.apply(
-            topk_weights, max_tokens, token_counts, ep_group, ep_rank, ep_size
-        )
-        global_topk_ids = _all_gather_padded_no_grad(
-            topk_ids, max_tokens, ep_group, ep_size
-        )
-    else:
-        global_hidden = local_hidden
-        global_topk_weights = topk_weights
-        global_topk_ids = topk_ids
-
-    w13_gate_up, w2 = _grouped_mlp_weights(moe_layer.experts)
-    global_output = _run_flashinfer_forward_with_surrogate(
-        global_hidden,
-        global_topk_weights,
-        global_topk_ids,
-        w13_gate_up,
-        w2,
-        runner,
-        _source_weight_key(moe_layer.experts),
-        backward_mode,
-    )
-    if ep_size > 1:
-        global_output = _EPAllReduceSum.apply(global_output, ep_group)
-
-    local_start = ep_rank * max_tokens
-    local_output = global_output[
-        local_start : local_start + token_counts[ep_rank]
-    ].contiguous()
-    routed_output = local_output.view(hidden_shape)
-    if shared_expert_output is not None:
-        routed_output = routed_output + shared_expert_output
-
-    layer_number = moe_layer.layer_number or -1
-    log_key = (quantization, dispatch_mode, backward_mode, layer_number)
-    if log_key not in _LOGGED_LAYERS:
-        log_single_rank(
-            logger,
-            logging.WARNING,
-            "Layer %d FlashInfer MoE path active: routed TRT-LLM, %s, "
-            "%s BF16 surrogate backward (%s=1, %s=%d)",
-            layer_number,
-            description,
-            backward_mode,
-            _ENV,
-            _DEQUANTIZED_ENV,
-            int(backward_mode == DEQUANTIZED_BACKWARD),
-        )
-        _LOGGED_LAYERS.add(log_key)
-
-    return routed_output, None
-
-
 __all__ = [
     "FlashInferGroupedMLP",
     "flashinfer_moe_dispatch_mode",
     "maybe_replace_flashinfer_moe_expert_spec",
-    "run_flashinfer_moe",
     "use_flashinfer_moe",
-    "validate_flashinfer_moe_layer",
 ]
