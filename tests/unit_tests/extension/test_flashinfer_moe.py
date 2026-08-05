@@ -17,7 +17,9 @@ from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from miles_megatron_plugins.flashinfer_moe import (
-    _bf16_local_routed_experts,
+    DEQUANTIZED_BACKWARD,
+    HIGH_PRECISION_BACKWARD,
+    FlashInferGroupedMLP,
     _dispatched_topk_inputs,
     _flashinfer_moe_description,
     _flashinfer_moe_quantization,
@@ -25,9 +27,6 @@ from miles_megatron_plugins.flashinfer_moe import (
     _FlashInferForwardBF16Backward,
     _FlashInferMXFP8Runner,
     _FlashInferNVFP4Runner,
-    FlashInferGroupedMLP,
-    DEQUANTIZED_BACKWARD,
-    HIGH_PRECISION_BACKWARD,
     _grouped_mlp_weight_parameters,
     _pack_topk_ids,
     _run_flashinfer_forward_with_surrogate,
@@ -35,6 +34,7 @@ from miles_megatron_plugins.flashinfer_moe import (
     _te_mxfp8_quantize_weight,
     _te_nvfp4_quantize_gated_weight,
     _te_nvfp4_quantize_weight,
+    _validate_flashinfer_moe_config,
     dequantize_mxfp8_activation,
     dequantize_nvfp4_activation,
     flashinfer_moe_backward_mode,
@@ -42,7 +42,35 @@ from miles_megatron_plugins.flashinfer_moe import (
     maybe_replace_flashinfer_moe_expert_spec,
     use_flashinfer_moe,
 )
+from miles_megatron_plugins.flashinfer_moe_surrogate import _BF16GroupedMLPSurrogate
 from tests.unit_tests.test_utilities import Utils
+
+
+def _sequential_bf16_routed_experts(
+    hidden_states, topk_weights, w13_gate_up, w2, tokens_per_expert, *, activation_in_fp32=False
+):
+    """Independent per-expert oracle for the grouped production surrogate."""
+
+    outputs = []
+    start = 0
+    for local_expert, count in enumerate(tokens_per_expert):
+        if count == 0:
+            continue
+        end = start + count
+        fc1 = F.linear(hidden_states[start:end], w13_gate_up[local_expert])
+        if activation_in_fp32:
+            gate, up = fc1.float().chunk(2, dim=-1)
+            activated = (F.silu(gate) * up * topk_weights[start:end].float()).to(
+                hidden_states.dtype
+            )
+        else:
+            gate, up = fc1.chunk(2, dim=-1)
+            activated = (F.silu(gate) * up * topk_weights[start:end]).to(hidden_states.dtype)
+        outputs.append(F.linear(activated, w2[local_expert]))
+        start = end
+    if not outputs:
+        return torch.empty_like(hidden_states)
+    return torch.cat(outputs, dim=0)
 
 
 def test_flashinfer_moe_is_opt_in(monkeypatch):
@@ -177,6 +205,42 @@ def test_flashinfer_experts_reuse_megatron_te_parameter_contract():
     assert issubclass(FlashInferGroupedMLP, TEGroupedMLP)
 
 
+@pytest.mark.parametrize(
+    "attribute,message",
+    [
+        pytest.param("delay_wgrad_compute", "delayed expert weight gradients", id="delayed-wgrad"),
+        pytest.param(
+            "use_te_activation_func", "Transformer Engine activation modules", id="te-activation"
+        ),
+    ],
+)
+def test_flashinfer_moe_rejects_unsupported_te_execution_paths(monkeypatch, attribute, message):
+    monkeypatch.setenv("MILES_FLASHINFER_MOE_QUANTIZATION", "mxfp8")
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=8,
+        num_moe_experts=4,
+        moe_ffn_hidden_size=128,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_token_dispatcher_type="alltoall",
+        moe_grouped_gemm=True,
+        tensor_model_parallel_size=1,
+        expert_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
+        add_bias_linear=False,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+    )
+    setattr(config, attribute, True)
+
+    with pytest.raises(ValueError, match=message):
+        _validate_flashinfer_moe_config(config)
+
+
 def test_pack_topk_ids_matches_flashinfer_packed_contract():
     ids = torch.tensor([[3, 17]], dtype=torch.int32)
     weights = torch.tensor([[0.25, 0.75]], dtype=torch.float32)
@@ -234,7 +298,7 @@ def test_bf16_surrogate_matches_megatron_expert_formula_and_gradients():
     w2 = torch.tensor([[[2.0, -1.0], [0.5, 3.0]]], requires_grad=True)
     topk_weights = torch.tensor([[0.25], [0.75]], requires_grad=True)
 
-    actual = _bf16_local_routed_experts(
+    actual = _sequential_bf16_routed_experts(
         hidden, topk_weights, tuple(w13.unbind()), tuple(w2.unbind()), (2,)
     )
     gate, up = F.linear(hidden, w13[0]).chunk(2, dim=-1)
@@ -262,6 +326,216 @@ def test_bf16_surrogate_matches_megatron_expert_formula_and_gradients():
 
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped BF16 requires CUDA")
+@pytest.mark.parametrize("tokens_per_expert", [(2, 0, 3, 0), (0, 0, 5, 0)])
+@pytest.mark.parametrize(
+    "activation_in_fp32,fused_activation", [(False, False), (False, True), (True, False)]
+)
+def test_te_grouped_bf16_surrogate_matches_independent_loop(
+    tokens_per_expert, activation_in_fp32, fused_activation
+):
+    num_experts = 4
+    hidden_size = 128
+    intermediate_size = 128
+    num_tokens = sum(tokens_per_expert)
+    torch.manual_seed(1234)
+
+    hidden = torch.randn(
+        (num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    probs = torch.rand((num_tokens, 1), device="cuda", dtype=torch.float32, requires_grad=True)
+    w13 = tuple(
+        torch.randn((2 * intermediate_size, hidden_size), device="cuda", dtype=torch.bfloat16)
+        .mul_(0.02)
+        .requires_grad_()
+        for _ in range(num_experts)
+    )
+    w2 = tuple(
+        torch.randn((hidden_size, intermediate_size), device="cuda", dtype=torch.bfloat16)
+        .mul_(0.02)
+        .requires_grad_()
+        for _ in range(num_experts)
+    )
+    grad_output = torch.randn_like(hidden)
+
+    surrogate = _BF16GroupedMLPSurrogate(
+        num_experts=num_experts, hidden_size=hidden_size, intermediate_size=intermediate_size
+    )
+    actual = surrogate(
+        hidden,
+        probs,
+        w13,
+        w2,
+        tokens_per_expert,
+        activation_in_fp32=activation_in_fp32,
+        fused_activation=fused_activation,
+    )
+    actual_inputs = (hidden, probs, *w13, *w2)
+    actual_grads = torch.autograd.grad(actual, actual_inputs, grad_output, allow_unused=True)
+    actual_grads = tuple(
+        torch.zeros_like(tensor) if grad is None else grad
+        for tensor, grad in zip(actual_inputs, actual_grads)
+    )
+
+    hidden_ref = hidden.detach().requires_grad_()
+    probs_ref = probs.detach().requires_grad_()
+    w13_ref = tuple(weight.detach().requires_grad_() for weight in w13)
+    w2_ref = tuple(weight.detach().requires_grad_() for weight in w2)
+    expected = _sequential_bf16_routed_experts(
+        hidden_ref,
+        probs_ref,
+        w13_ref,
+        w2_ref,
+        tokens_per_expert,
+        activation_in_fp32=activation_in_fp32,
+    )
+    expected_inputs = (hidden_ref, probs_ref, *w13_ref, *w2_ref)
+    expected_grads = torch.autograd.grad(expected, expected_inputs, grad_output, allow_unused=True)
+    expected_grads = tuple(
+        torch.zeros_like(tensor) if grad is None else grad
+        for tensor, grad in zip(expected_inputs, expected_grads)
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=5e-3, atol=5e-3)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-3, atol=5e-3)
+    assert surrogate._fc1 is not None and surrogate._fc2 is not None
+    assert all(parameter.is_meta for parameter in surrogate._fc1.op.parameters())
+    assert all(parameter.is_meta for parameter in surrogate._fc2.op.parameters())
+    assert not surrogate._fc1.op.fuse_wgrad_accumulation
+    assert not surrogate._fc2.op.fuse_wgrad_accumulation
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped BF16 requires CUDA")
+@pytest.mark.parametrize("outer_quantization", ["mxfp8", "nvfp4"])
+def test_te_grouped_bf16_surrogate_disables_outer_quantized_autocast(outer_quantization):
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import Format, MXFP8BlockScaling, NVFP4BlockScaling
+
+    recipe = (
+        MXFP8BlockScaling(fp8_format=Format.E4M3)
+        if outer_quantization == "mxfp8"
+        else NVFP4BlockScaling()
+    )
+    torch.manual_seed(2345)
+    hidden = torch.randn((5, 128), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    probs = torch.rand((5, 1), device="cuda", dtype=torch.float32, requires_grad=True)
+    w13 = tuple(
+        (torch.randn((256, 128), device="cuda", dtype=torch.bfloat16) * 0.02).requires_grad_()
+        for _ in range(2)
+    )
+    w2 = tuple(
+        (torch.randn((128, 128), device="cuda", dtype=torch.bfloat16) * 0.02).requires_grad_()
+        for _ in range(2)
+    )
+    grad_output = torch.randn_like(hidden)
+    surrogate = _BF16GroupedMLPSurrogate(num_experts=2, hidden_size=128, intermediate_size=128)
+
+    with te.autocast(enabled=True, recipe=recipe):
+        actual = surrogate(
+            hidden, probs, w13, w2, (2, 3), activation_in_fp32=False, fused_activation=False
+        )
+    actual_inputs = (hidden, probs, *w13, *w2)
+    actual_grads = torch.autograd.grad(actual, actual_inputs, grad_output)
+
+    reference_inputs = tuple(tensor.detach().requires_grad_() for tensor in actual_inputs)
+    hidden_ref, probs_ref, *expert_weights_ref = reference_inputs
+    expected = _sequential_bf16_routed_experts(
+        hidden_ref, probs_ref, expert_weights_ref[:2], expert_weights_ref[2:], (2, 3)
+    )
+    expected_grads = torch.autograd.grad(expected, reference_inputs, grad_output)
+
+    torch.testing.assert_close(actual, expected, rtol=5e-3, atol=5e-3)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped BF16 requires CUDA")
+@pytest.mark.parametrize(
+    "w13_trainable,w2_trainable",
+    [
+        pytest.param((True, False), (False, True), id="partial-experts"),
+        pytest.param((True, True), (False, False), id="fc1-only"),
+        pytest.param((False, False), (True, True), id="fc2-only"),
+        pytest.param((False, False), (False, False), id="weights-frozen"),
+    ],
+)
+def test_flashinfer_grouped_surrogate_respects_frozen_expert_weights(w13_trainable, w2_trainable):
+    class BF16Runner:
+        local_num_experts = 2
+
+        def __init__(self):
+            self.surrogate = _BF16GroupedMLPSurrogate(
+                num_experts=2, hidden_size=128, intermediate_size=128
+            )
+            self.seen_weight_grad_states = None
+
+        def forward(self, hidden_states, *_args):
+            return SimpleNamespace(output=hidden_states.detach().clone())
+
+        def bf16_surrogate(self, hidden_states, topk_weights, w13, w2, counts, **kwargs):
+            self.seen_weight_grad_states = tuple(weight.requires_grad for weight in (*w13, *w2))
+            return self.surrogate(hidden_states, topk_weights, w13, w2, counts, **kwargs)
+
+        def invalidate_weights(self):
+            pass
+
+    torch.manual_seed(3456)
+    hidden = torch.randn((5, 128), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    probs = torch.rand((5, 1), device="cuda", dtype=torch.float32, requires_grad=True)
+    w13 = tuple(
+        (torch.randn((256, 128), device="cuda", dtype=torch.bfloat16) * 0.02).requires_grad_(need)
+        for need in w13_trainable
+    )
+    w2 = tuple(
+        (torch.randn((128, 128), device="cuda", dtype=torch.bfloat16) * 0.02).requires_grad_(need)
+        for need in w2_trainable
+    )
+    runner = BF16Runner()
+    grad_output = torch.randn_like(hidden)
+
+    output = _FlashInferForwardBF16Backward.apply(
+        hidden,
+        probs,
+        torch.zeros((5, 1), device="cuda", dtype=torch.int32),
+        (2, 3),
+        runner,
+        (1,),
+        HIGH_PRECISION_BACKWARD,
+        False,
+        False,
+        *w13,
+        *w2,
+    )
+    torch.autograd.backward(output, grad_output)
+
+    hidden_ref = hidden.detach().requires_grad_()
+    probs_ref = probs.detach().requires_grad_()
+    w13_ref = tuple(
+        weight.detach().requires_grad_(need) for weight, need in zip(w13, w13_trainable)
+    )
+    w2_ref = tuple(weight.detach().requires_grad_(need) for weight, need in zip(w2, w2_trainable))
+    expected = _sequential_bf16_routed_experts(hidden_ref, probs_ref, w13_ref, w2_ref, (2, 3))
+    torch.autograd.backward(expected, grad_output)
+
+    torch.testing.assert_close(hidden.grad, hidden_ref.grad, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(probs.grad, probs_ref.grad, rtol=5e-3, atol=5e-3)
+    for actual, reference, trainable in zip(
+        (*w13, *w2), (*w13_ref, *w2_ref), (*w13_trainable, *w2_trainable)
+    ):
+        if trainable:
+            torch.testing.assert_close(actual.grad, reference.grad, rtol=5e-3, atol=5e-3)
+        else:
+            assert actual.grad is None
+    assert runner.seen_weight_grad_states == (
+        *(any(w13_trainable) for _ in w13_trainable),
+        *(any(w2_trainable) for _ in w2_trainable),
+    )
 
 
 def test_flashinfer_autograd_skips_empty_forward_and_invalidates_on_backward():
@@ -295,6 +569,8 @@ def test_flashinfer_autograd_skips_empty_forward_and_invalidates_on_backward():
         runner,
         (0, 0, 0, 0),
         DEQUANTIZED_BACKWARD,
+        False,
+        False,
         *w13.unbind(),
         *w2.unbind(),
     )
@@ -350,6 +626,13 @@ def test_flashinfer_autograd_uses_selected_forward_operands(backward_mode):
         def invalidate_weights(self):
             self.invalidate_calls += 1
 
+        def bf16_surrogate(
+            self, hidden_states, topk_weights, w13_gate_up, w2, tokens_per_expert, **_kwargs
+        ):
+            return _sequential_bf16_routed_experts(
+                hidden_states, topk_weights, w13_gate_up, w2, tokens_per_expert
+            )
+
     runner = FakeRunner()
     hidden = torch.tensor([[0.5, -1.0], [1.5, 0.25]], requires_grad=True)
     topk_weights = torch.tensor([[0.25], [0.75]], requires_grad=True)
@@ -367,6 +650,8 @@ def test_flashinfer_autograd_uses_selected_forward_operands(backward_mode):
         runner,
         (0, 0, 0, 0),
         backward_mode,
+        False,
+        False,
         *w13.unbind(),
         *w2.unbind(),
     )
@@ -383,7 +668,7 @@ def test_flashinfer_autograd_uses_selected_forward_operands(backward_mode):
     reference_w2 = (
         w2.detach() if backward_mode == HIGH_PRECISION_BACKWARD else dequantized_w2
     ).requires_grad_()
-    reference_output = _bf16_local_routed_experts(
+    reference_output = _sequential_bf16_routed_experts(
         reference_hidden,
         reference_weights,
         tuple(reference_w13.unbind()),
@@ -745,7 +1030,8 @@ def test_flashinfer_prepares_exact_dequantized_forward_weights(monkeypatch, runn
         pytest.param(_FlashInferMXFP8Runner, id="mxfp8"),
     ],
 )
-def test_flashinfer_dequantized_autograd_supports_outstanding_forwards(monkeypatch, runner_type):
+@pytest.mark.parametrize("backward_mode", [HIGH_PRECISION_BACKWARD, DEQUANTIZED_BACKWARD])
+def test_flashinfer_autograd_supports_outstanding_forwards(monkeypatch, runner_type, backward_mode):
     if runner_type is _FlashInferNVFP4Runner:
         _set_nvfp4_4over6_env(monkeypatch, flashinfer=True)
         hidden_size = 128
@@ -762,8 +1048,13 @@ def test_flashinfer_dequantized_autograd_supports_outstanding_forwards(monkeypat
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
-    hidden = torch.randn((8, hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    topk_weights = torch.rand((8, 1), device="cuda", dtype=torch.float32, requires_grad=True)
+    hidden = tuple(
+        torch.randn((8, hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        for _ in range(2)
+    )
+    topk_weights = tuple(
+        torch.rand((8, 1), device="cuda", dtype=torch.float32, requires_grad=True) for _ in range(2)
+    )
     topk_ids = torch.zeros((8, 1), device="cuda", dtype=torch.int32)
     w13 = torch.randn(
         (1, 2 * intermediate_size, hidden_size),
@@ -774,28 +1065,79 @@ def test_flashinfer_dequantized_autograd_supports_outstanding_forwards(monkeypat
     w2 = torch.randn(
         (1, hidden_size, intermediate_size), device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
-    snapshots = tuple(tensor.detach().clone() for tensor in (hidden, w13, w2))
+    snapshots = tuple(tensor.detach().clone() for tensor in (*hidden, w13, w2))
+    grad_outputs = tuple(torch.randn_like(tensor) for tensor in hidden)
 
-    outputs = [
+    outputs = tuple(
         _FlashInferForwardBF16Backward.apply(
-            hidden,
-            topk_weights,
+            hidden[index],
+            topk_weights[index],
             topk_ids,
             (8,),
             runner,
             (1,),
-            DEQUANTIZED_BACKWARD,
+            backward_mode,
+            False,
+            False,
             *w13.unbind(),
             *w2.unbind(),
         )
-        for _ in range(2)
-    ]
-    torch.autograd.backward(outputs, [torch.ones_like(output) for output in outputs])
+        for index in range(2)
+    )
+    torch.autograd.backward(outputs[1], grad_outputs[1], retain_graph=True)
+    torch.autograd.backward(outputs[1], grad_outputs[1])
+    torch.autograd.backward(outputs[0], grad_outputs[0])
 
-    for tensor in (hidden, topk_weights, w13, w2):
-        assert tensor.grad is not None
-        assert torch.isfinite(tensor.grad).all()
-    for source, snapshot in zip((hidden, w13, w2), snapshots):
+    reference_hidden_values = tuple(tensor.detach() for tensor in hidden)
+    reference_w13_values = tuple(w13.detach().unbind())
+    reference_w2_values = tuple(w2.detach().unbind())
+    if backward_mode == DEQUANTIZED_BACKWARD:
+        reference_runner = runner_type(
+            num_experts=4,
+            local_expert_offset=0,
+            local_num_experts=1,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        with torch.no_grad():
+            reference_results = tuple(
+                reference_runner.forward(
+                    tensor,
+                    probs,
+                    topk_ids,
+                    tuple(w13.unbind()),
+                    tuple(w2.unbind()),
+                    (1,),
+                    DEQUANTIZED_BACKWARD,
+                )
+                for tensor, probs in zip(hidden, topk_weights)
+            )
+            reference_hidden_values = tuple(
+                result.backward_hidden_states.dequantize(dtype=torch.bfloat16)
+                for result in reference_results
+            )
+            reference_w13_values = reference_results[0].backward_w13
+            reference_w2_values = reference_results[0].backward_w2
+
+    hidden_ref = tuple(value.detach().requires_grad_() for value in reference_hidden_values)
+    probs_ref = tuple(value.detach().requires_grad_() for value in topk_weights)
+    w13_ref = tuple(value.detach().requires_grad_() for value in reference_w13_values)
+    w2_ref = tuple(value.detach().requires_grad_() for value in reference_w2_values)
+    reference_outputs = tuple(
+        _sequential_bf16_routed_experts(hidden_ref[index], probs_ref[index], w13_ref, w2_ref, (8,))
+        for index in range(2)
+    )
+    torch.autograd.backward(reference_outputs[1], grad_outputs[1], retain_graph=True)
+    torch.autograd.backward(reference_outputs[1], grad_outputs[1])
+    torch.autograd.backward(reference_outputs[0], grad_outputs[0])
+
+    for actual, expected in zip(hidden, hidden_ref):
+        torch.testing.assert_close(actual.grad, expected.grad, rtol=5e-3, atol=5e-3)
+    for actual, expected in zip(topk_weights, probs_ref):
+        torch.testing.assert_close(actual.grad, expected.grad, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(w13.grad, torch.stack([weight.grad for weight in w13_ref]))
+    torch.testing.assert_close(w2.grad, torch.stack([weight.grad for weight in w2_ref]))
+    for source, snapshot in zip((*hidden, w13, w2), snapshots):
         torch.testing.assert_close(source, snapshot, rtol=0, atol=0)
     assert runner._prepared is None
     assert runner._weight_key is None
@@ -917,6 +1259,8 @@ def _bf16_flashinfer_apply(
     runner,
     _weight_key,
     _backward_mode,
+    activation_in_fp32,
+    _fused_activation,
     *expert_weights,
 ):
     """Replace only the fused kernel boundary for a topology-identical reference."""
@@ -928,8 +1272,13 @@ def _bf16_flashinfer_apply(
         for weight in expert_weights:
             zero = zero + weight.reshape(-1)[0] * 0
         return torch.empty_like(hidden_states) + zero
-    return _bf16_local_routed_experts(
-        hidden_states, topk_weights, w13_gate_up, w2, tokens_per_expert
+    return _sequential_bf16_routed_experts(
+        hidden_states,
+        topk_weights,
+        w13_gate_up,
+        w2,
+        tokens_per_expert,
+        activation_in_fp32=activation_in_fp32,
     )
 
 
@@ -941,6 +1290,8 @@ def _dequantized_flashinfer_apply(
     runner,
     weight_key,
     backward_mode,
+    activation_in_fp32,
+    _fused_activation,
     *expert_weights,
 ):
     """Build an ordinary-autograd reference from forward-derived QDQ operands."""
@@ -957,6 +1308,8 @@ def _dequantized_flashinfer_apply(
             runner,
             weight_key,
             backward_mode,
+            activation_in_fp32,
+            _fused_activation,
             *expert_weights,
         )
     with torch.no_grad():
@@ -974,8 +1327,13 @@ def _dequantized_flashinfer_apply(
     w2_ref = tuple(
         decoded.detach() + (source - source.detach()) for decoded, source in zip(decoded_w2, w2)
     )
-    surrogate = _bf16_local_routed_experts(
-        hidden_ref, topk_weights, w13_ref, w2_ref, tokens_per_expert
+    surrogate = _sequential_bf16_routed_experts(
+        hidden_ref,
+        topk_weights,
+        w13_ref,
+        w2_ref,
+        tokens_per_expert,
+        activation_in_fp32=activation_in_fp32,
     )
     return result.output.detach() + (surrogate - surrogate.detach())
 
@@ -1168,12 +1526,17 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             activation_func=F.silu,
             bf16=True,
             params_dtype=torch.bfloat16,
+            gradient_accumulation_fusion=True,
             use_cpu_initialization=False,
         )
         layer = MoELayer(
             config, MoESubmodules(experts=ModuleSpec(module=GroupedMLP)), layer_number=1
         ).cuda()
         layer.train()
+        parameter_ownership_before = tuple(
+            (name, id(parameter)) for name, parameter in layer.named_parameters()
+        )
+        state_keys_before = tuple(layer.state_dict())
 
         torch.manual_seed(5678 + rank)
         hidden_seed = torch.randn((num_tokens, 1, hidden_size), device="cuda", dtype=torch.bfloat16)
@@ -1365,6 +1728,9 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             and actual_runner._prepared is None
             and actual_runner._weight_key is None
         )
+        parameter_ownership_unchanged = parameter_ownership_before == tuple(
+            (name, id(parameter)) for name, parameter in layer.named_parameters()
+        ) and state_keys_before == tuple(layer.state_dict())
         result_metadata = (
             reference.bias,
             high_precision.bias,
@@ -1377,6 +1743,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             bool(torch.isfinite(dequantized_reference.output).all().item()),
             bool(torch.isfinite(dequantized.output).all().item()),
             runner_cache_cleared,
+            parameter_ownership_unchanged,
         )
         torch.cuda.synchronize()
         run_completed = True
@@ -1402,6 +1769,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         None,
         (num_tokens, 1, hidden_size),
         torch.bfloat16,
+        True,
         True,
         True,
         True,

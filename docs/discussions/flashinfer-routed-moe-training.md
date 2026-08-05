@@ -7,9 +7,10 @@ the FP32-activation work in
 [radixark/Megatron-LM#68](https://github.com/radixark/Megatron-LM/pull/68)
 to model-neutral NVFP4 and MXFP8 expert execution.
 
-The implementation lives in `miles_megatron_plugins/flashinfer_moe.py`. The only
-Megatron-core integration is expert-spec selection during `MoELayer`
-construction.
+FlashInfer forward integration and its custom-autograd boundary live in
+`miles_megatron_plugins/flashinfer_moe.py`. The BF16 replay is isolated in
+`miles_megatron_plugins/flashinfer_moe_surrogate.py`, so the quantized-kernel
+adapter does not need to reproduce grouped-GEMM or activation backward logic.
 
 ## Enablement
 
@@ -26,8 +27,8 @@ explicit override:
 export MILES_FLASHINFER_MOE_QUANTIZATION=nvfp4  # or mxfp8
 ```
 
-The override must agree with an active `fp4=nvfp4` or `fp8=mxfp8` recipe. There
-is no implicit NVFP4 fallback.
+If an active `fp4=nvfp4` or `fp8=mxfp8` recipe and the override are both
+present, they must agree. There is no implicit NVFP4 fallback.
 
 Backward uses the original BF16 operands by default. To recompute with BF16
 values decoded from the exact forward quantized operands, set:
@@ -59,8 +60,10 @@ the model router can still use top-k greater than one because each assignment
 has already been expanded by the dispatcher.
 
 The expert class inherits Megatron's `TEGroupedMLP`, so parameter creation,
-names, initialization, and distributed-checkpoint mapping remain owned by
-Megatron. Only `forward` and delayed-weight-gradient handling are replaced.
+names, initialization, optimizer ownership, and distributed-checkpoint mapping
+remain owned by Megatron. The surrogate's raw Transformer Engine operators are
+storage-free helpers rather than registered expert modules, and gradients from
+the custom-autograd boundary are returned to the original Megatron parameters.
 
 ## Forward and backward
 
@@ -77,16 +80,31 @@ The quantized weights are cached until backward. The cache is conservatively
 invalidated after every training backward because optimizer updates through
 `param.data` are not guaranteed to advance a parameter version counter.
 
-Both backward modes recompute a BF16 SwiGLU expert graph and differentiate that
-surrogate:
+Both backward modes recompute a grouped BF16 SwiGLU expert graph and
+differentiate that surrogate:
 
 - `high_precision` saves references to the original BF16 activation and master
   parameters.
-- `dequantized` saves the compact forward activation payload and eagerly decodes
-  each weight immediately after it is quantized. The decoded per-expert weights
-  are shared by outstanding forward graphs, and the temporary canonical
-  quantized weight storage is released expert by expert. Activation decode is
-  deferred until its backward to limit memory growth with pipeline overlap.
+- `dequantized` saves the compact forward activation payload and reuses BF16
+  weights decoded from the quantized operands produced for that forward. It
+  does not replace or mutate the BF16 master parameters.
+
+The replay in `flashinfer_moe_surrogate.py` consists of a raw Transformer Engine
+`GroupedLinear` for FC1, the routed activation, and a second raw
+`GroupedLinear` for FC2. The operators are constructed without persistent
+weight storage, and `torch.func.functional_call` supplies either the original
+or QDQ-selected per-expert weights. Transformer Engine therefore owns the
+grouped forward, dgrad, and wgrad GEMMs; there is no Python loop over experts.
+
+The FP32-activation path reuses Megatron's `_MoEActivationInFP32`, and the
+fused-activation BF16 path reuses Megatron's weighted SwiGLU helper. The replay
+does not use Transformer Engine `LayerNormMLP`: dispatched expert rows require
+only the two grouped linear operations and the intervening routed activation, and there is
+no expert-local layer normalization to reproduce.
+
+Token counts are passed to both grouped linears as a Python split list. This is
+the default path supported by the repository-pinned Transformer Engine revision
+and keeps split metadata on the host.
 
 The surrogate is intentionally not the mathematical derivative of the fused
 quantized forward. The choice only controls which forward operands seed the
@@ -104,29 +122,29 @@ BF16 recomputation.
 - up to 2,048 global experts
 
 The extension rejects unsupported branches before the kernel launch. In
-particular, flex dispatch (`deepep` or `hybridep`), ETP greater than one, shared
-expert overlap, latent MoE projections, expert bias, non-SwiGLU activations,
-capacity/drop routing, FP32 combine, and unknown quantization recipes are not
-silently redirected to another implementation.
+particular, delayed expert-weight gradients, Transformer Engine activation
+modules (`use_te_activation_func`), ETP greater than one, and flex dispatch
+backends such as DeepEP and HybridEP have no fallback branch. Shared-expert
+overlap, latent MoE projections, expert bias, non-SwiGLU activations,
+capacity/drop routing, FP32 combine, and unknown quantization recipes are also
+rejected rather than silently redirected to another implementation.
 
 ## Validation
 
-The distributed numerical test is parameterized over:
+The focused tests compare the grouped surrogate with an independent BF16
+expert reference, including empty local experts and the supported activation
+paths. The distributed numerical test exercises both quantizations, both
+Megatron dispatchers, and both backward operand modes.
 
-- 8 and 4,096 input tokens;
-- 32 experts, hidden size 7,168, intermediate size 2,048, router top-k 8;
-- NVFP4 and MXFP8; and
-- Megatron all-to-all and all-gather.
+On a bare 8xB200 `radixark/miles:dev-202608041247` devbox, the focused file
+completed with 54 passed and 8 torchrun-only cases skipped. The eight-rank run
+then passed all eight combinations of NVFP4/MXFP8, all-to-all/all-gather, and
+8/4,096 input tokens at 32 experts, hidden size 7,168, intermediate size 2,048,
+and router top-k 8. The largest observed forward relative L2 was 0.215 for
+NVFP4 and 0.071 for MXFP8; every surrogate hidden-gradient relative L2 was
+below 0.004.
 
-On one 8xB200 bare devbox, all eight distributed cases passed. The fused
-forward was compared with a distributed BF16 reference, and both backward modes
-were compared with their corresponding ordinary-autograd BF16 surrogate. The
-worst observed forward relative L2 was below 0.215 for NVFP4 and 0.071 for
-MXFP8; surrogate hidden-gradient relative L2 was below 0.004, with router and
-parameter-gradient comparisons matching at the reported precision.
-
-The focused single-process suite passed 38 tests with 8 distributed cases
-skipped outside torchrun:
+Run the focused suite with:
 
 ```bash
 python3 -m pytest -q tests/unit_tests/extension/test_flashinfer_moe.py
@@ -137,22 +155,24 @@ python3 -m torch.distributed.run --standalone --nproc_per_node=8 \
   -k test_flashinfer_routed_forward_and_surrogate_backward
 ```
 
-The non-gating profile in
-`tests/manual_tests/flashinfer_moe_backward_profile.py` reports end-to-end step
-latency, peak allocated memory, post-forward live memory, and peak memory with
-one and four outstanding forward graphs for every dispatcher/quantization pair.
+`tests/manual_tests/flashinfer_moe_backward_profile.py` can measure end-to-end
+step latency and CUDA memory for the dispatcher, quantization, backward-mode,
+and outstanding-forward configuration under review. No single-run performance
+or memory result is treated as a guarantee in this design discussion.
 
-One B200 sample at 4,096 tokens produced:
+One same-image, three-iteration A/B against the previous per-expert-loop commit
+(`428ad508f`) produced the following non-gating result. The grouped revision
+used the repository-compatible non-fused Transformer Engine `GroupedLinear`
+path with `NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=0`; the loop baseline did
+not use that Transformer Engine path.
 
-| Dispatcher | Quantization | High-precision ms | Dequantized ms | 1-graph peak delta MiB | 4-graph live delta MiB | 4-graph peak delta MiB |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| all-to-all | NVFP4 | 105.05 | 112.01 | +480.18 | -1,135.45 | -470.87 |
-| all-to-all | MXFP8 | 99.48 | 99.66 | +600.03 | -656.01 | -143.99 |
-| all-gather | NVFP4 | 117.65 | 119.51 | +480.07 | -1,134.70 | -526.73 |
-| all-gather | MXFP8 | 127.51 | 119.32 | +600.03 | -655.99 | -143.99 |
+| Dispatcher | Quantization | High precision, loop -> grouped (ms) | Dequantized, loop -> grouped (ms) | Grouped peak delta, high/dequantized (MiB) |
+| --- | --- | ---: | ---: | ---: |
+| all-to-all | NVFP4 | 105.209 -> 101.711 | 106.915 -> 104.042 | +36.97 / +35.50 |
+| all-to-all | MXFP8 | 99.302 -> 97.623 | 100.082 -> 97.652 | +35.38 / +35.38 |
+| all-gather | NVFP4 | 117.823 -> 114.781 | 120.059 -> 117.163 | +34.34 / +33.67 |
+| all-gather | MXFP8 | 116.284 -> 114.661 | 119.156 -> 117.903 | +35.37 / +34.53 |
 
-The dequantized mode pays for one cached BF16 QDQ weight shard, so its
-single-graph peak is higher. With four outstanding graphs, retaining compact
-activation payloads instead of BF16 dispatched activations outweighed that
-fixed cost in every measured case. These are non-gating single-run profile
-numbers, not a performance guarantee.
+This sample shows a 1.1-3.3% end-to-end latency reduction with a roughly
+34-37 MiB increase in peak workspace. It is a narrow regression/profile check,
+not a performance guarantee.

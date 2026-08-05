@@ -36,7 +36,7 @@ from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.spec_utils import ModuleSpec, get_module
 from megatron.core.utils import get_pg_rank, log_single_rank
-
+from miles_megatron_plugins.flashinfer_moe_surrogate import _BF16GroupedMLPSurrogate
 
 logger = logging.getLogger(__name__)
 
@@ -335,12 +335,16 @@ def _validate_flashinfer_moe_config(config) -> str:
     quantization = _flashinfer_moe_quantization(config)
     if getattr(config, "moe_shared_expert_overlap", False):
         raise ValueError("FlashInfer MoE does not support shared-expert overlap")
+    if config.delay_wgrad_compute:
+        raise ValueError("FlashInfer MoE does not support delayed expert weight gradients")
     if config.moe_latent_size is not None:
         raise ValueError("FlashInfer MoE does not support latent MoE projections")
     if config.add_bias_linear:
         raise ValueError("FlashInfer MoE does not support expert bias")
     if not config.gated_linear_unit or config.activation_func is not F.silu:
         raise ValueError("FlashInfer MoE currently supports gated SwiGLU only")
+    if getattr(config, "use_te_activation_func", False):
+        raise ValueError("FlashInfer MoE does not support Transformer Engine activation modules")
     if config.activation_func_clamp_value is not None or config.glu_linear_offset != 0.0:
         raise ValueError("FlashInfer MoE does not support SwiGLU clamp or linear offset")
     if config.moe_expert_capacity_factor is not None:
@@ -494,40 +498,6 @@ def _source_weight_key(experts: FlashInferGroupedMLP) -> tuple[int, ...]:
             weight = getattr(linear, f"weight{expert}")
             key.extend((weight.untyped_storage().data_ptr(), weight._version))
     return tuple(key)
-
-
-def _bf16_local_routed_experts(
-    hidden_states: torch.Tensor,
-    topk_weights: torch.Tensor,
-    w13_gate_up: Sequence[torch.Tensor],
-    w2: Sequence[torch.Tensor],
-    tokens_per_expert: Sequence[int],
-) -> torch.Tensor:
-    """BF16 surrogate over Megatron's expert-sorted dispatched rows."""
-
-    if len(w13_gate_up) != len(w2) or len(w13_gate_up) != len(tokens_per_expert):
-        raise ValueError("FlashInfer MoE expert weights and token counts must align")
-    if sum(tokens_per_expert) != hidden_states.shape[0]:
-        raise ValueError(
-            "FlashInfer MoE dispatched token counts do not match hidden rows: "
-            f"{sum(tokens_per_expert)} != {hidden_states.shape[0]}"
-        )
-
-    outputs = []
-    start = 0
-    for local_expert, count in enumerate(tokens_per_expert):
-        if count == 0:
-            continue
-        end = start + count
-        fc1 = F.linear(hidden_states[start:end], w13_gate_up[local_expert])
-        gate, up = fc1.chunk(2, dim=-1)
-        activated = F.silu(gate) * up
-        # Megatron applies routing probabilities before FC2 and rounds back to BF16.
-        activated = (activated * topk_weights[start:end]).to(activated.dtype)
-        outputs.append(F.linear(activated, w2[local_expert]))
-        start = end
-
-    return torch.cat(outputs, dim=0)
 
 
 @dataclass
@@ -732,6 +702,11 @@ class _FlashInferRunnerBase:
         self._prepared_backward_mode: Optional[str] = None
         self._prepared: Optional[object] = None
         self._permute_cache: dict = {}
+        self._bf16_surrogate = _BF16GroupedMLPSurrogate(
+            num_experts=local_num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
 
     def invalidate_weights(self) -> None:
         """Drop the forward mirror before the next optimizer-updated iteration."""
@@ -739,6 +714,29 @@ class _FlashInferRunnerBase:
         self._weight_key = None
         self._prepared_backward_mode = None
         self._prepared = None
+
+    def bf16_surrogate(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        w13_gate_up: Sequence[torch.Tensor],
+        w2: Sequence[torch.Tensor],
+        tokens_per_expert: Sequence[int],
+        *,
+        activation_in_fp32: bool,
+        fused_activation: bool,
+    ) -> torch.Tensor:
+        """Run the shared grouped-BF16 surrogate without retaining expert weights."""
+
+        return self._bf16_surrogate(
+            hidden_states,
+            topk_weights,
+            w13_gate_up,
+            w2,
+            tokens_per_expert,
+            activation_in_fp32=activation_in_fp32,
+            fused_activation=fused_activation,
+        )
 
 
 class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
@@ -1046,7 +1044,7 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
                     get_shuffle_matrix_sf_a_row_indices(w2_sf, epilogue_tile_m).to(w2_sf.device),
                 )
                 self._permute_cache[cache_key] = indices
-            (gated_rows, w13_weight_rows, w2_weight_rows, w13_scale_rows, w2_scale_rows) = indices
+            gated_rows, w13_weight_rows, w2_weight_rows, w13_scale_rows, w2_scale_rows = indices
 
             w13_u8 = w13_u8.index_select(0, gated_rows)
             w13_sf = w13_sf.index_select(0, gated_rows)
@@ -1216,9 +1214,13 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
         runner,
         weight_key,
         backward_mode,
+        activation_in_fp32,
+        fused_activation,
         *expert_weights,
     ):
         ctx.runner = runner
+        ctx.activation_in_fp32 = activation_in_fp32
+        ctx.fused_activation = fused_activation
         num_local_experts = runner.local_num_experts
         if len(expert_weights) != 2 * num_local_experts:
             raise ValueError(
@@ -1286,10 +1288,8 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
             expert_weights = ctx.saved_tensors[ctx.quantized_tensor_count :]
         else:
             hidden_states, topk_weights, *expert_weights = ctx.saved_tensors
-        w13_gate_up = expert_weights[: ctx.num_local_experts]
-        w2 = expert_weights[ctx.num_local_experts :]
         needs = ctx.needs_input_grad
-        weight_needs = needs[7:]
+        weight_needs = needs[9:]
         if hidden_states.shape[0] == 0:
             # Avoid launching a full BF16 expert recompute just to manufacture
             # explicit zeros on an EP rank with no dispatched assignments.
@@ -1297,6 +1297,8 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
             return (
                 torch.zeros_like(hidden_states) if needs[0] else None,
                 torch.zeros_like(topk_weights) if needs[1] else None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1311,16 +1313,27 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
         with torch.enable_grad():
             hidden_ref = hidden_states.detach().requires_grad_(needs[0])
             weights_ref = topk_weights.detach().requires_grad_(needs[1])
-            expert_weight_refs = tuple(
-                weight.detach().requires_grad_(need)
-                for weight, need in zip(expert_weights, weight_needs)
+            w13_needs = weight_needs[: ctx.num_local_experts]
+            w2_needs = weight_needs[ctx.num_local_experts :]
+            w13_ref = tuple(
+                weight.detach().requires_grad_(any(w13_needs))
+                for weight in expert_weights[: ctx.num_local_experts]
             )
-            w13_ref = expert_weight_refs[: ctx.num_local_experts]
-            w2_ref = expert_weight_refs[ctx.num_local_experts :]
-            output_ref = _bf16_local_routed_experts(
-                hidden_ref, weights_ref, w13_ref, w2_ref, ctx.tokens_per_expert
+            w2_ref = tuple(
+                weight.detach().requires_grad_(any(w2_needs))
+                for weight in expert_weights[ctx.num_local_experts :]
+            )
+            output_ref = ctx.runner.bf16_surrogate(
+                hidden_ref,
+                weights_ref,
+                w13_ref,
+                w2_ref,
+                ctx.tokens_per_expert,
+                activation_in_fp32=ctx.activation_in_fp32,
+                fused_activation=ctx.fused_activation,
             )
 
+        expert_weight_refs = (*w13_ref, *w2_ref)
         grad_inputs = (hidden_ref, weights_ref, *expert_weight_refs)
         requested_mask = (needs[0], needs[1], *weight_needs)
         requested = [tensor for tensor, need in zip(grad_inputs, requested_mask) if need]
@@ -1337,7 +1350,7 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
         # owning Parameter's version counter. Invalidate after every training
         # backward so the next forward cannot reuse pre-update quantized weights.
         ctx.runner.invalidate_weights()
-        return grads[0], grads[1], None, None, None, None, None, *grads[2:]
+        return grads[0], grads[1], None, None, None, None, None, None, None, *grads[2:]
 
 
 def _run_flashinfer_forward_with_surrogate(
@@ -1350,6 +1363,9 @@ def _run_flashinfer_forward_with_surrogate(
     runner,
     weight_key,
     backward_mode,
+    *,
+    activation_in_fp32=False,
+    fused_activation=False,
 ):
     """Attach custom autograd only when this invocation can require backward."""
 
@@ -1366,6 +1382,8 @@ def _run_flashinfer_forward_with_surrogate(
             runner,
             weight_key,
             backward_mode,
+            activation_in_fp32,
+            fused_activation,
             *expert_weights,
         )
 
@@ -1445,6 +1463,8 @@ def _run_dispatched_flashinfer_moe(
         runner,
         _source_weight_key(experts),
         backward_mode,
+        activation_in_fp32=experts.config.moe_activation_in_fp32,
+        fused_activation=experts.config.bias_activation_fusion,
     )
     if output.shape != hidden_states.shape:
         raise RuntimeError(
