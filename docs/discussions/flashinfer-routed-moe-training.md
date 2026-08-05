@@ -73,8 +73,8 @@ Both supported dispatchers use Megatron's normal lifecycle:
 router -> Megatron dispatch -> FlashInfer local experts -> Megatron combine
 ```
 
-`alltoall` uses `MoEAlltoAllTokenDispatcher` unchanged. `allgather` uses
-`MoEAllGatherTokenDispatcher` unchanged. The plugin does not implement a
+`allgather` uses `MoEAllGatherTokenDispatcher` unchanged. `alltoall` uses
+`MoEAlltoAllTokenDispatcher` unchanged. The plugin does not implement a
 collective, reconstruct routing, pad ranks, or reproduce the MoE layer forward.
 
 Megatron hands the expert module rows already sorted by local expert, their
@@ -158,7 +158,7 @@ BF16 recomputation.
   models
 - gated SwiGLU without bias, clamp, or linear offset
 - expert parallelism with `expert_tensor_parallel_size=1`
-- Megatron `alltoall` and `allgather` token dispatchers
+- Megatron `allgather` and `alltoall` token dispatchers
 - dropless routing without router quantization padding
 - up to 2,048 global experts
 

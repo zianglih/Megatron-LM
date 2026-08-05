@@ -239,12 +239,13 @@ def main() -> None:
     model_parallel_cuda_manual_seed(1234)
     route_ids = _routing_ids(rank, world_size)
 
-    # Preserve each case's seed and backward-mode order while grouping MXFP8 before NVFP4.
+    # Preserve each case's seed and backward-mode order while sorting first by dispatcher,
+    # then by quantization.
     for dispatcher, quantization, profile_seed_offset in (
-        ("alltoall", "mxfp8", 1),
         ("allgather", "mxfp8", 3),
-        ("alltoall", "nvfp4", 0),
         ("allgather", "nvfp4", 2),
+        ("alltoall", "mxfp8", 1),
+        ("alltoall", "nvfp4", 0),
     ):
         torch.manual_seed(5678 + rank)
         hidden_seed = torch.randn((NUM_TOKENS, 1, HIDDEN_SIZE), device="cuda", dtype=torch.bfloat16)

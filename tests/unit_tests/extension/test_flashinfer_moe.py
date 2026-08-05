@@ -1713,7 +1713,7 @@ def _global_abs_max(tensors) -> float:
 )
 @pytest.mark.parametrize(
     "moe_token_dispatcher_type",
-    [pytest.param("alltoall", id="alltoall"), pytest.param("allgather", id="allgather")],
+    [pytest.param("allgather", id="allgather"), pytest.param("alltoall", id="alltoall")],
 )
 @pytest.mark.parametrize(
     "model_hyperparameters",
