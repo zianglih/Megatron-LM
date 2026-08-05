@@ -27,14 +27,21 @@ from miles_megatron_plugins.flashinfer_moe import (
     _FlashInferMXFP8Runner,
     _FlashInferNVFP4Runner,
     FlashInferGroupedMLP,
+    DEQUANTIZED_BACKWARD,
+    HIGH_PRECISION_BACKWARD,
+    _dequantize_weight_payloads,
     _grouped_mlp_weights,
     _pack_topk_ids,
     _rollout_replay_topk_ids,
+    _run_flashinfer_forward_with_surrogate,
     _te_mxfp8_quantize_gated_weight,
     _te_mxfp8_quantize_weight,
     _te_nvfp4_quantize_gated_weight,
     _te_nvfp4_quantize_weight,
     _topk_from_dense_routing,
+    dequantize_mxfp8_activation,
+    dequantize_nvfp4_activation,
+    flashinfer_moe_backward_mode,
     flashinfer_moe_dispatch_mode,
     maybe_replace_flashinfer_moe_expert_spec,
     use_flashinfer_moe,
@@ -48,6 +55,21 @@ def test_flashinfer_moe_is_opt_in(monkeypatch):
 
     monkeypatch.setenv("MILES_USE_FLASHINFER_MOE", "1")
     assert use_flashinfer_moe()
+
+
+def test_flashinfer_moe_backward_mode_is_explicit(monkeypatch):
+    monkeypatch.delenv("MILES_FLASHINFER_MOE_DEQUANTIZED", raising=False)
+    assert flashinfer_moe_backward_mode() == HIGH_PRECISION_BACKWARD
+
+    monkeypatch.setenv("MILES_FLASHINFER_MOE_DEQUANTIZED", "0")
+    assert flashinfer_moe_backward_mode() == HIGH_PRECISION_BACKWARD
+
+    monkeypatch.setenv("MILES_FLASHINFER_MOE_DEQUANTIZED", "1")
+    assert flashinfer_moe_backward_mode() == DEQUANTIZED_BACKWARD
+
+    monkeypatch.setenv("MILES_FLASHINFER_MOE_DEQUANTIZED", "future")
+    with pytest.raises(ValueError, match="expected '0' or '1'"):
+        flashinfer_moe_backward_mode()
 
 
 def test_flashinfer_moe_quantization_resolves_config_and_override(monkeypatch):
@@ -333,7 +355,7 @@ def test_flashinfer_autograd_skips_empty_forward_and_invalidates_on_backward():
     w2 = torch.randn((2, 4, 4), requires_grad=True)
 
     output = _FlashInferForwardBF16Backward.apply(
-        hidden, topk_weights, topk_ids, w13, w2, runner, (0, 0, 0, 0)
+        hidden, topk_weights, topk_ids, w13, w2, runner, (0, 0, 0, 0), DEQUANTIZED_BACKWARD
     )
 
     assert output.shape == hidden.shape
@@ -343,6 +365,222 @@ def test_flashinfer_autograd_skips_empty_forward_and_invalidates_on_backward():
     for tensor in (hidden, topk_weights, w13, w2):
         assert tensor.grad is not None
         torch.testing.assert_close(tensor.grad, torch.zeros_like(tensor))
+
+
+@pytest.mark.parametrize("backward_mode", [HIGH_PRECISION_BACKWARD, DEQUANTIZED_BACKWARD])
+def test_flashinfer_autograd_uses_selected_forward_operands(backward_mode):
+    dequantized_hidden = torch.tensor([[0.25, -0.5], [1.0, 0.75]])
+    dequantized_w13 = torch.tensor([[[0.5, -0.25], [0.75, 0.125], [1.25, 0.5], [-0.5, 1.0]]])
+    dequantized_w2 = torch.tensor([[[0.5, -1.0], [1.5, 0.25]]])
+
+    class FakeStorage:
+        def __init__(self, tensor):
+            self._rowwise_data = tensor
+
+        def dequantize(self, *, dtype):
+            return self._rowwise_data.to(dtype)
+
+        def prepare_for_saving(self):
+            tensors = [self._rowwise_data]
+            self._rowwise_data = None
+            return tensors, self
+
+        def restore_from_saved(self, tensors):
+            self._rowwise_data = tensors[0]
+            return tensors[1:]
+
+    class FakeRunner:
+        local_expert_offset = 0
+
+        def __init__(self):
+            self.invalidate_calls = 0
+            self.seen_mode = None
+
+        def forward(self, hidden_states, _topk_weights, _topk_ids, _w13, _w2, _weight_key, mode):
+            self.seen_mode = mode
+            return SimpleNamespace(
+                output=hidden_states.detach().clone(),
+                backward_hidden_states=FakeStorage(dequantized_hidden),
+                backward_w13=(FakeStorage(dequantized_w13[0]),),
+                backward_w2=(FakeStorage(dequantized_w2[0]),),
+            )
+
+        def invalidate_weights(self):
+            self.invalidate_calls += 1
+
+    runner = FakeRunner()
+    hidden = torch.tensor([[0.5, -1.0], [1.5, 0.25]], requires_grad=True)
+    topk_weights = torch.tensor([[0.25], [0.75]], requires_grad=True)
+    topk_ids = torch.zeros((2, 1), dtype=torch.int32)
+    w13 = torch.tensor([[[1.0, 0.0], [0.0, 2.0], [3.0, 0.0], [0.0, -4.0]]], requires_grad=True)
+    w2 = torch.tensor([[[2.0, -1.0], [0.5, 3.0]]], requires_grad=True)
+    source_snapshots = tuple(tensor.detach().clone() for tensor in (hidden, w13, w2))
+    grad_output = torch.tensor([[0.5, -0.25], [1.25, 0.75]])
+
+    output = _FlashInferForwardBF16Backward.apply(
+        hidden, topk_weights, topk_ids, w13, w2, runner, (0, 0, 0, 0), backward_mode
+    )
+    torch.autograd.backward(output, grad_output, retain_graph=True)
+    torch.autograd.backward(output, grad_output)
+
+    reference_hidden = (
+        hidden.detach() if backward_mode == HIGH_PRECISION_BACKWARD else dequantized_hidden
+    ).requires_grad_()
+    reference_weights = topk_weights.detach().requires_grad_()
+    reference_w13 = (
+        w13.detach() if backward_mode == HIGH_PRECISION_BACKWARD else dequantized_w13
+    ).requires_grad_()
+    reference_w2 = (
+        w2.detach() if backward_mode == HIGH_PRECISION_BACKWARD else dequantized_w2
+    ).requires_grad_()
+    reference_output = _bf16_local_routed_experts(
+        reference_hidden,
+        reference_weights,
+        topk_ids,
+        reference_w13,
+        reference_w2,
+        local_expert_offset=0,
+    )
+    torch.autograd.backward(reference_output, grad_output, retain_graph=True)
+    torch.autograd.backward(reference_output, grad_output)
+
+    for actual, expected in (
+        (hidden.grad, reference_hidden.grad),
+        (topk_weights.grad, reference_weights.grad),
+        (w13.grad, reference_w13.grad),
+        (w2.grad, reference_w2.grad),
+    ):
+        torch.testing.assert_close(actual, expected)
+    for source, snapshot in zip((hidden, w13, w2), source_snapshots):
+        torch.testing.assert_close(source, snapshot)
+    assert runner.seen_mode == backward_mode
+    assert runner.invalidate_calls == 2
+
+
+@pytest.mark.parametrize("num_tokens", [0, 2])
+def test_flashinfer_dequantized_mode_avoids_backward_payloads_under_no_grad(num_tokens):
+    class FakeRunner:
+        def __init__(self):
+            self.seen_mode = None
+
+        def forward(
+            self, hidden_states, _topk_weights, _topk_ids, _w13, _w2, _weight_key, backward_mode
+        ):
+            self.seen_mode = backward_mode
+            return SimpleNamespace(output=hidden_states + 1)
+
+    runner = FakeRunner()
+    hidden = torch.ones((num_tokens, 4), requires_grad=True)
+    topk_weights = torch.ones((num_tokens, 1), requires_grad=True)
+    topk_ids = torch.zeros((num_tokens, 1), dtype=torch.int32)
+    w13 = torch.ones((1, 8, 4), requires_grad=True)
+    w2 = torch.ones((1, 4, 4), requires_grad=True)
+
+    with torch.no_grad():
+        output = _run_flashinfer_forward_with_surrogate(
+            hidden, topk_weights, topk_ids, w13, w2, runner, (1,), DEQUANTIZED_BACKWARD
+        )
+
+    expected = hidden if num_tokens == 0 else hidden + 1
+    torch.testing.assert_close(output, expected)
+    assert not output.requires_grad
+    assert runner.seen_mode == (None if num_tokens == 0 else HIGH_PRECISION_BACKWARD)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="FlashInfer forward-operand dequantization requires Blackwell",
+)
+@pytest.mark.parametrize(
+    "quantization,use_4over6,use_256,hidden_size",
+    [
+        pytest.param("nvfp4", False, False, 16, id="nvfp4-k16"),
+        pytest.param("nvfp4", True, False, 128, id="nvfp4-4over6-e4m3-448"),
+        pytest.param("nvfp4", True, True, 128, id="nvfp4-4over6-e4m3-256"),
+        pytest.param("mxfp8", False, False, 128, id="mxfp8"),
+    ],
+)
+def test_flashinfer_dequantizes_forward_activation_payload(
+    monkeypatch, quantization, use_4over6, use_256, hidden_size
+):
+    torch.manual_seed(123)
+    hidden = torch.randn((33, hidden_size), device="cuda", dtype=torch.bfloat16)
+
+    if quantization == "mxfp8":
+        from flashinfer import mxfp8_quantize
+
+        data, scales = mxfp8_quantize(hidden, False, backend="cute-dsl")
+        actual = dequantize_mxfp8_activation(data, scales, dtype=torch.bfloat16)
+        scale_bytes = scales.view(torch.uint8).reshape(33, hidden_size // 32)
+        expanded_scales = scale_bytes.repeat_interleave(32, dim=-1)
+        expected = torch.where(
+            expanded_scales == 0,
+            torch.zeros_like(data, dtype=torch.float32),
+            torch.ldexp(data.float(), expanded_scales.to(torch.int32) - 127),
+        ).to(torch.bfloat16)
+    else:
+        from flashinfer import SfLayout, nvfp4_quantize
+
+        if use_4over6:
+            _set_nvfp4_4over6_env(monkeypatch, flashinfer=True)
+            if not use_256:
+                monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", "0")
+        else:
+            monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
+            monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", "0")
+        e4m3_max = 256 if use_4over6 and use_256 else 448
+        input_global_scale = torch.tensor(
+            [1.0 / (e4m3_max * 6.0)], device="cuda", dtype=torch.float32
+        )
+        data, scales, per_token_scale = nvfp4_quantize(
+            hidden,
+            input_global_scale,
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cuda",
+        )
+        actual = dequantize_nvfp4_activation(
+            data,
+            scales,
+            per_token_scale,
+            dtype=torch.bfloat16,
+            e4m3_max=e4m3_max,
+            use_4over6=use_4over6,
+        )
+        e2m1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device="cuda")
+        packed = data.view(torch.uint8).flatten()
+        nibbles = torch.stack((packed & 0xF, packed >> 4), dim=1).flatten()
+        values = e2m1[(nibbles & 0x7).long()] * torch.where(nibbles & 0x8 != 0, -1.0, 1.0)
+        values = values.reshape(33, hidden_size // 16, 16)
+        block_scales = scales.view(torch.float8_e4m3fn).float().reshape(33, hidden_size // 16, 1)
+        expected = (
+            (values * block_scales * per_token_scale.reshape(33, 1, 1))
+            .reshape_as(hidden)
+            .to(torch.bfloat16)
+        )
+
+    # TE's 4-over-6 decoder may choose a different BF16 multiply order than
+    # this explicit payload formula; the observed discrepancy is at most one
+    # BF16 rounding step. Standard NVFP4 and MXFP8 remain bitwise checks.
+    rtol = 0.005 if quantization == "nvfp4" and use_4over6 else 0
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=0)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="FlashInfer MXFP8 activation dequantization requires Blackwell",
+)
+def test_flashinfer_mxfp8_zero_scale_dequantizes_to_zero():
+    from flashinfer import mxfp8_quantize
+
+    hidden = torch.zeros((3, 128), device="cuda", dtype=torch.bfloat16)
+    data, scales = mxfp8_quantize(hidden, False, backend="cute-dsl")
+
+    assert torch.count_nonzero(scales.view(torch.uint8)).item() == 0
+    actual = dequantize_mxfp8_activation(data, scales, dtype=torch.bfloat16)
+    torch.testing.assert_close(actual, hidden, rtol=0, atol=0)
 
 
 @pytest.mark.internal
@@ -484,6 +722,123 @@ def _set_nvfp4_4over6_env(monkeypatch, *, flashinfer=False):
 @pytest.mark.internal
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="FlashInfer dequantized expert weights require Blackwell",
+)
+@pytest.mark.parametrize(
+    "runner_type",
+    [
+        pytest.param(_FlashInferNVFP4Runner, id="nvfp4"),
+        pytest.param(_FlashInferMXFP8Runner, id="mxfp8"),
+    ],
+)
+def test_flashinfer_prepares_exact_dequantized_forward_weights(monkeypatch, runner_type):
+    if runner_type is _FlashInferNVFP4Runner:
+        _set_nvfp4_4over6_env(monkeypatch, flashinfer=True)
+
+    torch.manual_seed(321)
+    w13 = torch.randn((1, 256, 128), device="cuda", dtype=torch.bfloat16)
+    w2 = torch.randn((1, 128, 128), device="cuda", dtype=torch.bfloat16)
+    source_snapshots = (w13.clone(), w2.clone())
+    runner = runner_type(
+        num_experts=1,
+        local_expert_offset=0,
+        local_num_experts=1,
+        hidden_size=128,
+        intermediate_size=128,
+    )
+
+    prepared = runner._prepare_weights(w13, w2, (1,), DEQUANTIZED_BACKWARD)
+    assert prepared.backward_w13 is not None
+    assert prepared.backward_w2 is not None
+
+    if runner_type is _FlashInferNVFP4Runner:
+        *_, w13_quantized = _te_nvfp4_quantize_gated_weight(w13[0], return_quantized=True)
+        *_, w2_quantized = _te_nvfp4_quantize_weight(w2[0], return_quantized=True)
+    else:
+        *_, w13_quantized = _te_mxfp8_quantize_gated_weight(w13[0], return_quantized=True)
+        *_, w2_quantized = _te_mxfp8_quantize_weight(w2[0], return_quantized=True)
+    expected_w13 = w13_quantized.dequantize(dtype=torch.bfloat16)[:256, :128]
+    expected_w2 = w2_quantized.dequantize(dtype=torch.bfloat16)[:128, :128]
+
+    actual_w13 = prepared.backward_w13[0].dequantize(dtype=torch.bfloat16)[:256, :128]
+    actual_w2 = prepared.backward_w2[0].dequantize(dtype=torch.bfloat16)[:128, :128]
+    torch.testing.assert_close(actual_w13, expected_w13, rtol=0, atol=0)
+    torch.testing.assert_close(actual_w2, expected_w2, rtol=0, atol=0)
+    assert torch.count_nonzero(actual_w13 != w13[0]).item() > 0
+    assert torch.count_nonzero(actual_w2 != w2[0]).item() > 0
+    torch.testing.assert_close(w13, source_snapshots[0], rtol=0, atol=0)
+    torch.testing.assert_close(w2, source_snapshots[1], rtol=0, atol=0)
+
+    assert runner._prepare_weights(w13, w2, (1,), DEQUANTIZED_BACKWARD) is prepared
+    high_precision = runner._prepare_weights(w13, w2, (1,), HIGH_PRECISION_BACKWARD)
+    assert high_precision is not prepared
+    assert high_precision.backward_w13 is None
+    assert high_precision.backward_w2 is None
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="FlashInfer dequantized autograd requires Blackwell",
+)
+@pytest.mark.parametrize(
+    "runner_type",
+    [
+        pytest.param(_FlashInferNVFP4Runner, id="nvfp4"),
+        pytest.param(_FlashInferMXFP8Runner, id="mxfp8"),
+    ],
+)
+def test_flashinfer_dequantized_autograd_supports_outstanding_forwards(monkeypatch, runner_type):
+    if runner_type is _FlashInferNVFP4Runner:
+        _set_nvfp4_4over6_env(monkeypatch, flashinfer=True)
+        hidden_size = 128
+        intermediate_size = 128
+    else:
+        hidden_size = 2048
+        intermediate_size = 768
+
+    torch.manual_seed(4321)
+    runner = runner_type(
+        num_experts=4,
+        local_expert_offset=0,
+        local_num_experts=1,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    hidden = torch.randn((8, hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    topk_weights = torch.rand((8, 1), device="cuda", dtype=torch.float32, requires_grad=True)
+    topk_ids = torch.zeros((8, 1), device="cuda", dtype=torch.int32)
+    w13 = torch.randn(
+        (1, 2 * intermediate_size, hidden_size),
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    w2 = torch.randn(
+        (1, hidden_size, intermediate_size), device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    snapshots = tuple(tensor.detach().clone() for tensor in (hidden, w13, w2))
+
+    outputs = [
+        _FlashInferForwardBF16Backward.apply(
+            hidden, topk_weights, topk_ids, w13, w2, runner, (1,), DEQUANTIZED_BACKWARD
+        )
+        for _ in range(2)
+    ]
+    torch.autograd.backward(outputs, [torch.ones_like(output) for output in outputs])
+
+    for tensor in (hidden, topk_weights, w13, w2):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+    for source, snapshot in zip((hidden, w13, w2), snapshots):
+        torch.testing.assert_close(source, snapshot, rtol=0, atol=0)
+    assert runner._prepared is None
+    assert runner._weight_key is None
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="TE NVFP4 weight quantization requires Blackwell",
 )
 @pytest.mark.parametrize("seed", [29, 44])
@@ -590,13 +945,44 @@ def _install_distributed_route(
 
 
 def _bf16_flashinfer_apply(
-    hidden_states, topk_weights, topk_ids, w13_gate_up, w2, runner, _weight_key
+    hidden_states, topk_weights, topk_ids, w13_gate_up, w2, runner, _weight_key, _backward_mode
 ):
     """Replace only the fused kernel boundary for a topology-identical reference."""
 
     return _bf16_local_routed_experts(
         hidden_states, topk_weights, topk_ids, w13_gate_up, w2, runner.local_expert_offset
     )
+
+
+def _dequantized_flashinfer_apply(
+    hidden_states, topk_weights, topk_ids, w13_gate_up, w2, runner, weight_key, backward_mode
+):
+    """Build an ordinary-autograd reference from forward-derived QDQ operands."""
+
+    assert backward_mode == DEQUANTIZED_BACKWARD
+    if hidden_states.shape[0] == 0:
+        surrogate = _bf16_local_routed_experts(
+            hidden_states, topk_weights, topk_ids, w13_gate_up, w2, runner.local_expert_offset
+        )
+        return torch.empty_like(hidden_states) + (surrogate - surrogate.detach())
+    with torch.no_grad():
+        result = runner.forward(
+            hidden_states, topk_weights, topk_ids, w13_gate_up, w2, weight_key, backward_mode
+        )
+        decoded_hidden = result.backward_hidden_states.dequantize(dtype=hidden_states.dtype)
+        decoded_w13 = _dequantize_weight_payloads(
+            result.backward_w13, tuple(w13_gate_up.shape), dtype=w13_gate_up.dtype
+        )
+        decoded_w2 = _dequantize_weight_payloads(
+            result.backward_w2, tuple(w2.shape), dtype=w2.dtype
+        )
+    hidden_ref = decoded_hidden.detach() + (hidden_states - hidden_states.detach())
+    w13_ref = decoded_w13.detach() + (w13_gate_up - w13_gate_up.detach())
+    w2_ref = decoded_w2.detach() + (w2 - w2.detach())
+    surrogate = _bf16_local_routed_experts(
+        hidden_ref, topk_weights, topk_ids, w13_ref, w2_ref, runner.local_expert_offset
+    )
+    return result.output.detach() + (surrogate - surrogate.detach())
 
 
 def _run_distributed_layer_once(
@@ -607,7 +993,7 @@ def _run_distributed_layer_once(
     route_ids: torch.Tensor,
     *,
     dispatch_mode: str,
-    bf16_reference: bool,
+    surrogate_reference: str | None = None,
 ):
     """Run one full layer forward/backward and snapshot its local results."""
 
@@ -618,19 +1004,29 @@ def _run_distributed_layer_once(
 
     received_rows = []
     hook = None
-    if dispatch_mode == "alltoall" and not bf16_reference:
+    if dispatch_mode == "alltoall" and surrogate_reference is None:
         hook = layer.experts.register_forward_pre_hook(
             lambda _module, inputs: received_rows.append(inputs[0].shape[0])
         )
 
     try:
         with ExitStack() as stack:
-            if bf16_reference:
+            if surrogate_reference == "bf16":
                 stack.enter_context(
                     mock.patch.object(
                         _FlashInferForwardBF16Backward, "apply", side_effect=_bf16_flashinfer_apply
                     )
                 )
+            elif surrogate_reference == DEQUANTIZED_BACKWARD:
+                stack.enter_context(
+                    mock.patch.object(
+                        _FlashInferForwardBF16Backward,
+                        "apply",
+                        side_effect=_dequantized_flashinfer_apply,
+                    )
+                )
+            elif surrogate_reference is not None:
+                raise ValueError(f"unknown distributed surrogate reference {surrogate_reference!r}")
             if dispatch_mode == "alltoall":
                 stack.enter_context(
                     mock.patch.object(
@@ -654,6 +1050,9 @@ def _run_distributed_layer_once(
             hook.remove()
 
     torch.autograd.backward(output, grad_seed)
+    if surrogate_reference == DEQUANTIZED_BACKWARD:
+        owner = layer.experts if dispatch_mode == "alltoall" else layer
+        owner._flashinfer_moe_runner.invalidate_weights()
     parameter_grads = []
     missing_grads = int(hidden.grad is None) + int(route_logits.grad is None)
     hidden_grad = torch.zeros_like(hidden) if hidden.grad is None else hidden.grad
@@ -757,7 +1156,9 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
     output_nonzero_by_rank = None
     metrics = None
     reference = None
-    actual = None
+    high_precision = None
+    dequantized_reference = None
+    dequantized = None
     run_completed = False
 
     try:
@@ -803,6 +1204,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         grad_seed = torch.randn_like(hidden_seed)
         route_ids = _distributed_routing_ids(rank, world_size, num_tokens, num_experts, top_k)
 
+        monkeypatch.setenv("MILES_FLASHINFER_MOE_DEQUANTIZED", "0")
         reference = _run_distributed_layer_once(
             layer,
             hidden_seed,
@@ -810,51 +1212,128 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             grad_seed,
             route_ids,
             dispatch_mode=moe_token_dispatcher_type,
-            bf16_reference=True,
+            surrogate_reference="bf16",
         )
-        actual = _run_distributed_layer_once(
+        high_precision = _run_distributed_layer_once(
             layer,
             hidden_seed,
             logits_seed,
             grad_seed,
             route_ids,
             dispatch_mode=moe_token_dispatcher_type,
-            bf16_reference=False,
         )
 
-        forward_error_sq = (actual.output.float() - reference.output.float()).square().sum()
+        monkeypatch.setenv("MILES_FLASHINFER_MOE_DEQUANTIZED", "1")
+        dequantized_reference = _run_distributed_layer_once(
+            layer,
+            hidden_seed,
+            logits_seed,
+            grad_seed,
+            route_ids,
+            dispatch_mode=moe_token_dispatcher_type,
+            surrogate_reference=DEQUANTIZED_BACKWARD,
+        )
+        dequantized = _run_distributed_layer_once(
+            layer,
+            hidden_seed,
+            logits_seed,
+            grad_seed,
+            route_ids,
+            dispatch_mode=moe_token_dispatcher_type,
+        )
+
+        forward_error_sq = (high_precision.output.float() - reference.output.float()).square().sum()
         reference_sq = reference.output.float().square().sum()
         torch.distributed.all_reduce(forward_error_sq)
         torch.distributed.all_reduce(reference_sq)
         forward_rel_l2 = torch.sqrt(forward_error_sq / reference_sq.clamp_min(1e-20)).item()
         per_token_forward_rel_l2 = _global_max(
             torch.sqrt(
-                (actual.output.float() - reference.output.float()).square().sum(dim=-1)
+                (high_precision.output.float() - reference.output.float()).square().sum(dim=-1)
                 / reference.output.float().square().sum(dim=-1).clamp_min(1e-20)
             ).max()
         )
         hidden_grad_max = _global_max(
-            (actual.hidden_grad.float() - reference.hidden_grad.float()).abs().max()
+            (high_precision.hidden_grad.float() - reference.hidden_grad.float()).abs().max()
         )
         hidden_grad_reference_max = _global_abs_max((reference.hidden_grad,))
-        hidden_grad_rel_l2 = _global_relative_l2((actual.hidden_grad,), (reference.hidden_grad,))
+        hidden_grad_rel_l2 = _global_relative_l2(
+            (high_precision.hidden_grad,), (reference.hidden_grad,)
+        )
         route_grad_max = _global_max(
-            (actual.route_grad.float() - reference.route_grad.float()).abs().max()
+            (high_precision.route_grad.float() - reference.route_grad.float()).abs().max()
         )
         route_grad_reference_max = _global_abs_max((reference.route_grad,))
-        route_grad_rel_l2 = _global_relative_l2((actual.route_grad,), (reference.route_grad,))
+        route_grad_rel_l2 = _global_relative_l2(
+            (high_precision.route_grad,), (reference.route_grad,)
+        )
         parameter_grad_error = torch.zeros((), device="cuda")
-        for actual_grad, reference_grad in zip(actual.parameter_grads, reference.parameter_grads):
+        for actual_grad, reference_grad in zip(
+            high_precision.parameter_grads, reference.parameter_grads
+        ):
             parameter_grad_error = torch.maximum(
                 parameter_grad_error, (actual_grad.float() - reference_grad.float()).abs().max()
             )
         parameter_grad_max = _global_max(parameter_grad_error)
         parameter_grad_reference_max = _global_abs_max(reference.parameter_grads)
         parameter_grad_rel_l2 = _global_relative_l2(
-            actual.parameter_grads, reference.parameter_grads
+            high_precision.parameter_grads, reference.parameter_grads
+        )
+        dequantized_hidden_grad_rel_l2 = _global_relative_l2(
+            (dequantized.hidden_grad,), (dequantized_reference.hidden_grad,)
+        )
+        dequantized_hidden_grad_reference_max = _global_abs_max(
+            (dequantized_reference.hidden_grad,)
+        )
+        dequantized_route_grad_rel_l2 = _global_relative_l2(
+            (dequantized.route_grad,), (dequantized_reference.route_grad,)
+        )
+        dequantized_parameter_grad_rel_l2 = _global_relative_l2(
+            dequantized.parameter_grads, dequantized_reference.parameter_grads
+        )
+        dequantized_hidden_grad_max = _global_max(
+            (dequantized.hidden_grad.float() - dequantized_reference.hidden_grad.float())
+            .abs()
+            .max()
+        )
+        dequantized_route_grad_max = _global_max(
+            (dequantized.route_grad.float() - dequantized_reference.route_grad.float()).abs().max()
+        )
+        dequantized_parameter_grad_error = torch.zeros((), device="cuda")
+        for actual_grad, reference_grad in zip(
+            dequantized.parameter_grads, dequantized_reference.parameter_grads
+        ):
+            dequantized_parameter_grad_error = torch.maximum(
+                dequantized_parameter_grad_error,
+                (actual_grad.float() - reference_grad.float()).abs().max(),
+            )
+        dequantized_parameter_grad_max = _global_max(dequantized_parameter_grad_error)
+        dequantized_vs_high_hidden_grad_rel_l2 = _global_relative_l2(
+            (dequantized.hidden_grad,), (high_precision.hidden_grad,)
+        )
+        dequantized_vs_high_route_grad_rel_l2 = _global_relative_l2(
+            (dequantized.route_grad,), (high_precision.route_grad,)
+        )
+        dequantized_vs_high_parameter_grad_rel_l2 = _global_relative_l2(
+            dequantized.parameter_grads, high_precision.parameter_grads
+        )
+        forward_mode_rel_l2 = max(
+            _global_relative_l2((dequantized.output,), (high_precision.output,)),
+            _global_relative_l2((dequantized_reference.output,), (high_precision.output,)),
+        )
+        forward_mode_max = max(
+            _global_max((dequantized.output.float() - high_precision.output.float()).abs().max()),
+            _global_max(
+                (dequantized_reference.output.float() - high_precision.output.float()).abs().max()
+            ),
         )
         missing_grads = torch.tensor(
-            reference.missing_grads + actual.missing_grads, device="cuda", dtype=torch.int32
+            reference.missing_grads
+            + high_precision.missing_grads
+            + dequantized_reference.missing_grads
+            + dequantized.missing_grads,
+            device="cuda",
+            dtype=torch.int32,
         )
         torch.distributed.all_reduce(missing_grads)
         metrics = (
@@ -869,12 +1348,24 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             parameter_grad_max,
             parameter_grad_reference_max,
             parameter_grad_rel_l2,
+            dequantized_hidden_grad_rel_l2,
+            dequantized_hidden_grad_reference_max,
+            dequantized_route_grad_rel_l2,
+            dequantized_parameter_grad_rel_l2,
+            dequantized_hidden_grad_max,
+            dequantized_route_grad_max,
+            dequantized_parameter_grad_max,
+            dequantized_vs_high_hidden_grad_rel_l2,
+            dequantized_vs_high_route_grad_rel_l2,
+            dequantized_vs_high_parameter_grad_rel_l2,
+            forward_mode_rel_l2,
+            forward_mode_max,
             missing_grads.item(),
         )
 
         if moe_token_dispatcher_type == "alltoall":
             received = torch.tensor(
-                actual.received_rows if len(actual.received_rows) == 1 else [-1],
+                dequantized.received_rows if len(dequantized.received_rows) == 1 else [-1],
                 device="cuda",
                 dtype=torch.int64,
             )
@@ -883,7 +1374,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             received_by_rank = [value.item() for value in received_tensors]
 
             output_nonzero = torch.tensor(
-                [int(torch.count_nonzero(actual.output).item() > 0)],
+                [int(torch.count_nonzero(dequantized.output).item() > 0)],
                 device="cuda",
                 dtype=torch.int32,
             )
@@ -900,11 +1391,15 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         )
         result_metadata = (
             reference.bias,
-            actual.bias,
-            tuple(actual.output.shape),
-            actual.output.dtype,
+            high_precision.bias,
+            dequantized_reference.bias,
+            dequantized.bias,
+            tuple(dequantized.output.shape),
+            dequantized.output.dtype,
             bool(torch.isfinite(reference.output).all().item()),
-            bool(torch.isfinite(actual.output).all().item()),
+            bool(torch.isfinite(high_precision.output).all().item()),
+            bool(torch.isfinite(dequantized_reference.output).all().item()),
+            bool(torch.isfinite(dequantized.output).all().item()),
             runner_cache_cleared,
         )
         torch.cuda.synchronize()
@@ -915,15 +1410,24 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         else:
             parallel_state.destroy_model_parallel()
             Utils.inited = False
-            if torch.distributed.is_initialized():
-                torch.distributed.destroy_process_group()
+            # Let torchrun terminate peer ranks after the original exception;
+            # synchronously tearing down the world here can hide the failure
+            # behind an NCCL shutdown wait while another rank is still on GPU.
 
-    assert reference is not None and actual is not None and metrics is not None
+    assert all(
+        result is not None
+        for result in (reference, high_precision, dequantized_reference, dequantized)
+    )
+    assert metrics is not None
     assert result_metadata == (
+        None,
+        None,
         None,
         None,
         (num_tokens, 1, hidden_size),
         torch.bfloat16,
+        True,
+        True,
         True,
         True,
         True,
@@ -940,6 +1444,18 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         parameter_grad_max,
         parameter_grad_reference_max,
         parameter_grad_rel_l2,
+        dequantized_hidden_grad_rel_l2,
+        dequantized_hidden_grad_reference_max,
+        dequantized_route_grad_rel_l2,
+        dequantized_parameter_grad_rel_l2,
+        dequantized_hidden_grad_max,
+        dequantized_route_grad_max,
+        dequantized_parameter_grad_max,
+        dequantized_vs_high_hidden_grad_rel_l2,
+        dequantized_vs_high_route_grad_rel_l2,
+        dequantized_vs_high_parameter_grad_rel_l2,
+        forward_mode_rel_l2,
+        forward_mode_max,
         missing_grads,
     ) = metrics
     if rank == 0:
@@ -954,9 +1470,23 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             f"route_grad_rel_l2={route_grad_rel_l2:.6f}, "
             f"route_grad_max={route_grad_max:.6f}, "
             f"parameter_grad_rel_l2={parameter_grad_rel_l2:.6f}, "
-            f"parameter_grad_max={parameter_grad_max:.6f}"
+            f"parameter_grad_max={parameter_grad_max:.6f}, "
+            f"dequantized_hidden_grad_rel_l2={dequantized_hidden_grad_rel_l2:.6f}, "
+            f"forward_mode_rel_l2={forward_mode_rel_l2:.6f}, "
+            f"forward_mode_max={forward_mode_max:.6f}, "
+            f"dequantized_route_grad_rel_l2={dequantized_route_grad_rel_l2:.6f}, "
+            "dequantized_parameter_grad_rel_l2="
+            f"{dequantized_parameter_grad_rel_l2:.6f}, "
+            "dequantized_vs_high_hidden_grad_rel_l2="
+            f"{dequantized_vs_high_hidden_grad_rel_l2:.6f}, "
+            "dequantized_vs_high_route_grad_rel_l2="
+            f"{dequantized_vs_high_route_grad_rel_l2:.6f}, "
+            "dequantized_vs_high_parameter_grad_rel_l2="
+            f"{dequantized_vs_high_parameter_grad_rel_l2:.6f}"
         )
     assert missing_grads == 0
+    assert forward_mode_rel_l2 < 0.01
+    assert forward_mode_max < 0.125
     forward_tolerance = 0.25 if runner_type.quantization == "nvfp4" else 0.10
     per_token_forward_tolerance = 0.30 if runner_type.quantization == "nvfp4" else 0.15
     assert forward_rel_l2 < forward_tolerance
@@ -969,6 +1499,22 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
     assert hidden_grad_max < gradient_atol + gradient_rtol * hidden_grad_reference_max
     assert route_grad_max < gradient_atol + gradient_rtol * route_grad_reference_max
     assert parameter_grad_max < gradient_atol + gradient_rtol * parameter_grad_reference_max
+    assert dequantized_hidden_grad_rel_l2 < 0.01
+    assert dequantized_route_grad_rel_l2 < 1e-6
+    assert dequantized_parameter_grad_rel_l2 < 1e-6
+    assert dequantized_hidden_grad_max < (
+        gradient_atol + gradient_rtol * dequantized_hidden_grad_reference_max
+    )
+    assert dequantized_route_grad_max < 1e-5
+    assert dequantized_parameter_grad_max < 1e-5
+    assert (
+        max(
+            dequantized_vs_high_hidden_grad_rel_l2,
+            dequantized_vs_high_route_grad_rel_l2,
+            dequantized_vs_high_parameter_grad_rel_l2,
+        )
+        > 0
+    )
 
     if moe_token_dispatcher_type == "alltoall":
         assert received_by_rank is not None

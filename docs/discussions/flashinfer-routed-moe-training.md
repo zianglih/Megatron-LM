@@ -16,6 +16,7 @@ This experiment targets:
 - MXFP8 weights and per-token MXFP8 activation quantization
 - routed SwiGLU experts
 - BF16 module input and output
+- selectable high-precision or forward-QDQ operands for the BF16 surrogate
 - expert tensor parallel size 1
 
 It does not introduce a weight or activation layout. It materializes the
@@ -41,6 +42,21 @@ There is no default quantization fallback. Other active recipes and missing or
 ambiguous selections fail before the routed kernel runs, and an environment
 selection cannot override a conflicting active recipe. New formats must add an
 explicit resolver, capability, validation, runner, and log-description branch.
+
+The surrogate-backward operand mode is selected independently:
+
+```bash
+MILES_FLASHINFER_MOE_DEQUANTIZED=0  # default: original BF16 operands
+MILES_FLASHINFER_MOE_DEQUANTIZED=1  # forward-derived visible QDQ operands
+```
+
+Only `0`, `1`, or an unset variable are accepted. The setting does not change
+the FlashInfer forward. The default preserves the original behavior, analogous
+to Transformer Engine's `NVTE_BACKWARD_OVERRIDE=high_precision`. The opt-in
+mode follows the external-operand semantics of
+[Transformer Engine #2644](https://github.com/NVIDIA/TransformerEngine/pull/2644)
+`NVTE_BACKWARD_OVERRIDE=dequantized`: it uses the dequantized values represented
+by the activation and weight payloads that fed the forward.
 
 When enabled, the MoE layer:
 
@@ -83,6 +99,17 @@ Megatron's `[gate, up]`, `silu(gate) * up`, probability-before-FC2 formula.
 It returns gradients for BF16 input, routing weights, and BF16 master weights.
 Expert IDs and forward quantization are intentionally nondifferentiable.
 
+In dequantized mode, the adapter retains compact canonical Transformer Engine
+storage for the exact weight payloads used to construct FlashInfer W13/W2. For
+MXFP8 it wraps FlashInfer's exact per-token input payload; for NVFP4 it wraps
+the exact packed values and block scales with equivalent Transformer Engine
+row-scale metadata. These tensors are registered with Transformer Engine's
+saved-tensor helpers, then lazily decoded to BF16 only when backward starts.
+The adapter never overwrites the input or Megatron master parameters and does
+not keep an eager full-size BF16 weight mirror. This trades compact saved
+quantized payloads plus backward-time decode work for a surrogate whose
+operands reflect forward quantization.
+
 The expert-parallel communication remains part of the autograd boundary:
 
 - in the replicated branch, padded all-gather backward is a summing
@@ -91,8 +118,10 @@ The expert-parallel communication remains part of the autograd boundary:
   hidden-state and routing-probability gradients back to their source ranks;
 - local expert parameters receive only their local gradients.
 
-This backward is not the derivative of the quantized FlashInfer forward.
-Gradient fidelity is an accepted limitation of this experiment.
+Neither backward mode is the derivative of the fused quantized FlashInfer
+forward. Dequantized mode changes the surrogate operands, but the recompute
+still uses ordinary BF16 SwiGLU and GEMMs. Gradient fidelity is an accepted
+limitation of this experiment.
 
 ## Exact NVFP4 rollout settings
 
@@ -207,6 +236,16 @@ per-token activations. The adapter mirrors that division of ownership.
   transfer and optimizer-state resume have not yet been exercised.
 - Partial MoE CUDA graph capture is rejected. Full-layer activation
   checkpointing may re-run the FlashInfer forward and must be measured.
+- FlashInfer does not expose the quantized post-SwiGLU intermediate produced
+  inside the fused kernel. Dequantized mode therefore covers the externally
+  visible input activation plus W13/W2 payloads; the surrogate's internal
+  activation remains the result of its BF16 recompute.
+- Dequantized mode retains compact quantized forward operands until backward
+  and decodes them on the backward critical path. The diagnostic below
+  characterizes one representative shape; target workloads still require
+  independent measurement, and no general performance improvement is claimed.
+- The opt-in path requires Transformer Engine's saved quantized-storage API
+  and fails explicitly when the active image does not provide it.
 - The current distributed numerical test uses TP1/EP8/ETP1, sequence parallel
   off, unfused permutation, and no shared experts. TP+EP, fused permutation,
   shared experts, activation checkpointing, optimizer steps/resume, and
@@ -301,11 +340,11 @@ the adapter's dispatcher and expert-ID reconstruction. Focused helper tests
 cover that reconstruction separately, but the numerical comparison is not an
 independent oracle for the shared packing code.
 
-The ordinary focused run passes every non-distributed case and skips only the
-eight cases that require an eight-rank launch:
+The ordinary focused run passes every non-distributed case and deselects only
+the eight cases that require an eight-rank launch:
 
 ```text
-29 passed, 8 skipped, 25 warnings in 1.47s
+43 passed, 8 deselected, 25 warnings in 2.30s
 ```
 
 The distributed matrix runs as:
@@ -318,20 +357,24 @@ python -m torch.distributed.run --standalone --nproc_per_node=8 \
 ```
 
 ```text
-8 passed, 29 deselected, 41 warnings in 26.16s
+8 passed, 43 deselected (slowest rank: 29.27s)
 ```
 
 Across the eight cases, NVFP4 forward relative L2 was at most `0.214520`
 against BF16 and MXFP8 was at most `0.070004`. The worst per-token relative L2
-values were `0.243297` and `0.083410`, respectively. Hidden-gradient relative
-L2 was at most `0.003749`; routing-logit and local-parameter gradient relative
-L2 values were `0.0` at the displayed precision. The quantization-specific
+values were `0.243297` and `0.083410`, respectively. High-precision and
+dequantized hidden-gradient relative L2 against their matching references were
+at most `0.003731` and `0.003576`; routing-logit and local-parameter relative
+L2 values were `0.0` at the displayed precision. The two backward modes shared
+the same forward within relative L2 `0.004384` and maximum difference
+`0.03125`; the nonzero A2A difference reflects nondeterministic collective or
+kernel ordering across separate launches. The quantization-specific
 global/per-token forward limits are `0.25`/`0.30` for NVFP4 and `0.10`/`0.15`
-for MXFP8. All surrogate-gradient relative L2 limits are `0.01`, with an
-additional scale-aware maximum-error check. Deterministic routing leaves EP
-rank 7 with zero received assignments in every A2A case while verifying the
-exact global assignment count and that inverse A2A restores its locally
-originated token outputs.
+for MXFP8. All matching-reference surrogate-gradient relative L2 limits are
+`0.01`, with an additional scale-aware maximum-error check. Deterministic
+routing leaves EP rank 7 with zero received assignments in every A2A case
+while verifying the exact global assignment count and that inverse A2A
+restores its locally originated token outputs.
 
 The checked-in distributed smoke runs the complete Megatron route, permutation,
 EP A2A, local FlashInfer `top_k=1`, inverse A2A, and final unpermute lifecycle:
@@ -348,6 +391,42 @@ output all-reduce were not called. Against the same A2A lifecycle with BF16
 experts, the observed MXFP8 forward relative L2 was `0.070036`; maximum hidden,
 routing-logit, and local-parameter surrogate-gradient errors were all
 `0.000000` at the displayed precision.
+
+### Dequantized-backward validation and profile
+
+The focused tests independently decode MXFP8, standard NVFP4, and NVFP4
+4-over-6 payloads with E4M3 maxima 448 and 256. They verify the canonical
+weight payloads, source-tensor nonmutation, strict environment parsing,
+no-grad cache behavior, retained-graph restoration, and two outstanding
+forwards for both quantizations. Each distributed case then runs a BF16
+reference, high-precision FlashInfer, a decoded-operand ordinary-autograd
+reference, and dequantized FlashInfer. It checks each backward against its
+matching reference and reports the expected dequantized-versus-high-precision
+gradient difference separately.
+
+The checked-in non-gating profile uses the same EP8, 32-expert, hidden-size
+7168, intermediate-size 2048, top-k 8, and 4096-token setup. It warms each mode
+and reports the maximum rank latency and allocated-memory peak over three full
+forward/backward iterations:
+
+```bash
+NCCL_MAX_NCHANNELS=1 NCCL_NVLS_ENABLE=0 \
+python -m torch.distributed.run --standalone --nproc_per_node=8 \
+    tests/manual_tests/flashinfer_moe_backward_profile.py
+```
+
+| Quantization | Dispatcher | High precision | Dequantized | Latency delta | Peak delta |
+| --- | --- | ---: | ---: | ---: | ---: |
+| NVFP4 | all-to-all | 112.896 ms | 115.838 ms | +2.61% | +239.98 MiB |
+| MXFP8 | all-to-all | 106.978 ms | 108.819 ms | +1.72% | +437.28 MiB |
+| NVFP4 | all-gather | 119.877 ms | 119.416 ms | -0.38% | +95.36 MiB |
+| MXFP8 | all-gather | 113.608 ms | 114.022 ms | +0.36% | +173.25 MiB |
+
+This is a short diagnostic sample, not a throughput claim. The peak deltas
+include the canonical low-precision weight payloads, activation payloads, and
+backward-time BF16 reconstruction. Lazy reconstruction avoids the earlier
+candidate's persistent 336 MiB BF16 weight mirror per layer/rank, but the
+retained canonical low-precision mirrors and decode work are still material.
 
 ### Quantized-weight contract
 

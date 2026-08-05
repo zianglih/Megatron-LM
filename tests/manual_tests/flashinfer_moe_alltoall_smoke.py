@@ -25,6 +25,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 os.environ["MILES_USE_FLASHINFER_MOE"] = "1"
 os.environ["MILES_FLASHINFER_MOE_QUANTIZATION"] = "mxfp8"
+os.environ["MILES_FLASHINFER_MOE_DEQUANTIZED"] = "0"
 
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed

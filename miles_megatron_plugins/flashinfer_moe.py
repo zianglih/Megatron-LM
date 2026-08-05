@@ -11,9 +11,10 @@ This module deliberately targets the rollout routed-MoE contracts for:
 
 Megatron BF16 parameters remain the checkpoint and optimizer source of truth.
 TransformerEngine quantizes expert weights to match Miles weight sync, while
-FlashInfer quantizes per-token activations and runs the fused MoE.
-Backward recomputes a BF16 expert module and is intentionally not the
-derivative of the quantized forward.
+FlashInfer quantizes per-token activations and runs the fused MoE. Backward
+recomputes a BF16 expert module from either the original BF16 operands or lazy
+dequantization of forward-derived visible quantized operands. Neither
+surrogate is the derivative of the fused quantized forward.
 """
 
 from __future__ import annotations
@@ -49,12 +50,273 @@ logger = logging.getLogger(__name__)
 
 _ENV = "MILES_USE_FLASHINFER_MOE"
 _QUANTIZATION_ENV = "MILES_FLASHINFER_MOE_QUANTIZATION"
-_LOGGED_LAYERS: set[tuple[str, str, int]] = set()
+_DEQUANTIZED_ENV = "MILES_FLASHINFER_MOE_DEQUANTIZED"
+HIGH_PRECISION_BACKWARD = "high_precision"
+DEQUANTIZED_BACKWARD = "dequantized"
+_LOGGED_LAYERS: set[tuple[str, str, str, int]] = set()
+_VALIDATED_DEQUANTIZED_SUPPORT: set[str] = set()
 _NVFP4_GROUP_SIZE = 16
 _TE_NVFP4_ROW_ALIGNMENT = 16
 _MXFP8_GROUP_SIZE = 32
 _TE_MXFP8_ROW_ALIGNMENT = 32
 _SUPPORTED_QUANTIZATIONS = ("nvfp4", "mxfp8")
+
+
+def flashinfer_moe_backward_mode() -> str:
+    """Resolve the explicit surrogate-backward operand mode."""
+
+    value = os.environ.get(_DEQUANTIZED_ENV, "").strip()
+    if value in ("", "0"):
+        return HIGH_PRECISION_BACKWARD
+    elif value == "1":
+        return DEQUANTIZED_BACKWARD
+    else:
+        raise ValueError(
+            f"Unsupported {_DEQUANTIZED_ENV}={value!r}; expected '0' or '1'"
+        )
+
+
+def _require_dequantized_backward_support(quantization: str) -> None:
+    """Fail early when the image's TE lacks the saved-storage contract."""
+
+    if quantization in _VALIDATED_DEQUANTIZED_SUPPORT:
+        return
+    try:
+        from transformer_engine.pytorch.quantized_tensor import (
+            prepare_for_saving,
+            restore_from_saved,
+        )
+
+        if quantization == "nvfp4":
+            from transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage import (
+                NVFP4TensorStorage,
+            )
+
+            del NVFP4TensorStorage
+        elif quantization == "mxfp8":
+            from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import (
+                MXFP8TensorStorage,
+            )
+
+            del MXFP8TensorStorage
+        else:
+            raise NotImplementedError(
+                f"FlashInfer MoE quantization {quantization!r} has no "
+                "dequantized-backward capability branch"
+            )
+        del prepare_for_saving, restore_from_saved
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            f"{_DEQUANTIZED_ENV}=1 with {quantization} requires Transformer "
+            "Engine saved quantized-storage support"
+        ) from exc
+    _VALIDATED_DEQUANTIZED_SUPPORT.add(quantization)
+
+
+def _padded_linear_scales(
+    scales: torch.Tensor,
+    *,
+    rows: int,
+    scale_columns: int,
+) -> torch.Tensor:
+    """Adapt compact FlashInfer scales to TE's row-padded linear layout."""
+
+    if scales.numel() != rows * scale_columns:
+        raise ValueError(
+            "FlashInfer MoE scale payload has the wrong size: "
+            f"got {scales.numel()}, expected {rows * scale_columns}"
+        )
+    padded_rows = ((rows + 127) // 128) * 128
+    padded_columns = ((scale_columns + 3) // 4) * 4
+    padded = torch.empty(
+        (padded_rows, padded_columns),
+        device=scales.device,
+        dtype=torch.uint8,
+    )
+    padded[:rows, :scale_columns].copy_(
+        scales.view(torch.uint8).reshape(rows, scale_columns)
+    )
+    return padded
+
+
+def _mxfp8_activation_storage(
+    data: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+):
+    """Wrap the exact FlashInfer rowwise MXFP8 payload for deferred decode."""
+
+    from transformer_engine.pytorch.constants import DType
+    from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import (
+        MXFP8TensorStorage,
+    )
+
+    if data.ndim != 2 or data.shape[1] % _MXFP8_GROUP_SIZE:
+        raise ValueError(
+            "FlashInfer MXFP8 activation must be [M, K] with K divisible by 32, "
+            f"got {tuple(data.shape)}"
+        )
+    rows, columns = data.shape
+    if rows == 0:
+        raise ValueError("FlashInfer MXFP8 storage requires at least one row")
+    linear_scales = _padded_linear_scales(
+        scales,
+        rows=rows,
+        scale_columns=columns // _MXFP8_GROUP_SIZE,
+    )
+    return MXFP8TensorStorage(
+        data.view(torch.uint8),
+        linear_scales,
+        None,
+        None,
+        DType.kFloat8E4M3,
+        None,
+        False,
+        fake_dtype=dtype,
+    )
+
+
+def dequantize_mxfp8_activation(
+    data: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """GPU-dequantize the exact rowwise MXFP8 activation used by FlashInfer."""
+
+    if data.shape[0] == 0:
+        return torch.empty_like(data, dtype=dtype)
+    return _mxfp8_activation_storage(data, scales, dtype=dtype).dequantize(
+        dtype=dtype
+    )
+
+
+def _nvfp4_activation_storage(
+    data: torch.Tensor,
+    scales: torch.Tensor,
+    per_token_scale: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    e4m3_max: int,
+    use_4over6: bool,
+):
+    """Wrap exact NVFP4 q/block scales with equivalent TE row metadata."""
+
+    from transformer_engine.pytorch.constants import DType
+    from transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage import (
+        NVFP4TensorStorage,
+    )
+
+    if data.ndim != 2:
+        raise ValueError(
+            f"FlashInfer NVFP4 activation must be [M, K/2], got {tuple(data.shape)}"
+        )
+    rows, packed_columns = data.shape
+    columns = packed_columns * 2
+    if columns % _NVFP4_GROUP_SIZE:
+        raise ValueError(
+            f"FlashInfer NVFP4 activation K={columns} must be divisible by 16"
+        )
+    if per_token_scale.numel() != rows:
+        raise ValueError(
+            "FlashInfer NVFP4 per-token scale count mismatch: "
+            f"got {per_token_scale.numel()}, expected {rows}"
+        )
+    if rows == 0:
+        raise ValueError("FlashInfer NVFP4 storage requires at least one row")
+    linear_scales = _padded_linear_scales(
+        scales,
+        rows=rows,
+        scale_columns=columns // _NVFP4_GROUP_SIZE,
+    )
+    # TE derives the row decode scale as amax / (E4M3_MAX * E2M1_MAX).
+    # FlashInfer returns that decode scale directly, so reconstruct the amax.
+    row_amax = per_token_scale.to(torch.float32).reshape(rows) * float(
+        e4m3_max * 6
+    )
+    return NVFP4TensorStorage(
+        data.view(torch.uint8),
+        linear_scales,
+        None,
+        None,
+        row_amax,
+        None,
+        DType.kFloat4E2M1,
+        None,
+        False,
+        fake_dtype=dtype,
+        row_scaled_nvfp4=True,
+        nvfp4_use_4over6=use_4over6,
+        nvfp4_e4m3_max=e4m3_max,
+    )
+
+
+def dequantize_nvfp4_activation(
+    data: torch.Tensor,
+    scales: torch.Tensor,
+    per_token_scale: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    e4m3_max: int,
+    use_4over6: bool,
+) -> torch.Tensor:
+    """Decode FlashInfer NVFP4 q data through equivalent TE row metadata."""
+
+    if data.shape[0] == 0:
+        return torch.empty(
+            (0, data.shape[1] * 2), device=data.device, dtype=dtype
+        )
+    return _nvfp4_activation_storage(
+        data,
+        scales,
+        per_token_scale,
+        dtype=dtype,
+        e4m3_max=e4m3_max,
+        use_4over6=use_4over6,
+    ).dequantize(dtype=dtype)
+
+
+def _dequantize_weight_payloads(
+    payloads: tuple[object, ...],
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Materialize exact forward-QDQ expert weights only when backward starts."""
+
+    if len(payloads) != shape[0]:
+        raise ValueError(
+            "FlashInfer MoE saved weight payload count mismatch: "
+            f"got {len(payloads)}, expected {shape[0]}"
+        )
+    if not payloads:
+        raise ValueError("FlashInfer MoE requires at least one local expert")
+    device = payloads[0]._rowwise_data.device
+    result = torch.empty(shape, device=device, dtype=dtype)
+    for expert, payload in enumerate(payloads):
+        destination = result[expert]
+        decoded = payload.dequantize(dtype=dtype)
+        if len(decoded.shape) != len(destination.shape) or any(
+            decoded_size < output_size
+            for decoded_size, output_size in zip(decoded.shape, destination.shape)
+        ):
+            raise ValueError(
+                "Decoded FlashInfer MoE weight is smaller than its master shape: "
+                f"got {tuple(decoded.shape)}, expected at least {tuple(destination.shape)}"
+            )
+        destination.copy_(
+            decoded[tuple(slice(0, size) for size in destination.shape)]
+        )
+    return result
+
+
+def _quantized_storage_shell(storage):
+    """Clone TE storage metadata without copying or consuming its payloads."""
+
+    shell = object.__new__(type(storage))
+    shell.__dict__.update(storage.__dict__)
+    return shell
 
 
 def use_flashinfer_moe() -> bool:
@@ -683,6 +945,8 @@ class _PreparedWeights:
     output1_scale: torch.Tensor
     output1_gate_scale: torch.Tensor
     output2_scale: torch.Tensor
+    backward_w13: Optional[tuple[object, ...]] = None
+    backward_w2: Optional[tuple[object, ...]] = None
 
 
 def _te_nvfp4_weight_e4m3_max() -> int:
@@ -722,7 +986,9 @@ def _te_nvfp4_global_decode_scale(
 
 def _te_nvfp4_quantize_weight(
     weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    return_quantized: bool = False,
+):
     """Quantize one expert matrix with Miles' TE weight-sync contract."""
 
     from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
@@ -767,34 +1033,50 @@ def _te_nvfp4_quantize_weight(
         nvfp4_4over6_err_mode=err_mode,
         with_random_sign_mask=False,
     )
+    # This quantization is an implementation detail of the custom autograd
+    # boundary. Ask TE for lightweight storage directly instead of a Tensor
+    # subclass whose autograd wrapper owns zero-sized base storage.
+    quantizer.internal = True
     quantized = quantizer.quantize(weight)
     qweight = quantized._rowwise_data[:num_rows, : num_cols // 2].contiguous()
     block_scale = quantized._rowwise_scale_inv[
         :num_rows, : num_cols // _NVFP4_GROUP_SIZE
     ].contiguous()
     global_amax = quantized._amax_rowwise.reshape(-1)[0]
-    return (
+    result = (
         qweight,
         block_scale.view(torch.float8_e4m3fn),
         _te_nvfp4_global_decode_scale(global_amax, e4m3_max),
     )
+    if return_quantized:
+        return (*result, quantized)
+    return result
 
 
 def _te_nvfp4_quantize_gated_weight(
     gate_up_weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    return_quantized: bool = False,
+):
     """Quantize shared-scale gate/up rows, then adapt to FlashInfer order."""
 
-    qweight, block_scale, global_scale = _te_nvfp4_quantize_weight(
-        gate_up_weight
+    result = _te_nvfp4_quantize_weight(
+        gate_up_weight, return_quantized=return_quantized
     )
+    if return_quantized:
+        qweight, block_scale, global_scale, quantized = result
+    else:
+        qweight, block_scale, global_scale = result
     gate_qweight, up_qweight = qweight.chunk(2, dim=0)
     gate_block_scale, up_block_scale = block_scale.chunk(2, dim=0)
-    return (
+    reordered = (
         torch.cat((up_qweight, gate_qweight), dim=0),
         torch.cat((up_block_scale, gate_block_scale), dim=0),
         global_scale,
     )
+    if return_quantized:
+        return (*reordered, quantized)
+    return reordered
 
 
 @dataclass
@@ -803,11 +1085,23 @@ class _PreparedMXFP8Weights:
     gemm1_scales: torch.Tensor
     gemm2_weights: torch.Tensor
     gemm2_scales: torch.Tensor
+    backward_w13: Optional[tuple[object, ...]] = None
+    backward_w2: Optional[tuple[object, ...]] = None
+
+
+@dataclass
+class _FlashInferForwardResult:
+    output: torch.Tensor
+    backward_hidden_states: Optional[object]
+    backward_w13: Optional[tuple[object, ...]]
+    backward_w2: Optional[tuple[object, ...]]
 
 
 def _te_mxfp8_quantize_weight(
     weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    return_quantized: bool = False,
+):
     """Quantize one expert matrix with Miles' rowwise MXFP8 contract."""
 
     from transformer_engine.pytorch import MXFP8Quantizer
@@ -840,27 +1134,42 @@ def _te_mxfp8_quantize_weight(
         rowwise=True,
         columnwise=False,
     )
+    quantizer.internal = True
     quantized = quantizer.quantize(weight)
     qweight = quantized._rowwise_data[:num_rows, :num_cols]
     qweight = qweight.contiguous().view(torch.float8_e4m3fn)
     scale = quantized._rowwise_scale_inv[
         :num_rows, : num_cols // _MXFP8_GROUP_SIZE
     ].contiguous()
-    return qweight, scale.view(torch.uint8)
+    result = (qweight, scale.view(torch.uint8))
+    if return_quantized:
+        return (*result, quantized)
+    return result
 
 
 def _te_mxfp8_quantize_gated_weight(
     gate_up_weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    return_quantized: bool = False,
+):
     """Quantize Megatron [gate, up] rows and adapt them to TRT-LLM [up, gate]."""
 
-    qweight, scale = _te_mxfp8_quantize_weight(gate_up_weight)
+    result = _te_mxfp8_quantize_weight(
+        gate_up_weight, return_quantized=return_quantized
+    )
+    if return_quantized:
+        qweight, scale, quantized = result
+    else:
+        qweight, scale = result
     gate_qweight, up_qweight = qweight.chunk(2, dim=0)
     gate_scale, up_scale = scale.chunk(2, dim=0)
-    return (
+    reordered = (
         torch.cat((up_qweight, gate_qweight), dim=0),
         torch.cat((up_scale, gate_scale), dim=0),
     )
+    if return_quantized:
+        return (*reordered, quantized)
+    return reordered
 
 
 class _FlashInferRunnerBase:
@@ -881,6 +1190,7 @@ class _FlashInferRunnerBase:
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self._weight_key: Optional[tuple[int, ...]] = None
+        self._prepared_backward_mode: Optional[str] = None
         self._prepared: Optional[object] = None
         self._permute_cache: dict = {}
 
@@ -888,6 +1198,7 @@ class _FlashInferRunnerBase:
         """Drop the forward mirror before the next optimizer-updated iteration."""
 
         self._weight_key = None
+        self._prepared_backward_mode = None
         self._prepared = None
 
 
@@ -906,9 +1217,19 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
         )
 
     def _prepare_weights(
-        self, w13_gate_up: torch.Tensor, w2: torch.Tensor, weight_key: tuple[int, ...]
+        self,
+        w13_gate_up: torch.Tensor,
+        w2: torch.Tensor,
+        weight_key: tuple[int, ...],
+        backward_mode: str = HIGH_PRECISION_BACKWARD,
     ) -> _PreparedWeights:
-        if self._prepared is not None and self._weight_key == weight_key:
+        if backward_mode not in (HIGH_PRECISION_BACKWARD, DEQUANTIZED_BACKWARD):
+            raise ValueError(f"Unsupported FlashInfer MoE backward mode {backward_mode!r}")
+        if (
+            self._prepared is not None
+            and self._weight_key == weight_key
+            and self._prepared_backward_mode == backward_mode
+        ):
             return self._prepared
 
         from flashinfer import nvfp4_block_scale_interleave
@@ -923,15 +1244,28 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
         gemm2_scales = []
         output1_scales = []
         output2_scales = []
+        dequantized_backward = backward_mode == DEQUANTIZED_BACKWARD
+        backward_w13 = [] if dequantized_backward else None
+        backward_w2 = [] if dequantized_backward else None
         epilogue_tile_m = 128
 
         for expert in range(self.local_num_experts):
             # Quantize Megatron's shared-scale [gate, up] matrix before adapting
             # its emitted rows to the TRT-LLM gated kernel's [up, gate] order.
-            w13_q, w13_sf, w13_decode = _te_nvfp4_quantize_gated_weight(
-                w13_gate_up[expert]
+            w13_result = _te_nvfp4_quantize_gated_weight(
+                w13_gate_up[expert], return_quantized=dequantized_backward
             )
-            w2_q, w2_sf, w2_decode = _te_nvfp4_quantize_weight(w2[expert])
+            w2_result = _te_nvfp4_quantize_weight(
+                w2[expert], return_quantized=dequantized_backward
+            )
+            if dequantized_backward:
+                w13_q, w13_sf, w13_decode, w13_quantized = w13_result
+                w2_q, w2_sf, w2_decode, w2_quantized = w2_result
+                backward_w13.append(w13_quantized)
+                backward_w2.append(w2_quantized)
+            else:
+                w13_q, w13_sf, w13_decode = w13_result
+                w2_q, w2_sf, w2_decode = w2_result
             w13_q = w13_q.reshape(
                 2 * self.intermediate_size, self.hidden_size // 2
             ).view(torch.uint8)
@@ -1004,8 +1338,11 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
             output1_scale=output1_scale,
             output1_gate_scale=output1_scale.clone(),
             output2_scale=torch.stack(output2_scales).to(torch.float32),
+            backward_w13=tuple(backward_w13) if backward_w13 is not None else None,
+            backward_w2=tuple(backward_w2) if backward_w2 is not None else None,
         )
         self._weight_key = weight_key
+        self._prepared_backward_mode = backward_mode
         self._prepared = prepared
         if os.environ.get("MILES_FLASHINFER_MOE_DEBUG") == "1":
             logger.warning(
@@ -1023,12 +1360,15 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
         w13_gate_up: torch.Tensor,
         w2: torch.Tensor,
         weight_key: tuple[int, ...],
-    ) -> torch.Tensor:
+        backward_mode: str,
+    ) -> _FlashInferForwardResult:
         from flashinfer import ActivationType, SfLayout, nvfp4_quantize
         from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
         from flashinfer.utils import device_support_pdl
 
-        prepared = self._prepare_weights(w13_gate_up, w2, weight_key)
+        prepared = self._prepare_weights(
+            w13_gate_up, w2, weight_key, backward_mode
+        )
         input_global_scale = torch.full(
             (1,),
             1.0 / (self._e4m3_max() * 6.0),
@@ -1049,7 +1389,7 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
         packed_topk = _pack_topk_ids(topk_ids, topk_weights)
         tune_max_tokens = 1 << max(hidden_states.shape[0] - 1, 0).bit_length()
 
-        return trtllm_fp4_block_scale_routed_moe(
+        output = trtllm_fp4_block_scale_routed_moe(
             topk_ids=packed_topk,
             routing_bias=None,
             hidden_states=hidden_fp4,
@@ -1082,6 +1422,22 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
             enable_pdl=hidden_states.shape[0] <= 8192
             and device_support_pdl(hidden_states.device),
         )[0]
+        backward_hidden_states = None
+        if backward_mode == DEQUANTIZED_BACKWARD:
+            backward_hidden_states = _nvfp4_activation_storage(
+                hidden_fp4,
+                hidden_scales,
+                per_token_scale,
+                dtype=hidden_states.dtype,
+                e4m3_max=int(self._e4m3_max()),
+                use_4over6=os.environ.get("FLASHINFER_NVFP4_4OVER6") == "1",
+            )
+        return _FlashInferForwardResult(
+            output=output,
+            backward_hidden_states=backward_hidden_states,
+            backward_w13=prepared.backward_w13,
+            backward_w2=prepared.backward_w2,
+        )
 
 
 class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
@@ -1090,9 +1446,19 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
     quantization = "mxfp8"
 
     def _prepare_weights(
-        self, w13_gate_up: torch.Tensor, w2: torch.Tensor, weight_key: tuple[int, ...]
+        self,
+        w13_gate_up: torch.Tensor,
+        w2: torch.Tensor,
+        weight_key: tuple[int, ...],
+        backward_mode: str = HIGH_PRECISION_BACKWARD,
     ) -> _PreparedMXFP8Weights:
-        if self._prepared is not None and self._weight_key == weight_key:
+        if backward_mode not in (HIGH_PRECISION_BACKWARD, DEQUANTIZED_BACKWARD):
+            raise ValueError(f"Unsupported FlashInfer MoE backward mode {backward_mode!r}")
+        if (
+            self._prepared is not None
+            and self._weight_key == weight_key
+            and self._prepared_backward_mode == backward_mode
+        ):
             return self._prepared
 
         from flashinfer import block_scale_interleave
@@ -1108,15 +1474,28 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
         gemm1_scales = []
         gemm2_weights = []
         gemm2_scales = []
+        dequantized_backward = backward_mode == DEQUANTIZED_BACKWARD
+        backward_w13 = [] if dequantized_backward else None
+        backward_w2 = [] if dequantized_backward else None
         epilogue_tile_m = 128
 
         for expert in range(self.local_num_experts):
             # Miles owns Megatron [gate, up] masters. FlashInfer consumes W3/W1
             # [up, gate] before its gated-row interleave and row shuffle.
-            w13_q, w13_sf = _te_mxfp8_quantize_gated_weight(
-                w13_gate_up[expert]
+            w13_result = _te_mxfp8_quantize_gated_weight(
+                w13_gate_up[expert], return_quantized=dequantized_backward
             )
-            w2_q, w2_sf = _te_mxfp8_quantize_weight(w2[expert])
+            w2_result = _te_mxfp8_quantize_weight(
+                w2[expert], return_quantized=dequantized_backward
+            )
+            if dequantized_backward:
+                w13_q, w13_sf, w13_quantized = w13_result
+                w2_q, w2_sf, w2_quantized = w2_result
+                backward_w13.append(w13_quantized)
+                backward_w2.append(w2_quantized)
+            else:
+                w13_q, w13_sf = w13_result
+                w2_q, w2_sf = w2_result
             w13_u8 = w13_q.reshape(
                 2 * self.intermediate_size, self.hidden_size
             ).view(torch.uint8)
@@ -1190,8 +1569,11 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
             gemm1_scales=torch.stack(gemm1_scales).view(torch.uint8),
             gemm2_weights=torch.stack(gemm2_weights).view(torch.float8_e4m3fn),
             gemm2_scales=torch.stack(gemm2_scales).view(torch.uint8),
+            backward_w13=tuple(backward_w13) if backward_w13 is not None else None,
+            backward_w2=tuple(backward_w2) if backward_w2 is not None else None,
         )
         self._weight_key = weight_key
+        self._prepared_backward_mode = backward_mode
         self._prepared = prepared
         if os.environ.get("MILES_FLASHINFER_MOE_DEBUG") == "1":
             logger.warning(
@@ -1209,7 +1591,8 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
         w13_gate_up: torch.Tensor,
         w2: torch.Tensor,
         weight_key: tuple[int, ...],
-    ) -> torch.Tensor:
+        backward_mode: str,
+    ) -> _FlashInferForwardResult:
         from flashinfer import ActivationType, RoutingMethodType, mxfp8_quantize
         from flashinfer.fused_moe import (
             Fp8QuantizationType,
@@ -1218,7 +1601,9 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
         from flashinfer.tllm_enums import WeightLayout
         from flashinfer.utils import device_support_pdl
 
-        prepared = self._prepare_weights(w13_gate_up, w2, weight_key)
+        prepared = self._prepare_weights(
+            w13_gate_up, w2, weight_key, backward_mode
+        )
         hidden_q, hidden_sf = mxfp8_quantize(
             hidden_states.contiguous(), False, backend="cute-dsl"
         )
@@ -1254,7 +1639,20 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
             fp8_quantization_type=Fp8QuantizationType.MxFp8,
             activation_type=ActivationType.Swiglu.value,
         )
-        return output[0] if isinstance(output, list) else output
+        output = output[0] if isinstance(output, list) else output
+        backward_hidden_states = None
+        if backward_mode == DEQUANTIZED_BACKWARD:
+            backward_hidden_states = _mxfp8_activation_storage(
+                hidden_q,
+                hidden_sf,
+                dtype=hidden_states.dtype,
+            )
+        return _FlashInferForwardResult(
+            output=output,
+            backward_hidden_states=backward_hidden_states,
+            backward_w13=prepared.backward_w13,
+            backward_w2=prepared.backward_w2,
+        )
 
 
 def _flashinfer_moe_runner_type(quantization: str):
@@ -1322,7 +1720,7 @@ def _flashinfer_moe_description(quantization: str) -> str:
 
 
 class _FlashInferForwardBF16Backward(torch.autograd.Function):
-    """Exact FlashInfer forward and module-level BF16 surrogate backward."""
+    """Exact FlashInfer forward with selectable BF16 surrogate operands."""
 
     @staticmethod
     def forward(
@@ -1334,22 +1732,118 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
         w2,
         runner,
         weight_key,
+        backward_mode,
     ):
         ctx.runner = runner
-        ctx.save_for_backward(hidden_states, topk_weights, topk_ids, w13_gate_up, w2)
+        ctx.saved_quantized_operands = False
         if hidden_states.shape[0] == 0:
             # FlashInfer's routed launchers do not accept M=0. Keep this rank in
             # the custom-autograd graph so backward still emits explicit zero
             # gradients for inputs and locally owned expert weights.
+            ctx.save_for_backward(
+                hidden_states, topk_weights, topk_ids, w13_gate_up, w2
+            )
             return torch.empty_like(hidden_states)
-        return runner.forward(
-            hidden_states, topk_weights, topk_ids, w13_gate_up, w2, weight_key
+        result = runner.forward(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            w13_gate_up,
+            w2,
+            weight_key,
+            backward_mode,
         )
+        if backward_mode == HIGH_PRECISION_BACKWARD:
+            ctx.save_for_backward(
+                hidden_states, topk_weights, topk_ids, w13_gate_up, w2
+            )
+        elif backward_mode == DEQUANTIZED_BACKWARD:
+            backward_hidden_states = result.backward_hidden_states
+            backward_w13 = result.backward_w13
+            backward_w2 = result.backward_w2
+            if any(
+                tensor is None
+                for tensor in (backward_hidden_states, backward_w13, backward_w2)
+            ):
+                raise RuntimeError(
+                    "FlashInfer MoE dequantized backward is missing a forward operand"
+                )
+            from transformer_engine.pytorch.quantized_tensor import (
+                prepare_for_saving,
+            )
+
+            ctx.backward_dtype = hidden_states.dtype
+            ctx.backward_w13_shape = tuple(w13_gate_up.shape)
+            ctx.backward_w2_shape = tuple(w2.shape)
+            quantized_operands = (
+                _quantized_storage_shell(backward_hidden_states),
+                topk_weights,
+                topk_ids,
+                *(_quantized_storage_shell(payload) for payload in backward_w13),
+                *(_quantized_storage_shell(payload) for payload in backward_w2),
+            )
+            tensors_to_save, tensor_objects = prepare_for_saving(
+                *quantized_operands
+            )
+            ctx.save_for_backward(*tensors_to_save)
+            ctx.tensor_objects = tensor_objects
+            ctx.saved_quantized_operands = True
+        else:
+            raise ValueError(
+                f"Unsupported FlashInfer MoE backward mode {backward_mode!r}"
+            )
+        return result.output
 
     @staticmethod
     def backward(ctx, grad_output):
-        hidden_states, topk_weights, topk_ids, w13_gate_up, w2 = ctx.saved_tensors
+        if ctx.saved_quantized_operands:
+            from transformer_engine.pytorch.quantized_tensor import restore_from_saved
+
+            # Restore into per-backward metadata clones. The context retains
+            # payload-free shells for retain_graph=True, while the actual q
+            # tensors remain owned only by ctx.saved_tensors and can be freed
+            # by autograd after an ordinary backward.
+            tensor_objects = [
+                None
+                if tensor_object is None
+                else _quantized_storage_shell(tensor_object)
+                for tensor_object in ctx.tensor_objects
+            ]
+            restored = restore_from_saved(tensor_objects, ctx.saved_tensors)
+            hidden_storage, topk_weights, topk_ids = restored[:3]
+            split = 3 + ctx.backward_w13_shape[0]
+            w13_payloads = tuple(restored[3:split])
+            w2_payloads = tuple(restored[split:])
+            hidden_states = hidden_storage.dequantize(dtype=ctx.backward_dtype)
+            w13_gate_up = _dequantize_weight_payloads(
+                w13_payloads,
+                ctx.backward_w13_shape,
+                dtype=ctx.backward_dtype,
+            )
+            w2 = _dequantize_weight_payloads(
+                w2_payloads,
+                ctx.backward_w2_shape,
+                dtype=ctx.backward_dtype,
+            )
+        else:
+            hidden_states, topk_weights, topk_ids, w13_gate_up, w2 = (
+                ctx.saved_tensors
+            )
         needs = ctx.needs_input_grad
+        if hidden_states.shape[0] == 0:
+            # Avoid launching a full BF16 expert recompute just to manufacture
+            # explicit zeros on an EP rank with no dispatched assignments.
+            ctx.runner.invalidate_weights()
+            return (
+                torch.zeros_like(hidden_states) if needs[0] else None,
+                torch.zeros_like(topk_weights) if needs[1] else None,
+                None,
+                torch.zeros_like(w13_gate_up) if needs[3] else None,
+                torch.zeros_like(w2) if needs[4] else None,
+                None,
+                None,
+                None,
+            )
 
         with torch.enable_grad():
             hidden_ref = hidden_states.detach().requires_grad_(needs[0])
@@ -1384,7 +1878,52 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
         # owning Parameter's version counter. Invalidate after every training
         # backward so the next forward cannot reuse pre-update quantized weights.
         ctx.runner.invalidate_weights()
-        return grads[0], grads[1], None, grads[2], grads[3], None, None
+        return grads[0], grads[1], None, grads[2], grads[3], None, None, None
+
+
+def _run_flashinfer_forward_with_surrogate(
+    hidden_states,
+    topk_weights,
+    topk_ids,
+    w13_gate_up,
+    w2,
+    runner,
+    weight_key,
+    backward_mode,
+):
+    """Attach custom autograd only when this invocation can require backward."""
+
+    needs_backward = torch.is_grad_enabled() and any(
+        tensor.requires_grad
+        for tensor in (hidden_states, topk_weights, w13_gate_up, w2)
+    )
+    if needs_backward:
+        return _FlashInferForwardBF16Backward.apply(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            w13_gate_up,
+            w2,
+            runner,
+            weight_key,
+            backward_mode,
+        )
+
+    if hidden_states.shape[0] == 0:
+        return torch.empty_like(hidden_states)
+
+    # The output is independent of the backward operand mode. Avoid retaining
+    # an additional canonical low-precision payload cache when no backward can
+    # consume it; the ordinary FlashInfer mirror remains reusable for inference.
+    return runner.forward(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w13_gate_up,
+        w2,
+        weight_key,
+        HIGH_PRECISION_BACKWARD,
+    ).output
 
 
 def _get_flashinfer_runner(owner, experts, quantization: str):
@@ -1434,7 +1973,8 @@ def _run_dispatched_flashinfer_moe(
         )
 
     w13_gate_up, w2 = _grouped_mlp_weights(experts)
-    output = _FlashInferForwardBF16Backward.apply(
+    backward_mode = flashinfer_moe_backward_mode()
+    output = _run_flashinfer_forward_with_surrogate(
         hidden_states,
         topk_weights,
         topk_ids,
@@ -1442,6 +1982,7 @@ def _run_dispatched_flashinfer_moe(
         w2,
         runner,
         _source_weight_key(experts),
+        backward_mode,
     )
     if output.shape != hidden_states.shape:
         raise RuntimeError(
@@ -1449,15 +1990,19 @@ def _run_dispatched_flashinfer_moe(
             f"{tuple(output.shape)} != {tuple(hidden_states.shape)}"
         )
 
-    log_key = (quantization, dispatch_mode, -1)
+    log_key = (quantization, dispatch_mode, backward_mode, -1)
     if log_key not in _LOGGED_LAYERS:
         log_single_rank(
             logger,
             logging.WARNING,
             "FlashInfer MoE path active: Megatron all-to-all dispatch, routed TRT-LLM "
-            "top-k=1 local assignments, %s, BF16 surrogate backward (%s=1)",
+            "top-k=1 local assignments, %s, %s BF16 surrogate backward "
+            "(%s=1, %s=%d)",
             _flashinfer_moe_description(quantization),
+            backward_mode,
             _ENV,
+            _DEQUANTIZED_ENV,
+            int(backward_mode == DEQUANTIZED_BACKWARD),
         )
         _LOGGED_LAYERS.add(log_key)
 
@@ -1476,6 +2021,9 @@ def validate_flashinfer_moe_layer(
     experts = moe_layer.experts
     dispatch_mode = flashinfer_moe_dispatch_mode(config)
     quantization = _flashinfer_moe_quantization(config)
+    backward_mode = flashinfer_moe_backward_mode()
+    if backward_mode == DEQUANTIZED_BACKWARD:
+        _require_dequantized_backward_support(quantization)
     if not isinstance(experts, FlashInferGroupedMLP):
         raise TypeError(
             f"{_ENV}=1 requires FlashInferGroupedMLP BF16 parameters, got {type(experts)}"
@@ -1564,7 +2112,7 @@ def run_flashinfer_moe(
     padding_mask: Optional[torch.Tensor],
     input_ids: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, None]:
-    """Run the exact routed FlashInfer forward and attach the BF16 surrogate backward."""
+    """Run the exact FlashInfer forward and attach the selected BF16 surrogate."""
 
     dispatch_mode = flashinfer_moe_dispatch_mode(moe_layer.config)
     quantization = validate_flashinfer_moe_layer(
@@ -1578,6 +2126,7 @@ def run_flashinfer_moe(
         raise AssertionError(f"Unreachable FlashInfer MoE dispatch mode: {dispatch_mode!r}")
 
     description = _flashinfer_moe_description(quantization)
+    backward_mode = flashinfer_moe_backward_mode()
     runner = _get_flashinfer_runner(moe_layer, moe_layer.experts, quantization)
 
     shared_expert_output = moe_layer.shared_experts_compute(hidden_states)
@@ -1624,7 +2173,7 @@ def run_flashinfer_moe(
         global_topk_ids = topk_ids
 
     w13_gate_up, w2 = _grouped_mlp_weights(moe_layer.experts)
-    global_output = _FlashInferForwardBF16Backward.apply(
+    global_output = _run_flashinfer_forward_with_surrogate(
         global_hidden,
         global_topk_weights,
         global_topk_ids,
@@ -1632,6 +2181,7 @@ def run_flashinfer_moe(
         w2,
         runner,
         _source_weight_key(moe_layer.experts),
+        backward_mode,
     )
     if ep_size > 1:
         global_output = _EPAllReduceSum.apply(global_output, ep_group)
@@ -1645,16 +2195,19 @@ def run_flashinfer_moe(
         routed_output = routed_output + shared_expert_output
 
     layer_number = moe_layer.layer_number or -1
-    log_key = (quantization, dispatch_mode, layer_number)
+    log_key = (quantization, dispatch_mode, backward_mode, layer_number)
     if log_key not in _LOGGED_LAYERS:
         log_single_rank(
             logger,
             logging.WARNING,
             "Layer %d FlashInfer MoE path active: routed TRT-LLM, %s, "
-            "BF16 surrogate backward (%s=1)",
+            "%s BF16 surrogate backward (%s=1, %s=%d)",
             layer_number,
             description,
+            backward_mode,
             _ENV,
+            _DEQUANTIZED_ENV,
+            int(backward_mode == DEQUANTIZED_BACKWARD),
         )
         _LOGGED_LAYERS.add(log_key)
 
