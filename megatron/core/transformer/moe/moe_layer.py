@@ -28,7 +28,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
-from miles_megatron_plugins.flashinfer_moe import maybe_replace_flashinfer_moe_expert_spec
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -146,6 +145,8 @@ class MoELayer(BaseMoELayer):
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+        from miles_megatron_plugins.flashinfer_moe import maybe_replace_flashinfer_moe_expert_spec
+
         submodules = maybe_replace_flashinfer_moe_expert_spec(submodules)
         self.submodules = submodules
         # TODO(Hepteract): delete the usage of the global parallel_state.

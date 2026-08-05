@@ -12,7 +12,6 @@ import types
 import torch
 import torch.nn.functional as F
 
-
 os.environ["MILES_USE_FLASHINFER_MOE"] = "1"
 
 from megatron.core import parallel_state
@@ -21,8 +20,6 @@ from megatron.core.transformer.moe.experts import GroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from miles_megatron_plugins import flashinfer_moe  # noqa: F401
-
 
 NUM_EXPERTS = 32
 HIDDEN_SIZE = 7168

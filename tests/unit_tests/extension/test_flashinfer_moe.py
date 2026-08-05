@@ -20,6 +20,7 @@ from miles_megatron_plugins.flashinfer_moe import (
     DEQUANTIZED_BACKWARD,
     HIGH_PRECISION_BACKWARD,
     FlashInferGroupedMLP,
+    _BF16GroupedMLPSurrogate,
     _dispatched_topk_inputs,
     _flashinfer_moe_description,
     _flashinfer_moe_quantization,
@@ -42,7 +43,6 @@ from miles_megatron_plugins.flashinfer_moe import (
     maybe_replace_flashinfer_moe_expert_spec,
     use_flashinfer_moe,
 )
-from miles_megatron_plugins.flashinfer_moe_surrogate import _BF16GroupedMLPSurrogate
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -201,20 +201,67 @@ def test_flashinfer_moe_selects_extension_experts_without_mutating_source(monkey
     assert original.experts.submodules is None
 
 
+def test_flashinfer_moe_rejects_non_grouped_expert_submodules(monkeypatch):
+    class OtherExperts:
+        pass
+
+    class DenseLinear:
+        pass
+
+    original = SimpleNamespace(
+        experts=ModuleSpec(
+            module=OtherExperts,
+            submodules=SimpleNamespace(linear_fc1=DenseLinear, linear_fc2=DenseLinear),
+        )
+    )
+    monkeypatch.setenv("MILES_USE_FLASHINFER_MOE", "1")
+
+    with pytest.raises(ValueError, match="Transformer Engine grouped FC1/FC2"):
+        maybe_replace_flashinfer_moe_expert_spec(original)
+
+
 def test_flashinfer_experts_reuse_megatron_te_parameter_contract():
     assert issubclass(FlashInferGroupedMLP, TEGroupedMLP)
 
 
 @pytest.mark.parametrize(
-    "attribute,message",
+    "updates,exception,message",
     [
-        pytest.param("delay_wgrad_compute", "delayed expert weight gradients", id="delayed-wgrad"),
         pytest.param(
-            "use_te_activation_func", "Transformer Engine activation modules", id="te-activation"
+            {"delay_wgrad_compute": True},
+            ValueError,
+            "delayed expert weight gradients",
+            id="delayed-wgrad",
+        ),
+        pytest.param(
+            {"use_te_activation_func": True},
+            ValueError,
+            "Transformer Engine activation modules",
+            id="te-activation",
+        ),
+        pytest.param(
+            {"fine_grained_activation_offloading": True, "offload_modules": ["expert_fc1"]},
+            ValueError,
+            "fine-grained activation offloading.*expert_fc1",
+            id="offload-expert-fc1",
+        ),
+        pytest.param(
+            {"fine_grained_activation_offloading": True, "offload_modules": ["moe_act"]},
+            ValueError,
+            "fine-grained activation offloading.*moe_act",
+            id="offload-moe-act",
+        ),
+        pytest.param(
+            {"fp8_param": True}, TypeError, "master weights must remain BF16", id="fp8-param"
+        ),
+        pytest.param(
+            {"fp4_param": True}, TypeError, "master weights must remain BF16", id="fp4-param"
         ),
     ],
 )
-def test_flashinfer_moe_rejects_unsupported_te_execution_paths(monkeypatch, attribute, message):
+def test_flashinfer_moe_rejects_unsupported_te_execution_paths(
+    monkeypatch, updates, exception, message
+):
     monkeypatch.setenv("MILES_FLASHINFER_MOE_QUANTIZATION", "mxfp8")
     config = TransformerConfig(
         num_layers=1,
@@ -235,9 +282,10 @@ def test_flashinfer_moe_rejects_unsupported_te_execution_paths(monkeypatch, attr
         bf16=True,
         params_dtype=torch.bfloat16,
     )
-    setattr(config, attribute, True)
+    for attribute, value in updates.items():
+        setattr(config, attribute, value)
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(exception, match=message):
         _validate_flashinfer_moe_config(config)
 
 
@@ -291,53 +339,14 @@ def test_grouped_mlp_weight_parameters_do_not_materialize_stacked_copies():
     )
 
 
-def test_bf16_surrogate_matches_megatron_expert_formula_and_gradients():
-    hidden = torch.tensor([[0.5, -1.0], [1.5, 0.25]], requires_grad=True)
-    # Deliberately asymmetric gate/up halves catch an accidental FlashInfer [up, gate] swap.
-    w13 = torch.tensor([[[1.0, 0.0], [0.0, 2.0], [3.0, 0.0], [0.0, -4.0]]], requires_grad=True)
-    w2 = torch.tensor([[[2.0, -1.0], [0.5, 3.0]]], requires_grad=True)
-    topk_weights = torch.tensor([[0.25], [0.75]], requires_grad=True)
-
-    actual = _sequential_bf16_routed_experts(
-        hidden, topk_weights, tuple(w13.unbind()), tuple(w2.unbind()), (2,)
-    )
-    gate, up = F.linear(hidden, w13[0]).chunk(2, dim=-1)
-    expected = F.linear((F.silu(gate) * up * topk_weights).to(hidden.dtype), w2[0])
-    torch.testing.assert_close(actual, expected)
-
-    actual.sum().backward()
-    actual_grads = (
-        hidden.grad.clone(),
-        topk_weights.grad.clone(),
-        w13.grad.clone(),
-        w2.grad.clone(),
-    )
-
-    hidden_ref = hidden.detach().requires_grad_()
-    weights_ref = topk_weights.detach().requires_grad_()
-    w13_ref = w13.detach().requires_grad_()
-    w2_ref = w2.detach().requires_grad_()
-    gate_ref, up_ref = F.linear(hidden_ref, w13_ref[0]).chunk(2, dim=-1)
-    expected_ref = F.linear(
-        (F.silu(gate_ref) * up_ref * weights_ref).to(hidden_ref.dtype), w2_ref[0]
-    )
-    expected_ref.sum().backward()
-    expected_grads = (hidden_ref.grad, weights_ref.grad, w13_ref.grad, w2_ref.grad)
-
-    for actual_grad, expected_grad in zip(actual_grads, expected_grads):
-        torch.testing.assert_close(actual_grad, expected_grad)
-
-
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped BF16 requires CUDA")
-@pytest.mark.parametrize("tokens_per_expert", [(2, 0, 3, 0), (0, 0, 5, 0)])
 @pytest.mark.parametrize(
     "activation_in_fp32,fused_activation", [(False, False), (False, True), (True, False)]
 )
-def test_te_grouped_bf16_surrogate_matches_independent_loop(
-    tokens_per_expert, activation_in_fp32, fused_activation
-):
-    num_experts = 4
+def test_te_grouped_bf16_surrogate_matches_independent_loop(activation_in_fp32, fused_activation):
+    tokens_per_expert = (0, 2, 0, 3, 0)
+    num_experts = len(tokens_per_expert)
     hidden_size = 128
     intermediate_size = 128
     num_tokens = sum(tokens_per_expert)
