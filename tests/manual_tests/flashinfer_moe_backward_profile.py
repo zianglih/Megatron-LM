@@ -71,7 +71,9 @@ def _build_layer(
     if backward_mode not in BACKWARD_MODES:
         raise ValueError(f"unsupported backward mode {backward_mode!r}")
     os.environ["NVTE_BACKWARD_OVERRIDE"] = backward_mode
-    if quantization == "nvfp4":
+    if quantization == "mxfp8":
+        precision_config = {"fp8": "e4m3", "fp8_recipe": "mxfp8"}
+    elif quantization == "nvfp4":
         precision_config = {"fp4": "e2m1", "fp4_recipe": "nvfp4"}
         os.environ.update(
             {
@@ -83,8 +85,6 @@ def _build_layer(
                 "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
             }
         )
-    elif quantization == "mxfp8":
-        precision_config = {"fp8": "e4m3", "fp8_recipe": "mxfp8"}
     else:
         raise ValueError(f"unsupported quantization {quantization!r}")
     config = TransformerConfig(
@@ -239,13 +239,12 @@ def main() -> None:
     model_parallel_cuda_manual_seed(1234)
     route_ids = _routing_ids(rank, world_size)
 
-    for case_index, (dispatcher, quantization) in enumerate(
-        (
-            ("alltoall", "nvfp4"),
-            ("alltoall", "mxfp8"),
-            ("allgather", "nvfp4"),
-            ("allgather", "mxfp8"),
-        )
+    # Preserve each case's seed and backward-mode order while grouping MXFP8 before NVFP4.
+    for dispatcher, quantization, profile_seed_offset in (
+        ("alltoall", "mxfp8", 1),
+        ("allgather", "mxfp8", 3),
+        ("alltoall", "nvfp4", 0),
+        ("allgather", "nvfp4", 2),
     ):
         torch.manual_seed(5678 + rank)
         hidden_seed = torch.randn((NUM_TOKENS, 1, HIDDEN_SIZE), device="cuda", dtype=torch.bfloat16)
@@ -253,13 +252,15 @@ def main() -> None:
         grad_seed = torch.randn_like(hidden_seed)
         results = {}
         memory_results = {}
-        mode_order = BACKWARD_MODES if case_index % 2 == 0 else BACKWARD_MODES[::-1]
+        mode_order = (
+            BACKWARD_MODES if profile_seed_offset % 2 == 0 else BACKWARD_MODES[::-1]
+        )
         for backward_mode in mode_order:
             # Construct each mode independently with identical parameters. The
             # backward policy is model-static and must be selected before the
             # FlashInfer expert module is initialized.
-            torch.manual_seed(1234 + case_index)
-            model_parallel_cuda_manual_seed(1234 + case_index)
+            torch.manual_seed(1234 + profile_seed_offset)
+            model_parallel_cuda_manual_seed(1234 + profile_seed_offset)
             layer = _build_layer(dispatcher, quantization, backward_mode, world_size)
             layer.train()
             results[backward_mode] = _measure(layer, hidden_seed, logits_seed, grad_seed, route_ids)

@@ -2,7 +2,7 @@
 
 This extension keeps Megatron BF16 parameters, checkpoints, routing, token
 dispatch, and token combine as the source of truth while replacing the local
-routed-expert forward with a model-neutral FlashInfer BF16, NVFP4, or MXFP8
+routed-expert forward with a model-neutral FlashInfer BF16, MXFP8, or NVFP4
 kernel. It composes with the reusable FP32 MoE activation option introduced in
 [radixark/Megatron-LM#68](https://github.com/radixark/Megatron-LM/pull/68), but
 does not require that option.
@@ -105,7 +105,7 @@ For each local routed-expert shard, the quantized forward path:
 2. quantizes through Transformer Engine using the same rowwise contracts as
    Miles weight sync;
 3. adapts gate/up order and FlashInfer's shuffled weight layouts; and
-4. invokes the explicit NVFP4 or MXFP8 TRT-LLM routed kernel.
+4. invokes the explicit MXFP8 or NVFP4 TRT-LLM routed kernel.
 
 When TE keeps the routed layer in BF16, the same BF16 master weights are
 materialized in FlashInfer's block-major layout and passed to its BF16 TRT-LLM
@@ -154,8 +154,8 @@ BF16 recomputation.
 
 - NVIDIA Blackwell (SM100 or newer)
 - BF16 master parameters and BF16 dispatched hidden states
-- NVFP4 and MXFP8, plus BF16 routed execution selected by TE for first/last
-  layers in those models
+- BF16 routed execution selected by TE for first/last layers in MXFP8 and NVFP4
+  models
 - gated SwiGLU without bias, clamp, or linear offset
 - expert parallelism with `expert_tensor_parallel_size=1`
 - Megatron `alltoall` and `allgather` token dispatchers

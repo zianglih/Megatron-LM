@@ -195,8 +195,8 @@ def test_flashinfer_moe_execution_precision_rejects_mixed_expert_linears():
     [
         pytest.param("bf16", HIGH_PRECISION_BACKWARD, HIGH_PRECISION_BACKWARD, id="bf16-high"),
         pytest.param("bf16", DEQUANTIZED_BACKWARD, HIGH_PRECISION_BACKWARD, id="bf16-dequant"),
-        pytest.param("nvfp4", DEQUANTIZED_BACKWARD, DEQUANTIZED_BACKWARD, id="nvfp4-dequant"),
         pytest.param("mxfp8", DEQUANTIZED_BACKWARD, DEQUANTIZED_BACKWARD, id="mxfp8-dequant"),
+        pytest.param("nvfp4", DEQUANTIZED_BACKWARD, DEQUANTIZED_BACKWARD, id="nvfp4-dequant"),
     ],
 )
 def test_flashinfer_moe_effective_backward_mode(execution_precision, requested, expected):
@@ -262,11 +262,11 @@ def test_flashinfer_moe_dispatch_mode_rejects_fp32_combine():
 
 def test_flashinfer_moe_resolves_supported_runners_explicitly():
     assert _flashinfer_moe_runner_type("bf16") is _FlashInferBF16Runner
-    assert _flashinfer_moe_runner_type("nvfp4") is _FlashInferNVFP4Runner
     assert _flashinfer_moe_runner_type("mxfp8") is _FlashInferMXFP8Runner
+    assert _flashinfer_moe_runner_type("nvfp4") is _FlashInferNVFP4Runner
     assert "BF16" in _flashinfer_moe_description("bf16")
-    assert "NVFP4" in _flashinfer_moe_description("nvfp4")
     assert "MXFP8" in _flashinfer_moe_description("mxfp8")
+    assert "NVFP4" in _flashinfer_moe_description("nvfp4")
 
 
 @pytest.mark.parametrize(
@@ -887,10 +887,10 @@ def test_flashinfer_dequantized_mode_avoids_backward_payloads_under_no_grad(num_
 @pytest.mark.parametrize(
     "quantization,use_4over6,use_256,hidden_size",
     [
+        pytest.param("mxfp8", False, False, 128, id="mxfp8"),
         pytest.param("nvfp4", False, False, 16, id="nvfp4-k16"),
         pytest.param("nvfp4", True, False, 128, id="nvfp4-4over6-e4m3-448"),
         pytest.param("nvfp4", True, True, 128, id="nvfp4-4over6-e4m3-256"),
-        pytest.param("mxfp8", False, False, 128, id="mxfp8"),
     ],
 )
 def test_flashinfer_dequantizes_forward_activation_payload(
@@ -954,7 +954,7 @@ def test_flashinfer_dequantizes_forward_activation_payload(
 
     # TE's 4-over-6 decoder may choose a different BF16 multiply order than
     # this explicit payload formula; the observed discrepancy is at most one
-    # BF16 rounding step. Standard NVFP4 and MXFP8 remain bitwise checks.
+    # BF16 rounding step. Standard MXFP8 and NVFP4 remain bitwise checks.
     rtol = 0.005 if quantization == "nvfp4" and use_4over6 else 0
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=0)
 
@@ -1175,8 +1175,8 @@ def _set_nvfp4_4over6_env(monkeypatch, *, flashinfer=False):
 @pytest.mark.parametrize(
     "runner_type",
     [
-        pytest.param(_FlashInferNVFP4Runner, id="nvfp4"),
         pytest.param(_FlashInferMXFP8Runner, id="mxfp8"),
+        pytest.param(_FlashInferNVFP4Runner, id="nvfp4"),
     ],
 )
 def test_flashinfer_prepares_exact_dequantized_forward_weights(monkeypatch, runner_type):
@@ -1199,12 +1199,12 @@ def test_flashinfer_prepares_exact_dequantized_forward_weights(monkeypatch, runn
     assert prepared.backward_w13 is not None
     assert prepared.backward_w2 is not None
 
-    if runner_type is _FlashInferNVFP4Runner:
-        *_, w13_quantized = _te_nvfp4_quantize_gated_weight(w13[0], return_quantized=True)
-        *_, w2_quantized = _te_nvfp4_quantize_weight(w2[0], return_quantized=True)
-    else:
+    if runner_type is _FlashInferMXFP8Runner:
         *_, w13_quantized = _te_mxfp8_quantize_gated_weight(w13[0], return_quantized=True)
         *_, w2_quantized = _te_mxfp8_quantize_weight(w2[0], return_quantized=True)
+    else:
+        *_, w13_quantized = _te_nvfp4_quantize_gated_weight(w13[0], return_quantized=True)
+        *_, w2_quantized = _te_nvfp4_quantize_weight(w2[0], return_quantized=True)
     expected_w13 = w13_quantized.dequantize(dtype=torch.bfloat16)[:256, :128]
     expected_w2 = w2_quantized.dequantize(dtype=torch.bfloat16)[:128, :128]
 
@@ -1232,19 +1232,19 @@ def test_flashinfer_prepares_exact_dequantized_forward_weights(monkeypatch, runn
 @pytest.mark.parametrize(
     "runner_type",
     [
-        pytest.param(_FlashInferNVFP4Runner, id="nvfp4"),
         pytest.param(_FlashInferMXFP8Runner, id="mxfp8"),
+        pytest.param(_FlashInferNVFP4Runner, id="nvfp4"),
     ],
 )
 @pytest.mark.parametrize("backward_mode", [HIGH_PRECISION_BACKWARD, DEQUANTIZED_BACKWARD])
 def test_flashinfer_autograd_supports_outstanding_forwards(monkeypatch, runner_type, backward_mode):
-    if runner_type is _FlashInferNVFP4Runner:
+    if runner_type is _FlashInferMXFP8Runner:
+        hidden_size = 2048
+        intermediate_size = 768
+    else:
         _set_nvfp4_4over6_env(monkeypatch, flashinfer=True)
         hidden_size = 128
         intermediate_size = 128
-    else:
-        hidden_size = 2048
-        intermediate_size = 768
 
     torch.manual_seed(4321)
     runner = runner_type(
@@ -1667,25 +1667,14 @@ def _global_abs_max(tensors) -> float:
     [
         pytest.param(
             SimpleNamespace(
-                configured="nvfp4",
-                execution="nvfp4",
-                runner_type=_FlashInferNVFP4Runner,
-                num_layers=1,
-                layer_no=0,
-                first_last_layers_bf16=False,
-            ),
-            id="nvfp4",
-        ),
-        pytest.param(
-            SimpleNamespace(
                 configured="mxfp8",
-                execution="mxfp8",
-                runner_type=_FlashInferMXFP8Runner,
-                num_layers=1,
-                layer_no=0,
-                first_last_layers_bf16=False,
+                execution="bf16",
+                runner_type=_FlashInferBF16Runner,
+                num_layers=3,
+                layer_no=2,
+                first_last_layers_bf16=True,
             ),
-            id="mxfp8",
+            id="mxfp8-last-layer-bf16",
         ),
         pytest.param(
             SimpleNamespace(
@@ -1701,13 +1690,24 @@ def _global_abs_max(tensors) -> float:
         pytest.param(
             SimpleNamespace(
                 configured="mxfp8",
-                execution="bf16",
-                runner_type=_FlashInferBF16Runner,
-                num_layers=3,
-                layer_no=2,
-                first_last_layers_bf16=True,
+                execution="mxfp8",
+                runner_type=_FlashInferMXFP8Runner,
+                num_layers=1,
+                layer_no=0,
+                first_last_layers_bf16=False,
             ),
-            id="mxfp8-last-layer-bf16",
+            id="mxfp8",
+        ),
+        pytest.param(
+            SimpleNamespace(
+                configured="nvfp4",
+                execution="nvfp4",
+                runner_type=_FlashInferNVFP4Runner,
+                num_layers=1,
+                layer_no=0,
+                first_last_layers_bf16=False,
+            ),
+            id="nvfp4",
         ),
     ],
 )
@@ -1755,10 +1755,10 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         monkeypatch.setenv("MILES_USE_FLASHINFER_MOE", "1")
         if precision_case.configured == "nvfp4":
             _set_nvfp4_4over6_env(monkeypatch, flashinfer=True)
-        if precision_case.configured == "nvfp4":
-            precision_config = {"fp4": "e2m1", "fp4_recipe": "nvfp4"}
-        elif precision_case.configured == "mxfp8":
+        if precision_case.configured == "mxfp8":
             precision_config = {"fp8": "e4m3", "fp8_recipe": "mxfp8"}
+        elif precision_case.configured == "nvfp4":
+            precision_config = {"fp4": "e2m1", "fp4_recipe": "nvfp4"}
         else:
             raise NotImplementedError(
                 f"test has no precision-config branch for {precision_case.configured!r}"
@@ -2122,15 +2122,15 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
     assert missing_grads == 0
     assert forward_mode_rel_l2 < 0.01
     assert forward_mode_max < 0.125
-    if precision_case.execution == "nvfp4":
-        forward_tolerance = 0.25
-        per_token_forward_tolerance = 0.30
+    if precision_case.execution == "bf16":
+        forward_tolerance = 0.01
+        per_token_forward_tolerance = 0.02
     elif precision_case.execution == "mxfp8":
         forward_tolerance = 0.10
         per_token_forward_tolerance = 0.15
-    elif precision_case.execution == "bf16":
-        forward_tolerance = 0.01
-        per_token_forward_tolerance = 0.02
+    elif precision_case.execution == "nvfp4":
+        forward_tolerance = 0.25
+        per_token_forward_tolerance = 0.30
     else:
         raise NotImplementedError(f"test has no numerical branch for {precision_case.execution!r}")
     assert forward_rel_l2 < forward_tolerance
