@@ -7,11 +7,13 @@ individually: use the same FlashInfer routed MoE forward in Megatron that SGLang
 uses for rollout, while retaining ordinary BF16 Megatron parameters and an
 explicitly approximate training backward.
 
-This experiment targets exactly:
+This experiment targets:
 
 - `trtllm_fp4_block_scale_routed_moe`
 - per-token NVFP4 activation quantization
 - NVFP4 4-over-6 weight and activation quantization
+- `trtllm_fp8_block_scale_routed_moe`
+- MXFP8 weights and per-token MXFP8 activation quantization
 - routed SwiGLU experts
 - BF16 module input and output
 - expert tensor parallel size 1
@@ -27,7 +29,20 @@ The opt-in environment variable is:
 MILES_USE_FLASHINFER_MOE=1
 ```
 
-It defaults to disabled. When enabled, the MoE layer:
+It defaults to disabled. When enabled, the adapter requires exactly one
+supported quantization. It resolves an active Megatron MXFP8 or NVFP4 recipe,
+or experiments can select either path explicitly:
+
+```bash
+MILES_FLASHINFER_MOE_QUANTIZATION=nvfp4  # or mxfp8
+```
+
+There is no default quantization fallback. Other active recipes and missing or
+ambiguous selections fail before the routed kernel runs, and an environment
+selection cannot override a conflicting active recipe. New formats must add an
+explicit resolver, capability, validation, runner, and log-description branch.
+
+When enabled, the MoE layer:
 
 1. Replaces `TEGroupedMLP` with a BF16 holder that preserves its per-expert
    parameter naming contract during model construction. The concrete
@@ -41,15 +56,14 @@ It defaults to disabled. When enabled, the MoE layer:
    weights remain differentiable gathers from Megatron's dense probabilities.
 3. Gathers BF16 tokens, routing weights, and routing IDs across the expert
    parallel group.
-4. Quantizes each current BF16 expert independently with a direct TE
-   `NVFP4Quantizer` call matching Miles weight sync. Gate and up weights are
-   quantized together in Megatron's `[gate, up]` order so they share one
-   per-expert scale. The emitted packed rows and block scales are then changed
-   to FlashInfer's `[up, gate]` order before the existing gated-act reorder and
-   MMA shuffle.
-5. Quantizes activations per token in the linear scale layout.
-6. Calls `trtllm_fp4_block_scale_routed_moe` with packed BF16 routing weights,
-   local expert offset/count, `do_finalize=True`, and SwiGLU.
+4. Quantizes each current BF16 expert with the matching direct TE quantizer so
+   the values and scales match Miles weight sync. NVFP4 uses per-tensor decode
+   scales; MXFP8 uses compact rowwise UE8M0 scales. Both paths adapt Megatron's
+   `[gate, up]` rows to FlashInfer's W3/W1 contract and apply the same
+   format-specific weight/scale layout transforms used by SGLang.
+5. Quantizes activations per token with FlashInfer in the linear scale layout.
+6. Calls the pre-routed FlashInfer NVFP4 or MXFP8 operation with packed BF16
+   routing weights, local expert offset/count, `do_finalize=True`, and SwiGLU.
 7. Sums local-expert partial outputs across expert parallel ranks and slices
    this rank's original tokens.
 
@@ -70,7 +84,7 @@ The expert-parallel communication remains part of the autograd boundary:
 This backward is not the derivative of the quantized FlashInfer forward.
 Gradient fidelity is an accepted limitation of this experiment.
 
-## Exact rollout settings
+## Exact NVFP4 rollout settings
 
 The controlled GLM-5.2 experiment uses:
 
@@ -98,6 +112,12 @@ top-k, Miles Torch top-k, and fixed rollout-routing replay. The activation-only
 toggle is disabled on both sides because this path bypasses Megatron's
 routed-expert activation implementation. A later controlled run using
 FlashInfer DSA top-k on both sides is recorded below.
+
+The MXFP8 path instead uses TE's rowwise `MXFP8Quantizer` for BF16 master
+weights and FlashInfer's `mxfp8_quantize` for per-token activations. The kernel
+receives token-major activation scales, shuffled W3/W1 and W2 weights, and
+interleaved UE8M0 weight scales, matching SGLang's
+`flashinfer_trtllm_routed` backend.
 
 ## Environment
 
@@ -146,6 +166,8 @@ per-token activations. The adapter mirrors that division of ownership.
   parallelism greater than one are rejected. Miles' all-`-1` replay padding
   rows are supported by applying the same deterministic expert-ID replacement
   as `ReplayManager`.
+- The current MXFP8 path requires hidden and expert-intermediate dimensions to
+  be multiples of 128. Shape padding can relax this in a later iteration.
 - The trainer run used EP4 while rollout data came from EP2. Ordinary NCCL
   all-reduce does not preserve the same partial-sum association across those
   topologies, so reusing the FlashInfer expert kernel alone cannot guarantee
@@ -198,6 +220,21 @@ nonzero-loss BF16 surrogate backward with finite gradients, replay slot-order
 preservation, replay padding normalization, and explicit zero gradients when an
 EP rank has no locally routed tokens. It also bitwise-compares the local TE
 helper with Miles for odd-row padding and paired gate/up quantization.
+
+The MXFP8 extension was validated separately on the bare
+`radixark/miles:dev-202608041247` image with FlashInfer 0.6.14 and an NVIDIA
+B200. The full routed-MoE unit file passed without installing or rebuilding any
+packages:
+
+```text
+24 passed, 25 warnings in 2.19s
+```
+
+This adds bitwise TE-versus-Miles MXFP8 weight and scale checks, explicit
+selection/error coverage for NVFP4 and MXFP8, bitwise prepared-layout parity
+with SGLang, and a routed SwiGLU MXFP8 forward with finite BF16 surrogate
+gradients at 128 global experts, 4 local experts, hidden size 2048, and
+intermediate size 768.
 
 ### Quantized-weight contract
 
