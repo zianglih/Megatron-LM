@@ -492,7 +492,7 @@ def _build_train_args(hf_checkpoint: Path, ref_load: Path, prompt_path: Path, ru
         "--sglang-tp-size 1 "
         "--sglang-ep-size 1 "
         "--sglang-moe-runner-backend triton "
-        "--sglang-attention-backend fa3 "
+        "--sglang-attention-backend flashinfer "
         "--sglang-kv-cache-dtype bf16 "
         "--sglang-mem-fraction-static 0.7 "
         "--sglang-max-running-requests 1 "
