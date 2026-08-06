@@ -8,6 +8,11 @@ from pathlib import Path
 
 import torch
 
+if __package__:
+    from .op_progression import build_operation_progression, write_operation_progression
+else:
+    from op_progression import build_operation_progression, write_operation_progression
+
 
 def _layer_taps(layer: int) -> tuple[str, ...]:
     prefix = f"layer_{layer}"
@@ -86,7 +91,7 @@ def _load_dumps(root: Path) -> dict[tuple[str, str, int], tuple[torch.Tensor, di
 
 
 def _group_dumps(
-    dumps: dict[tuple[str, str, int], tuple[torch.Tensor, dict]]
+    dumps: dict[tuple[str, str, int], tuple[torch.Tensor, dict]],
 ) -> dict[tuple[str, str], list[tuple[int, torch.Tensor, dict]]]:
     grouped: dict[tuple[str, str], list[tuple[int, torch.Tensor, dict]]] = {}
     for (name, phase, call), (tensor, metadata) in dumps.items():
@@ -104,7 +109,7 @@ def _align(left: torch.Tensor, right: torch.Tensor) -> tuple[torch.Tensor, torch
     return left.float(), right.float()
 
 
-def _metrics(left: torch.Tensor, right: torch.Tensor) -> dict[str, float]:
+def _metrics(left: torch.Tensor, right: torch.Tensor) -> dict[str, float | int]:
     left, right = _align(left, right)
     # These tensors contain tens of millions of elements at 8K context. FP32
     # reductions can accumulate enough error to report an impossible cosine
@@ -114,6 +119,8 @@ def _metrics(left: torch.Tensor, right: torch.Tensor) -> dict[str, float]:
     diff64 = right64 - left64
     left_norm = float(torch.linalg.vector_norm(left64))
     right_norm = float(torch.linalg.vector_norm(right64))
+    difference_l2 = float(torch.linalg.vector_norm(diff64))
+    exact_count = int((left == right).sum())
     denominator = max(left_norm, torch.finfo(torch.float64).tiny)
     cosine_denominator = max(left_norm * right_norm, torch.finfo(torch.float64).tiny)
     cosine = float(torch.dot(left64.reshape(-1), right64.reshape(-1))) / cosine_denominator
@@ -121,9 +128,13 @@ def _metrics(left: torch.Tensor, right: torch.Tensor) -> dict[str, float]:
         "max_abs": float(diff64.abs().max()),
         "mean_abs": float(diff64.abs().mean()),
         "rms_abs": float(diff64.square().mean().sqrt()),
-        "rel_l2": float(torch.linalg.vector_norm(diff64)) / denominator,
+        "rel_l2": difference_l2 / denominator,
         "cosine": min(1.0, max(-1.0, cosine)),
-        "exact_fraction": int((left == right).sum()) / left.numel(),
+        "exact_fraction": exact_count / left.numel(),
+        "reference_l2": left_norm,
+        "difference_l2": difference_l2,
+        "numel": left.numel(),
+        "exact_count": exact_count,
     }
 
 
@@ -157,7 +168,8 @@ def compare(left_root: Path, right_root: Path) -> dict:
         raise RuntimeError(f"No Megatron tensor dumps found under {right_root}")
     left_grouped = _group_dumps(left)
     right_grouped = _group_dumps(right)
-    common = sorted(left_grouped.keys() & right_grouped.keys())
+    common_keys = left_grouped.keys() & right_grouped.keys()
+    common = sorted(common_keys)
     if not common:
         raise RuntimeError("SGLang and Megatron dumps have no common canonical tensor names")
     records = []
@@ -186,9 +198,20 @@ def compare(left_root: Path, right_root: Path) -> dict:
             "left_path": left_meta["path"],
             "right_path": right_meta["path"],
         }
-        if key[0].endswith(".qkv"):
+        if key[0].endswith(".qkv") and key[1] == "output":
             record["status"] = "layout_opaque"
-            record["error"] = "Packed QKV layouts are backend-specific; compare canonical Q/K taps"
+            record["error"] = (
+                "Packed QKV layouts are backend-specific; compare canonical Q, K, and V taps"
+            )
+            records.append(record)
+            continue
+        if key[0].endswith(".qkv") and (
+            (key[0].removesuffix(".qkv") + ".input_rmsnorm", "output") not in common_keys
+        ):
+            record["status"] = "fused_opaque"
+            record["error"] = (
+                "Native TE QKV input is pre-RMSNorm while SGLang QKV input is post-RMSNorm"
+            )
             records.append(record)
             continue
         if selected is None:
@@ -202,18 +225,17 @@ def compare(left_root: Path, right_root: Path) -> dict:
             record.update(_metrics(left_tensor, right_tensor))
             record["status"] = "compared"
         records.append(record)
-    compared = [record for record in records if record["status"] == "compared"]
-    compared_output_names = {record["name"] for record in compared if record["phase"] == "output"}
-    missing_expected = [name for name in EXPECTED_OUTPUT_TAPS if name not in compared_output_names]
-    ordered = sorted(
-        compared,
+    records.sort(
         key=lambda record: (
             TAP_ORDER.get((record["name"], record["phase"]), len(TAP_ORDER)),
             record["name"],
             record["phase"],
-        ),
+        )
     )
-    nonzero = [record for record in ordered if record["max_abs"] > 0]
+    compared = [record for record in records if record["status"] == "compared"]
+    compared_output_names = {record["name"] for record in compared if record["phase"] == "output"}
+    missing_expected = [name for name in EXPECTED_OUTPUT_TAPS if name not in compared_output_names]
+    nonzero = [record for record in compared if record["max_abs"] > 0]
     worst = max(compared, key=lambda record: record["rel_l2"], default=None)
     summary = {
         "compared": len(compared),
@@ -222,7 +244,7 @@ def compare(left_root: Path, right_root: Path) -> dict:
         "first_nonzero": nonzero[0] if nonzero else None,
         "worst_relative_l2": worst,
     }
-    return {
+    report = {
         "left": str(left_root),
         "right": str(right_root),
         "left_only": [list(key) for key in sorted(left.keys() - used_left)],
@@ -230,6 +252,8 @@ def compare(left_root: Path, right_root: Path) -> dict:
         "records": records,
         "summary": summary,
     }
+    report["operation_progression"] = build_operation_progression(records)
+    return report
 
 
 def _write_markdown(report: dict, path: Path) -> None:
@@ -260,7 +284,7 @@ def _write_markdown(report: dict, path: Path) -> None:
         else:
             lines.append(
                 f"| `{record['name']}` | {record['phase']} | `{calls}` | `{shapes}` | "
-                "backend-specific layout | - | - | - | - |"
+                f"{record['error']} | - | - | - | - |"
             )
     lines.extend(
         [
@@ -287,6 +311,7 @@ def main() -> None:
         json.dumps(report, indent=2, allow_nan=False), encoding="utf-8"
     )
     _write_markdown(report, args.output / "intermediate_diff.md")
+    write_operation_progression(report, args.output)
 
     compared = [record for record in report["records"] if record["status"] == "compared"]
     worst = max(compared, key=lambda item: item["rel_l2"], default=None)

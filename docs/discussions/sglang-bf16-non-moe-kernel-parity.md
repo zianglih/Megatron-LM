@@ -143,10 +143,12 @@ python tools/sglang_bf16_parity/run_qwen3_30b_2layer.py \
 Each invocation creates a timestamped run directory so prior tensors and metric
 records cannot be reused accidentally. The harness records full tensors for
 the 8064-token generation prefill and the later scoring prefill, scalar
-summaries, a JSON/Markdown intermediate comparison, CI-history metric records,
-and one `result.json` per variant. The comparator pairs calls by canonical name,
-phase, and compatible squeezed shape, then selects the largest match; call
-ordinals are process-local and are never treated as cross-backend identities.
+summaries, raw JSON/Markdown tensor comparisons, operation-ordered
+`op_progression.json` and `op_progression.md` reports, CI-history metric
+records, and one `result.json` per variant. The comparator pairs calls by
+canonical name, phase, and compatible squeezed shape, then selects the largest
+match; call ordinals are process-local and are never treated as cross-backend
+identities.
 
 ## Experiment ledger
 
@@ -157,14 +159,14 @@ metrics and matched intermediate reports.
 
 | Variant | Drop-ins | Context | Log-prob abs diff | Delta | Train/rollout KL | Delta | First useful divergence | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| `baseline` | none | 8192 | 0.0223388672 | - | 0.0007065088 | - | Layer 0 Q-norm input: max 3.05e-5, relative L2 2.56e-7 | complete |
+| `baseline` | none | 8192 | 0.0223388672 | - | 0.0007065088 | - | Fused input norm + QKV region: joint Q/K/V relative L2 3.20e-7 | complete |
 | `rmsnorm` | block + pre-MoE RMSNorm | 8192 | 0.0230712891 | +0.0007324219 | 0.0008305465 | +0.0001240377 | Layer 0 Q-norm output: max 0.0703125, relative L2 0.00231965 | complete |
 | `rmsnorm_qk` | previous + Q/K RMSNorm | 8192 | 0.0213623047 | -0.0009765625 | 0.0007387963 | +0.0000322876 | Layer 0 attention output: max 0.000488281, relative L2 0.00116990 | complete |
 | `rmsnorm_qk_final` | previous + final RMSNorm | 8192 | 0.0219726562 | -0.0003662109 | 0.0007983116 | +0.0000918028 | Layer 0 attention output: max 0.000488281, relative L2 0.00116990 | complete |
 
 Run `20260806-infra-b200-v3` completed all four arms. Every arm produced its
 metric record and intermediate report; the comparator matched 36 tensors for
-the fused native baseline and 40 for each drop-in arm, with no canonical shape
+the fused native baseline and 42 for each drop-in arm, with no canonical shape
 mismatches or missing expected output taps. Scalar reductions use FP64 because
 the 8K tensors are large enough for an FP32 cosine reduction to exceed one from
 accumulation error.
@@ -186,6 +188,71 @@ exact fraction 25.55% to 31.01%) but does not improve either terminal metric
 over `rmsnorm_qk`. No arm improves both terminal metrics over baseline in this
 single deterministic sample. The layer-1 MoE output remains the worst relative
 L2 boundary, as expected for a declared non-goal.
+
+### Operation-by-operation observed drift
+
+The comparator also groups canonical taps into execution order. Each cell below
+is the relative L2 at that operation's output. QKV uses the joint norm of its
+canonical Q, K, and V outputs. For attribution, fused attention aggregates the
+joint Q/K/V input and residual rows aggregate both operands. A dash means that
+the fused baseline does not expose that boundary.
+
+These are natural-forward cumulative measurements, not an additive error
+budget. Once an operation receives different inputs, its output drift can grow
+or shrink through amplification, rounding, or cancellation. Only an exact
+input followed by a non-exact output proves that the observed implementation
+boundary introduced a mismatch.
+
+| Operation output | Baseline | RMSNorm | + Q/K RMSNorm | + final RMSNorm |
+| --- | ---: | ---: | ---: | ---: |
+| Layer 0 input | 0 | 0 | 0 | 0 |
+| Layer 0 input RMSNorm | - | 0 | 0 | 0 |
+| Layer 0 QKV projection, joint Q/K/V | 3.195412e-7 | 0 | 0 | 0 |
+| Layer 0 Q RMSNorm | 0.002319654 | 0.002319654 | 0 | 0 |
+| Layer 0 K RMSNorm | 0.002579950 | 0.002579950 | 0 | 0 |
+| Layer 0 Q RoPE + BF16 cast | 0.003225849 | 0.003225849 | 0 | 0 |
+| Layer 0 K RoPE + BF16 cast | 0.003330338 | 0.003330338 | 0 | 0 |
+| Layer 0 fused attention core | 0.002668378 | 0.002668378 | 0.001169901 | 0.001169901 |
+| Layer 0 attention output projection | 0.002594350 | 0.002594352 | 0.001321609 | 0.001321609 |
+| Layer 0 attention residual merge | 0.002592164 | 0.002592167 | 0.001843506 | 0.001843506 |
+| Layer 0 pre-MoE RMSNorm | 0.003554548 | 0.003554576 | 0.003008270 | 0.003008270 |
+| Layer 0 MoE output, control/non-goal | 0.008465747 | 0.008465757 | 0.008057719 | 0.008057719 |
+| Layer 0 MoE residual merge | 0.005423944 | 0.005423987 | 0.005136664 | 0.005136664 |
+| Layer 1 input | 0.005423944 | 0.005423987 | 0.005136664 | 0.005136664 |
+| Layer 1 input RMSNorm | - | 0.005298427 | 0.005036407 | 0.005036407 |
+| Layer 1 QKV projection, joint Q/K/V | 0.005035123 | 0.005035514 | 0.004599212 | 0.004599212 |
+| Layer 1 Q RMSNorm | 0.005074052 | 0.005073934 | 0.004615262 | 0.004615262 |
+| Layer 1 K RMSNorm | 0.003859255 | 0.003858314 | 0.003514436 | 0.003514436 |
+| Layer 1 Q RoPE + BF16 cast | 0.005562515 | 0.005562488 | 0.004901619 | 0.004901619 |
+| Layer 1 K RoPE + BF16 cast | 0.004574221 | 0.004573206 | 0.003732830 | 0.003732830 |
+| Layer 1 fused attention core | 0.004936935 | 0.004936046 | 0.004154173 | 0.004154173 |
+| Layer 1 attention output projection | 0.005048583 | 0.005046495 | 0.004317600 | 0.004317600 |
+| Layer 1 attention residual merge | 0.005413086 | 0.005412723 | 0.005082244 | 0.005082244 |
+| Layer 1 pre-MoE RMSNorm | 0.007113807 | 0.007113542 | 0.006773177 | 0.006773177 |
+| Layer 1 MoE output, control/non-goal | 0.009882709 | 0.009867726 | 0.009285527 | 0.009285527 |
+| Layer 1 MoE residual merge | 0.007009508 | 0.007002754 | 0.006625629 | 0.006625629 |
+| Final RMSNorm | 0.008563357 | 0.008563956 | 0.008346661 | 0.008198990 |
+
+The first attributable boundaries are:
+
+- Native baseline: layer 0 starts exact, but TE fuses input RMSNorm into QKV.
+  The first exposed Q/K/V outputs have joint relative L2 `3.195412e-7` and max
+  absolute error `3.051758e-5`; the current dumps cannot assign that small
+  mismatch to the norm or the projection separately.
+- `rmsnorm`: layer-0 input RMSNorm and QKV are exact. Q RMSNorm then produces
+  relative L2 `0.002319654` and K RMSNorm produces `0.002579950` from exact
+  inputs, so both native Q/K norm boundaries independently introduce drift.
+- `rmsnorm_qk` and `rmsnorm_qk_final`: layer-0 Q, K, and V remain exact through
+  Q/K normalization and the post-RoPE BF16 attention inputs. The fused attention
+  output is the first mismatch: relative L2 `0.001169901`, max absolute error
+  `0.0004882812`, and `93.213%` exact elements.
+
+Later rows are cumulative only. The largest increases occur around the opaque
+MoE control boundary, but its inputs already differ and MoE is intentionally a
+non-goal. The fused attention dumps likewise cannot split QK, softmax, and PV,
+and the current post-RoPE taps cannot split RoPE from its BF16 cast. Deeper
+attribution would require same-input operator replay or additional debug-only
+kernel outputs, not reinterpretation of the natural-forward deltas.
 
 ### Runtime attempt ledger
 
@@ -213,12 +280,14 @@ The matched sequence is:
 2. Input RMSNorm input/output.
 3. QKV boundary.
 4. Q and K RMSNorm input/output.
-5. Attention core input/output.
-6. Attention output projection input/output.
-7. Pre-MoE RMSNorm input/output.
-8. MoE output as a non-goal boundary/control.
-9. Layer output.
-10. Final RMSNorm input/output.
+5. Post-RoPE Q/K and canonical V.
+6. Attention core input/output.
+7. Attention output projection input/output.
+8. Attention residual merge at the pre-MoE RMSNorm input.
+9. Pre-MoE RMSNorm input/output.
+10. MoE output as a non-goal boundary/control.
+11. MoE residual merge at layer output.
+12. Final RMSNorm input/output.
 
 SGLang stores Q/K norm rows and post-RoPE Q/K/V in flattened attention
 layouts, while Megatron exposes explicit head dimensions. Debug hooks reshape
