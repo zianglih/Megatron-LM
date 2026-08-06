@@ -1,0 +1,229 @@
+# SGLang BF16 non-MoE kernel parity experiments
+
+This document is the live experiment ledger for isolated SGLang BF16 kernel
+drop-ins in Megatron. The goal is to measure how each replacement changes
+`train/train_rollout_logprob_abs_diff`, `train/train_rollout_kl`, and matched
+intermediate tensors before deciding which adapters are worth retaining.
+
+## Scope
+
+The experimental contract is intentionally narrower than the existing broad
+true-on-policy backend:
+
+- BF16 only; FP8, MXFP8, NVFP4, and mixed first/last-layer recipes are out of
+  scope for this PR.
+- The routed MoE, shared experts, router, dispatcher, combine, and probability
+  placement remain native Megatron. SGLang uses its requested Triton MoE runner.
+- The LM head remains native Megatron. Logits are a terminal observation, not a
+  replacement target.
+- Each kernel is selected independently through
+  `MILES_SGLANG_BF16_KERNELS`.
+- Unset or empty selection leaves the original block specs unchanged.
+- Once a kernel is selected, missing SGLang APIs and unsupported layouts fail
+  explicitly; there is no silent fallback.
+
+The current selections are:
+
+| Selection | Replaced boundary | Preserved boundary |
+| --- | --- | --- |
+| `rmsnorm` | Attention input RMSNorm and pre-MLP/pre-MoE RMSNorm | Attention, MoE, residual add, dense GEMMs |
+| `qk_rmsnorm` | Q and K RMSNorm | QKV projection, RoPE, attention |
+| `final_rmsnorm` | Final block RMSNorm | LM head and logit processing |
+
+For TE layers, selecting `rmsnorm` decomposes only the fused input
+`TELayerNormColumnParallelLinear` into a standalone SGLang RMSNorm followed by
+`TEColumnParallelLinear`. The distributed-checkpoint mapping preserves the
+canonical `self_attention.linear_qkv.layer_norm_` key. MoE specs are never
+traversed or replaced.
+
+The explicit attention-input norm also changes the live Megatron parameter
+name from `self_attention.linear_qkv.layer_norm_weight` to
+`input_layernorm.weight`. The image's Miles Qwen3-MoE weight converter does not
+recognize that spelling. Validation therefore uses the same one-line alias and
+focused test already present in the companion Miles side of
+[radixark/Megatron-LM#30](https://github.com/radixark/Megatron-LM/pull/30)
+([radixark/miles#1059](https://github.com/radixark/miles/pull/1059)). The harness
+preflight executes the conversion probe before downloading or launching
+anything. This integration-only Miles change is kept out of the Megatron PR.
+
+## Numerical and backward contract
+
+The forward calls SGLang's `true_on_policy_rms_norm` Triton kernel. Its dtype
+contract is explicit per site because SGLang does not use one common boundary:
+
+- Block input and pre-MoE norms reduce and apply the FP32 affine in FP32, then
+  store BF16 for the following Megatron dense operation.
+- Q/K norms reduce in FP32, round the normalized value to BF16, apply the FP32
+  affine, and retain FP32 through RoPE. One small Megatron hook casts Q/K to
+  BF16 immediately after RoPE and before attention, matching SGLang's dense
+  attention boundary.
+- Final norm rounds both the normalized value and effective weight to BF16 and
+  returns BF16 to the native Megatron LM head.
+
+Norm parameters are stored in FP32, matching the reference Megatron adapter and
+the SGLang block/QK contract. The final-norm kernel explicitly casts its
+effective weight to BF16. This storage choice is part of the experiment because
+it can also affect optimizer updates after the first step.
+
+The fused SGLang API is forward-only. Backward recomputes the same per-site
+SGLang expression under PyTorch autograd; it is a surrogate, not the TE RMSNorm
+backward. This avoids executing and retaining a second PyTorch graph during
+forward while keeping the experiment isolated. Backward-kernel parity is not
+claimed.
+
+The image's native final norm has a BF16 weight and receives a BF16 hidden
+tensor plus the FP32 residual carried by the block stack. The SGLang experiment
+branch enables the fused kernel for exactly this already-FP32-promoted residual
+case, so the final arm runs the same fused forward on rollout and training. It
+does not fuse narrower residual additions, where loading both operands as FP32
+would skip a native BF16 addition rounding point.
+
+## Two-layer 8192-token harness
+
+The harness is
+`tools/sglang_bf16_parity/run_qwen3_30b_2layer.py`. It truncates the published
+five-layer debug checkpoint at revision
+`9c2ee37f22b7ef150675311b3d5e1c671838ffe1` to two layers, converts the exact
+two-layer checkpoint to Megatron torch-dist, and exposes only two GPUs to Ray:
+
+- GPU 0: one-GPU Megatron BF16 training.
+- GPU 1: one-GPU SGLang rollout with `--sglang-moe-runner-backend triton`.
+
+The prompt is pre-rendered to exactly 8064 tokens and generation is forced to
+128 tokens, producing an exact 8192-token scoring prefill without paying for an
+8192-token decode. Routing selections are replayed. SGLang prefill recomputes
+rollout log probabilities. Radix prefix-cache reuse is disabled so the scoring
+request actually executes all 8192 tokens instead of reusing the preceding
+generation prefix; active-request KV state still serves decode. The image only
+registers the dense
+`qwen3_dense_true_on_policy_v1` contract, which is not valid for Qwen3-MoE and
+would also switch the router away from its normal Triton `TopK` path. The local
+SGLang experiment branch therefore uses the narrow
+`SGLANG_BF16_NONMOE_PARITY=1` environment gate for only the non-MoE Qwen3
+norm/cast boundaries. It adds the upstream fused RMSNorm API, the corresponding
+Qwen3 norm/cast wiring, and debug hooks. The Triton MoE implementation and its
+normal routing path are unchanged. Megatron does not enable its broad
+`true_on_policy_contract`; the selected drop-in set is the only Megatron model
+construction difference between variants.
+
+The requested validation image is:
+
+```text
+radixark/miles@sha256:d9e01378d8820afd88824c798ea628b3b6cb87a6c6911db5165ef9d98187db55
+```
+
+The devbox is a bare 8xB200 c1 allocation in queue `hell`; c1 requires the
+8-GPU scheduling unit even though this harness uses only two GPUs.
+
+Run all ablations from the image Megatron checkout after syncing this branch:
+
+```bash
+mkdir -p /root/shared_data/sglang-bf16-nonmoe
+cd /root/Megatron-LM
+set -o pipefail
+python tools/sglang_bf16_parity/run_qwen3_30b_2layer.py \
+  --variants baseline,rmsnorm,rmsnorm_qk,rmsnorm_qk_final \
+  2>&1 | tee /root/shared_data/sglang-bf16-nonmoe/harness.log
+```
+
+Run one arm during iteration:
+
+```bash
+python tools/sglang_bf16_parity/run_qwen3_30b_2layer.py \
+  --variants rmsnorm_qk
+```
+
+Each invocation creates a timestamped run directory so prior tensors and metric
+records cannot be reused accidentally. The harness records full tensors for
+the 8064-token generation prefill and the later scoring prefill, scalar
+summaries, a JSON/Markdown intermediate comparison, CI-history metric records,
+and one `result.json` per variant. The comparator pairs calls by canonical name,
+phase, and compatible squeezed shape, then selects the largest match; call
+ordinals are process-local and are never treated as cross-backend identities.
+
+## Experiment ledger
+
+All deltas are relative to the native baseline from the same image, checkpoint,
+prompt, seed, and topology. Lower absolute log-probability difference and lower
+train/rollout KL are better. A result remains `pending` until the run has both
+metrics and matched intermediate reports.
+
+| Variant | Drop-ins | Context | Log-prob abs diff | Delta | Train/rollout KL | Delta | First useful divergence | Status |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| `baseline` | none | 8192 | pending | - | pending | - | pending | queued |
+| `rmsnorm` | block + pre-MoE RMSNorm | 8192 | pending | pending | pending | pending | pending | queued |
+| `rmsnorm_qk` | previous + Q/K RMSNorm | 8192 | pending | pending | pending | pending | pending | queued |
+| `rmsnorm_qk_final` | previous + final RMSNorm | 8192 | pending | pending | pending | pending | pending | queued |
+
+## Intermediate taps
+
+Debugging is enabled only when `MILES_SGLANG_BF16_DEBUG_DIR` is set. Both
+Megatron and the image-aligned SGLang branch install hooks instead of embedding
+logging logic in forward implementations. Full dumps retain up to two calls
+whose token dimension is at least 8064. This includes the generation prefill
+and the longer scoring pass while excluding one-token decode calls; matching by
+shape selects the training/scoring pair.
+
+The matched sequence is:
+
+1. Layer input.
+2. Input RMSNorm input/output.
+3. QKV boundary.
+4. Q and K RMSNorm input/output.
+5. Attention core input/output.
+6. Attention output projection input/output.
+7. Pre-MoE RMSNorm input/output.
+8. MoE output as a non-goal boundary/control.
+9. Layer output.
+10. Final RMSNorm input/output.
+
+SGLang stores Q/K norm rows and post-RoPE Q/K/V in flattened attention
+layouts, while Megatron exposes explicit head dimensions. Debug hooks reshape
+only those known layouts to `[tokens, heads, head_dim]` before writing them;
+the model tensors themselves are untouched. For block, pre-MoE, and final
+RMSNorm, SGLang's raw FP32 norm output is retained under a `_raw` diagnostic
+name and the canonical output tap records the effective BF16 input to the next
+dense operation. This matches the isolated Megatron adapter's boundary without
+claiming the native raw norm tensors are identical.
+
+Native TE fuses the baseline attention-input RMSNorm into QKV and does not
+expose its exact output. That tap is omitted for the baseline instead of being
+mislabelled; the QKV output and canonical pre-norm Q/K taps are the first
+available downstream signals. Packed raw QKV tensors are retained for manual
+inspection but excluded from elementwise metrics because Megatron and SGLang
+use backend-specific packed layouts. Unknown canonical shape differences are
+reported as errors rather than flattened and reshaped.
+
+Router replay fixes the selected expert IDs; it is not an assertion about MoE
+numerical equality. Because native Megatron and SGLang still differ in MoE
+probability placement, the first-layer pre-MoE tensors are the cleanest signal
+for these non-MoE drop-ins, and a non-zero mismatch floor after the MoE boundary
+is expected.
+
+## Source revisions
+
+| Component | Revision | Notes |
+| --- | --- | --- |
+| Megatron image checkout | `4716f75475c78e2fc2c6f0d3af095f1681b770b4` | Exact `/root/Megatron-LM` revision in the requested image |
+| Megatron PR base | `50ac48e87b8a31da7330de4a03d8ae42b985d9d2` | `zianglih:megatron-miles`; descendant of the image checkout |
+| Megatron experiment | pending | `agent/sglang-bf16-kernel-parity` |
+| SGLang image base | `d218d6c7835307da50373f81704e61338b4e4847` | Exact `/sgl-workspace/sglang` revision from the requested image digest |
+| SGLang experiment | `ff3d9ca5a55c` | `agent/bf16-nonmoe-parity-debug`, based exactly on the image revision |
+| Miles image checkout | `43d38ada230a431845338ed913f6c3a1b5f8355d` | From the exact digest's prior validated run |
+| Miles validation integration | `7e19132a4240` | `agent/bf16-nonmoe-parity-integration`; explicit input-norm live-sync alias only |
+
+## Known limitations
+
+- SGLang carries the block residual separately and performs the residual add in
+  FP32 at the next RMSNorm. This isolated Megatron adapter deliberately keeps
+  native residual materialization, so rounding before layer 1 remains a floor;
+  the experiment tests whether norm and dense-consumer boundaries reduce drift,
+  not the full residual contract from PR #30.
+- The SGLang Triton RMSNorm API is forward-only, so backward is a recomputed
+  plain BF16 surrogate.
+- The Q/K arm changes both the fused norm kernel and the SGLang FP32-through-RoPE
+  dtype boundary. The intermediate dumps separate Q/K norm output, post-RoPE
+  Q/K, and attention input so that those effects remain diagnosable.
+- This one-GPU training/one-GPU rollout harness cannot measure TP-invariant row
+  linear or collective ordering. Those are separate future experiments.
+- MoE and LM-head mismatch floors are deliberately not fixed in this PR.
