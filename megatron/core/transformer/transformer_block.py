@@ -30,6 +30,10 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
+from miles_megatron_plugins.sglang_bf16_kernels import (
+    maybe_install_megatron_debug_hooks,
+    maybe_replace_sglang_bf16_kernel_specs,
+)
 from miles_megatron_plugins.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 from miles_megatron_plugins.true_on_policy.sglang_backend import SGLangFinalRMSNorm, SGLangNorm
 from megatron.core.utils import (
@@ -349,7 +353,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
         pp_rank = get_pg_rank(pp_group)
 
-        self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank)
+        self.submodules = maybe_replace_sglang_bf16_kernel_specs(
+            config, _get_block_submodules(config, spec, vp_stage, pp_rank)
+        )
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
@@ -386,6 +392,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.config._cpu_offloading_context = None
 
         self._build_layers()
+        maybe_install_megatron_debug_hooks(self)
         self.num_layers_per_pipeline_rank = len(self.layers)
 
     def _build_layers(self):

@@ -1241,7 +1241,9 @@ class Attention(MegatronModule, ABC):
         nvtx_range_pop(suffix="rotary_pos_emb")
 
         true_on_policy_policy = resolve_true_on_policy_runtime_policy(self.config)
-        if true_on_policy_policy.cast_qk_after_rope_to_dense_math_dtype:
+        if true_on_policy_policy.cast_qk_after_rope_to_dense_math_dtype or getattr(
+            self.config, "_miles_sglang_bf16_qk_after_rope", False
+        ):
             # SGLang Qwen3 casts Q/K after QK RMSNorm and RoPE, before attention.
             query = _sglang_cast_dense_tensor_math_input(query)
             key = _sglang_cast_dense_tensor_math_input(key)
