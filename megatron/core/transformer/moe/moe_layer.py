@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol, Union
@@ -330,7 +331,20 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
+        if os.environ.get("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT") == "1":
+            if self.config.moe_combine_in_fp32:
+                raise ValueError(
+                    "MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT is incompatible with moe_combine_in_fp32"
+                )
+            expert_probs = torch.ones_like(permuted_probs, dtype=dispatched_input.dtype)
+            expert_output, mlp_bias = self.experts(
+                dispatched_input, tokens_per_expert, expert_probs
+            )
+            expert_output = expert_output * permuted_probs.to(expert_output.dtype).unsqueeze(-1)
+        else:
+            expert_output, mlp_bias = self.experts(
+                dispatched_input, tokens_per_expert, permuted_probs
+            )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 

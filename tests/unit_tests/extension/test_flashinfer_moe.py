@@ -50,7 +50,14 @@ def _te_grouped_mlp_spec(module=TEGroupedMLP):
 
 
 def _sequential_bf16_routed_experts(
-    hidden_states, topk_weights, w13_gate_up, w2, tokens_per_expert, *, activation_in_fp32=False
+    hidden_states,
+    topk_weights,
+    w13_gate_up,
+    w2,
+    tokens_per_expert,
+    *,
+    activation_in_fp32=False,
+    fc2_input_qdq=None,
 ):
     """Independent per-expert oracle for the grouped production surrogate."""
 
@@ -61,19 +68,54 @@ def _sequential_bf16_routed_experts(
             continue
         end = start + count
         fc1 = F.linear(hidden_states[start:end], w13_gate_up[local_expert])
-        if activation_in_fp32:
-            gate, up = fc1.float().chunk(2, dim=-1)
-            activated = (F.silu(gate) * up * topk_weights[start:end].float()).to(
-                hidden_states.dtype
+        if fc2_input_qdq is not None:
+            activation_dtype = (
+                torch.float32 if activation_in_fp32 else fc2_input_qdq.fc2_input_qdq_source_dtype
             )
+            gate, up = fc1.to(activation_dtype).chunk(2, dim=-1)
+            activated = fc2_input_qdq.qdq_fc2_input(
+                (F.silu(gate) * up).to(fc2_input_qdq.fc2_input_qdq_source_dtype)
+            )
+        elif activation_in_fp32:
+            gate, up = fc1.float().chunk(2, dim=-1)
+            activated = (F.silu(gate) * up).to(hidden_states.dtype)
         else:
             gate, up = fc1.chunk(2, dim=-1)
-            activated = (F.silu(gate) * up * topk_weights[start:end]).to(hidden_states.dtype)
-        outputs.append(F.linear(activated, w2[local_expert]))
+            activated = (F.silu(gate) * up).to(hidden_states.dtype)
+        output = F.linear(activated, w2[local_expert])
+        output = output * topk_weights[start:end].to(output.dtype)
+        outputs.append(output)
         start = end
     if not outputs:
         return torch.empty_like(hidden_states)
     return torch.cat(outputs, dim=0)
+
+
+def _decode_mxfp8_payload(data, scales):
+    rows, columns = data.shape
+    scale_bytes = scales.view(torch.uint8).reshape(rows, columns // 32)
+    expanded_scales = scale_bytes.repeat_interleave(32, dim=-1)
+    return torch.where(
+        expanded_scales == 0,
+        torch.zeros_like(data, dtype=torch.float32),
+        torch.ldexp(data.float(), expanded_scales.to(torch.int32) - 127),
+    ).to(torch.bfloat16)
+
+
+def _decode_nvfp4_payload(data, scales, per_token_scale):
+    rows, packed_columns = data.shape
+    columns = packed_columns * 2
+    e2m1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=data.device)
+    packed = data.view(torch.uint8).flatten()
+    nibbles = torch.stack((packed & 0xF, packed >> 4), dim=1).flatten()
+    values = e2m1[(nibbles & 0x7).long()] * torch.where(nibbles & 0x8 != 0, -1.0, 1.0)
+    values = values.reshape(rows, columns // 16, 16)
+    block_scales = scales.view(torch.float8_e4m3fn).float().reshape(rows, columns // 16, 1)
+    return (
+        (values * block_scales * per_token_scale.reshape(rows, 1, 1))
+        .reshape(rows, columns)
+        .to(torch.bfloat16)
+    )
 
 
 def test_flashinfer_moe_is_opt_in(monkeypatch):
@@ -106,9 +148,18 @@ def test_flashinfer_moe_selects_extension_experts_without_mutating_source(monkey
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TE grouped BF16 requires CUDA")
 @pytest.mark.parametrize(
-    "activation_in_fp32,fused_activation", [(False, False), (False, True), (True, False)]
+    "activation_in_fp32,fused_activation,fc2_input_qdq_source_dtype",
+    [
+        pytest.param(False, False, None, id="unfused-bf16"),
+        pytest.param(False, True, None, id="fused-bf16"),
+        pytest.param(True, False, None, id="activation-fp32"),
+        pytest.param(True, False, torch.bfloat16, id="activation-fp32-fc2-input-qdq"),
+        pytest.param(False, True, torch.bfloat16, id="fused-activation-fc2-input-qdq"),
+    ],
 )
-def test_te_grouped_bf16_surrogate_matches_independent_loop(activation_in_fp32, fused_activation):
+def test_te_grouped_bf16_surrogate_matches_independent_loop(
+    activation_in_fp32, fused_activation, fc2_input_qdq_source_dtype
+):
     tokens_per_expert = (0, 2, 0, 3, 0)
     num_experts = len(tokens_per_expert)
     hidden_size = 128
@@ -134,6 +185,25 @@ def test_te_grouped_bf16_surrogate_matches_independent_loop(activation_in_fp32, 
     )
     grad_output = torch.randn_like(hidden)
 
+    def make_fc2_input_qdq(seen):
+        if fc2_input_qdq_source_dtype is None:
+            return None
+
+        def qdq(source):
+            seen.append(source.detach())
+            source_bf16 = source.to(torch.bfloat16)
+            decoded = (source.float() * 8).round().div(8).to(torch.bfloat16)
+            return source_bf16 + (decoded - source_bf16).detach()
+
+        return SimpleNamespace(
+            fc2_input_qdq_source_dtype=fc2_input_qdq_source_dtype, qdq_fc2_input=qdq
+        )
+
+    actual_qdq_inputs = []
+    expected_qdq_inputs = []
+    actual_fc2_input_qdq = make_fc2_input_qdq(actual_qdq_inputs)
+    expected_fc2_input_qdq = make_fc2_input_qdq(expected_qdq_inputs)
+
     surrogate = _BF16GroupedMLPSurrogate(
         num_experts=num_experts, hidden_size=hidden_size, intermediate_size=intermediate_size
     )
@@ -145,6 +215,7 @@ def test_te_grouped_bf16_surrogate_matches_independent_loop(activation_in_fp32, 
         tokens_per_expert,
         activation_in_fp32=activation_in_fp32,
         fused_activation=fused_activation,
+        fc2_input_qdq=actual_fc2_input_qdq,
     )
     actual_inputs = (hidden, probs, *w13, *w2)
     actual_grads = torch.autograd.grad(actual, actual_inputs, grad_output, allow_unused=True)
@@ -164,6 +235,7 @@ def test_te_grouped_bf16_surrogate_matches_independent_loop(activation_in_fp32, 
         w2_ref,
         tokens_per_expert,
         activation_in_fp32=activation_in_fp32,
+        fc2_input_qdq=expected_fc2_input_qdq,
     )
     expected_inputs = (hidden_ref, probs_ref, *w13_ref, *w2_ref)
     expected_grads = torch.autograd.grad(expected, expected_inputs, grad_output, allow_unused=True)
@@ -175,6 +247,11 @@ def test_te_grouped_bf16_surrogate_matches_independent_loop(activation_in_fp32, 
     torch.testing.assert_close(actual, expected, rtol=5e-3, atol=5e-3)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=5e-3, atol=5e-3)
+    if fc2_input_qdq_source_dtype is not None:
+        assert len(actual_qdq_inputs) == 1
+        assert len(expected_qdq_inputs) == 2
+        assert actual_qdq_inputs[0].shape == (num_tokens, intermediate_size)
+        assert actual_qdq_inputs[0].dtype == fc2_input_qdq_source_dtype
     assert surrogate._fc1 is not None and surrogate._fc2 is not None
     assert all(parameter.is_meta for parameter in surrogate._fc1.op.parameters())
     assert all(parameter.is_meta for parameter in surrogate._fc2.op.parameters())
@@ -196,7 +273,7 @@ def test_te_grouped_bf16_surrogate_matches_independent_loop(activation_in_fp32, 
         pytest.param("nvfp4", True, True, 128, id="nvfp4-4over6-e4m3-256"),
     ],
 )
-def test_flashinfer_dequantizes_forward_activation_payload(
+def test_flashinfer_activation_payload_qdq(
     monkeypatch, quantization, use_4over6, use_256, hidden_size
 ):
     torch.manual_seed(123)
@@ -207,13 +284,7 @@ def test_flashinfer_dequantizes_forward_activation_payload(
 
         data, scales = mxfp8_quantize(hidden, False, backend="cute-dsl")
         actual = _FlashInferMXFP8Runner.dequantize_activation(data, scales, dtype=torch.bfloat16)
-        scale_bytes = scales.view(torch.uint8).reshape(33, hidden_size // 32)
-        expanded_scales = scale_bytes.repeat_interleave(32, dim=-1)
-        expected = torch.where(
-            expanded_scales == 0,
-            torch.zeros_like(data, dtype=torch.float32),
-            torch.ldexp(data.float(), expanded_scales.to(torch.int32) - 127),
-        ).to(torch.bfloat16)
+        expected = _decode_mxfp8_payload(data, scales)
     else:
         from flashinfer import SfLayout, nvfp4_quantize
 
@@ -243,23 +314,25 @@ def test_flashinfer_dequantizes_forward_activation_payload(
             e4m3_max=e4m3_max,
             use_4over6=use_4over6,
         )
-        e2m1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device="cuda")
-        packed = data.view(torch.uint8).flatten()
-        nibbles = torch.stack((packed & 0xF, packed >> 4), dim=1).flatten()
-        values = e2m1[(nibbles & 0x7).long()] * torch.where(nibbles & 0x8 != 0, -1.0, 1.0)
-        values = values.reshape(33, hidden_size // 16, 16)
-        block_scales = scales.view(torch.float8_e4m3fn).float().reshape(33, hidden_size // 16, 1)
-        expected = (
-            (values * block_scales * per_token_scale.reshape(33, 1, 1))
-            .reshape_as(hidden)
-            .to(torch.bfloat16)
-        )
+        expected = _decode_nvfp4_payload(data, scales, per_token_scale)
 
     # TE's 4-over-6 decoder may choose a different BF16 multiply order than
     # this explicit payload formula; the observed discrepancy is at most one
     # BF16 rounding step. Standard MXFP8 and NVFP4 remain bitwise checks.
     rtol = 0.005 if quantization == "nvfp4" and use_4over6 else 0
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=0)
+
+    runner = _FlashInferMXFP8Runner if quantization == "mxfp8" else _FlashInferNVFP4Runner
+    source_dtype = runner.fc2_input_qdq_source_dtype
+    assert source_dtype is torch.bfloat16
+    source = hidden.detach().requires_grad_(True)
+    actual_qdq = runner.qdq_fc2_input(source)
+
+    assert actual_qdq.dtype == torch.bfloat16
+    torch.testing.assert_close(actual_qdq, expected, rtol=rtol, atol=0)
+    grad_output = torch.randn_like(actual_qdq)
+    torch.autograd.backward(actual_qdq, grad_output)
+    torch.testing.assert_close(source.grad, grad_output.to(source_dtype), rtol=0, atol=0)
 
 
 def _set_nvfp4_4over6_env(monkeypatch, *, flashinfer=False):
@@ -900,6 +973,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             _distributed_routing_ids(rank, world_size, num_tokens, num_experts, top_k), num_experts
         )
 
+        monkeypatch.setenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", "1")
         high_precision_reference = _run_distributed_layer_once(
             high_precision_reference_layer,
             hidden_seed,
@@ -909,6 +983,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             layer_no=precision_case.layer_no,
             backward_mode=HIGH_PRECISION_BACKWARD,
         )
+        monkeypatch.setenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", "0")
         high_precision = _run_distributed_layer_once(
             high_precision_layer,
             hidden_seed,
@@ -918,6 +993,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             layer_no=precision_case.layer_no,
             backward_mode=HIGH_PRECISION_BACKWARD,
         )
+        monkeypatch.setenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", "1")
         dequantized_reference = _run_distributed_layer_once(
             dequantized_reference_layer,
             hidden_seed,
@@ -927,6 +1003,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             layer_no=precision_case.layer_no,
             backward_mode=DEQUANTIZED_BACKWARD,
         )
+        monkeypatch.setenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", "0")
         dequantized = _run_distributed_layer_once(
             dequantized_layer,
             hidden_seed,
@@ -967,6 +1044,9 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         )
         dequantized_forward_rel_l2 = _global_relative_l2(
             (dequantized.output,), (dequantized_reference.output,)
+        )
+        backward_mode_forward_rel_l2 = _global_relative_l2(
+            (dequantized.output,), (high_precision.output,)
         )
 
         def per_token_forward_rel_l2(actual, expected):
@@ -1018,6 +1098,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         metrics = (
             high_precision_forward_rel_l2,
             dequantized_forward_rel_l2,
+            backward_mode_forward_rel_l2,
             high_precision_per_token_rel_l2,
             dequantized_per_token_rel_l2,
             hidden_grad_rel_l2,
@@ -1090,6 +1171,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
     (
         high_precision_forward_rel_l2,
         dequantized_forward_rel_l2,
+        backward_mode_forward_rel_l2,
         high_precision_per_token_rel_l2,
         dequantized_per_token_rel_l2,
         hidden_grad_rel_l2,
@@ -1108,6 +1190,7 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             f"dispatcher={moe_token_dispatcher_type}, num_tokens={num_tokens}, top_k={top_k}, "
             f"high_precision_forward_rel_l2={high_precision_forward_rel_l2:.6f}, "
             f"dequantized_forward_rel_l2={dequantized_forward_rel_l2:.6f}, "
+            f"backward_mode_forward_rel_l2={backward_mode_forward_rel_l2:.6f}, "
             f"high_precision_per_token_rel_l2={high_precision_per_token_rel_l2:.6f}, "
             f"dequantized_per_token_rel_l2={dequantized_per_token_rel_l2:.6f}, "
             f"hidden_grad_rel_l2={hidden_grad_rel_l2:.6f}, "
@@ -1123,9 +1206,15 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
     numerical_tolerances = {
         # (global forward, per-token forward), then
         # (hidden, router, parameter) gradients for each backward mode.
-        "bf16": ((0.010, 0.012), (0.005, 0.001, 0.001), (0.005, 0.001, 0.001)),
-        "mxfp8": ((0.050, 0.075), (0.055, 0.070, 0.060), (0.005, 0.001, 0.025)),
-        "nvfp4": ((0.050, 0.085), (0.170, 0.220, 0.190), (0.010, 0.010, 0.075)),
+        # Both implementations use output-side routing. For quantized execution,
+        # that also aligns their FC2-input QDQ boundary. Tolerances still account
+        # for independent grouped-GEMM and fused routed-kernel implementations.
+        # Measured 8-GPU B200 dequantized maxima (hidden, router, parameter):
+        # BF16 (0.0039, 0.0019, 0.0003), MXFP8 (0.0038, 0.0002, 0.0001),
+        # NVFP4 (0.0062, 0.0387, 0.0258).
+        "bf16": ((0.010, 0.012), (0.005, 0.003, 0.001), (0.005, 0.003, 0.001)),
+        "mxfp8": ((0.050, 0.075), (0.055, 0.070, 0.060), (0.005, 0.001, 0.001)),
+        "nvfp4": ((0.050, 0.085), (0.170, 0.220, 0.190), (0.008, 0.050, 0.035)),
     }
     forward_tolerances, high_precision_tolerances, dequantized_tolerances = numerical_tolerances[
         precision_case.execution
@@ -1133,6 +1222,10 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
     forward_tolerance, per_token_forward_tolerance = forward_tolerances
     assert high_precision_forward_rel_l2 < forward_tolerance
     assert dequantized_forward_rel_l2 < forward_tolerance
+    # Separate fused-finalize launches can choose a different top-k reduction
+    # order (0.0047 max observed here), but backward operand policy must not
+    # materially change forward.
+    assert backward_mode_forward_rel_l2 < 0.006
     assert high_precision_per_token_rel_l2 < per_token_forward_tolerance
     assert dequantized_per_token_rel_l2 < per_token_forward_tolerance
     for value, tolerance in zip(

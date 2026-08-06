@@ -150,8 +150,11 @@ def _padded_linear_scales(scales: torch.Tensor, *, rows: int, scale_columns: int
         )
     padded_rows = ((rows + 127) // 128) * 128
     padded_columns = ((scale_columns + 3) // 4) * 4
+    compact = scales.view(torch.uint8).reshape(rows, scale_columns)
+    if rows == padded_rows and scale_columns == padded_columns:
+        return compact.contiguous()
     padded = torch.empty((padded_rows, padded_columns), device=scales.device, dtype=torch.uint8)
-    padded[:rows, :scale_columns].copy_(scales.view(torch.uint8).reshape(rows, scale_columns))
+    padded[:rows, :scale_columns].copy_(compact)
     return padded
 
 
@@ -177,6 +180,19 @@ def _quantized_storage_shell(storage):
     shell = object.__new__(type(storage))
     shell.__dict__.update(storage.__dict__)
     return shell
+
+
+class _QDQWithIdentityGradient(torch.autograd.Function):
+    """Use a decoded forward value while passing its gradient to the QDQ source."""
+
+    @staticmethod
+    def forward(ctx, source: torch.Tensor, decoded: torch.Tensor) -> torch.Tensor:
+        ctx.source_dtype = source.dtype
+        return decoded
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output.to(ctx.source_dtype), None
 
 
 def use_flashinfer_moe() -> bool:
@@ -652,6 +668,7 @@ class _BF16GroupedMLPSurrogate:
         *,
         activation_in_fp32: bool,
         fused_activation: bool,
+        fc2_input_qdq=None,
     ) -> torch.Tensor:
         if len(tokens_per_expert) != self.num_experts:
             raise ValueError(
@@ -678,21 +695,43 @@ class _BF16GroupedMLPSurrogate:
             with _flashinfer_nvtx_range("surrogate_fc1"):
                 fc1_output = self._fc1(hidden_states, splits, w13_gate_up)
             with _flashinfer_nvtx_range("surrogate_activation"):
-                if activation_in_fp32:
-                    activated = _MoEActivationInFP32.apply(fc1_output, topk_weights, 0.0)
+                if fc2_input_qdq is not None:
+                    activation_dtype = (
+                        torch.float32
+                        if activation_in_fp32
+                        else fc2_input_qdq.fc2_input_qdq_source_dtype
+                    )
+                    gate, up = fc1_output.to(activation_dtype).chunk(2, dim=-1)
+                    activated = (F.silu(gate) * up).to(
+                        fc2_input_qdq.fc2_input_qdq_source_dtype
+                    )
+                elif activation_in_fp32:
+                    activated = _MoEActivationInFP32.apply(
+                        fc1_output, torch.ones_like(topk_weights), 0.0
+                    )
                 elif fused_activation:
                     activated = weighted_bias_swiglu_impl(
-                        fc1_output, None, topk_weights, fp8_input_store=False
+                        fc1_output,
+                        None,
+                        torch.ones_like(topk_weights),
+                        fp8_input_store=False,
                     )
                 else:
                     gate, up = fc1_output.chunk(2, dim=-1)
-                    activated = (F.silu(gate) * up * topk_weights).to(fc1_output.dtype)
+                    activated = (F.silu(gate) * up).to(fc1_output.dtype)
+            if fc2_input_qdq is not None:
+                with _flashinfer_nvtx_range("surrogate_fc2_input_qdq"):
+                    activated = fc2_input_qdq.qdq_fc2_input(activated)
             with _flashinfer_nvtx_range("surrogate_fc2"):
-                return self._fc2(activated, splits, w2)
+                output = self._fc2(activated, splits, w2)
+            with _flashinfer_nvtx_range("surrogate_finalize"):
+                return output * topk_weights.to(output.dtype)
 
 
 class _FlashInferRunnerBase:
     """Common layer-local metadata and nonpersistent quantized-weight cache."""
+
+    fc2_input_qdq_source_dtype: torch.dtype | None = None
 
     def __init__(
         self,
@@ -737,8 +776,14 @@ class _FlashInferRunnerBase:
         *,
         activation_in_fp32: bool,
         fused_activation: bool,
+        dequantized_backward: bool,
     ) -> torch.Tensor:
         """Run the shared grouped-BF16 surrogate without retaining expert weights."""
+
+        if dequantized_backward and self.fc2_input_qdq_source_dtype is None:
+            raise NotImplementedError(
+                f"FlashInfer {self.quantization} MoE has no FC2-input QDQ implementation"
+            )
 
         return self._bf16_surrogate(
             hidden_states,
@@ -748,6 +793,14 @@ class _FlashInferRunnerBase:
             tokens_per_expert,
             activation_in_fp32=activation_in_fp32,
             fused_activation=fused_activation,
+            fc2_input_qdq=self if dequantized_backward else None,
+        )
+
+    def qdq_fc2_input(self, activation: torch.Tensor) -> torch.Tensor:
+        """Return the BF16 QDQ input consumed by surrogate FC2."""
+
+        raise NotImplementedError(
+            f"FlashInfer {self.quantization} MoE has no FC2-input QDQ implementation"
         )
 
 
@@ -874,6 +927,7 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
     """MXFP8 exact-forward adapter matching Miles and SGLang layouts."""
 
     quantization = "mxfp8"
+    fc2_input_qdq_source_dtype = torch.bfloat16
 
     @staticmethod
     @cache
@@ -920,6 +974,35 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
         if data.shape[0] == 0:
             return torch.empty_like(data, dtype=dtype)
         return cls._activation_storage(data, scales, dtype=dtype).dequantize(dtype=dtype)
+
+    @classmethod
+    def qdq_fc2_input(cls, activation: torch.Tensor) -> torch.Tensor:
+        """QDQ the configured activation output for the BF16 FC2 replay."""
+
+        if activation.dtype != cls.fc2_input_qdq_source_dtype:
+            raise TypeError(
+                "FlashInfer MXFP8 FC2-input QDQ requires activation dtype "
+                f"{cls.fc2_input_qdq_source_dtype}, got {activation.dtype}"
+            )
+        with _flashinfer_nvtx_range("surrogate_fc2_input_quantize_mxfp8"):
+            data, scales = cls._quantize_activation(activation.detach())
+        with _flashinfer_nvtx_range("surrogate_fc2_input_dequantize_mxfp8"):
+            decoded = cls.dequantize_activation(data, scales, dtype=torch.bfloat16)
+        return _QDQWithIdentityGradient.apply(activation, decoded)
+
+    @staticmethod
+    def _quantize_activation(activation: torch.Tensor):
+        """Quantize one activation with FlashInfer's rowwise MXFP8 contract."""
+
+        if activation.ndim != 2 or activation.dtype != torch.bfloat16:
+            raise TypeError(
+                "FlashInfer MXFP8 activation quantization requires a 2D BF16 tensor, "
+                f"got shape={tuple(activation.shape)}, dtype={activation.dtype}"
+            )
+        flashinfer = _flashinfer_modules()
+        return flashinfer.api.mxfp8_quantize(
+            activation.contiguous(), False, backend="cute-dsl"
+        )
 
     @staticmethod
     def _quantize_weight(weight: torch.Tensor, *, return_quantized: bool = False):
@@ -1119,9 +1202,7 @@ class _FlashInferMXFP8Runner(_FlashInferRunnerBase):
         with _flashinfer_nvtx_range("weight_prepare_mxfp8"):
             prepared = self._prepare_weights(w13_gate_up, w2, weight_key, backward_mode)
         with _flashinfer_nvtx_range("activation_quantize_mxfp8"):
-            hidden_q, hidden_sf = flashinfer.api.mxfp8_quantize(
-                hidden_states.contiguous(), False, backend="cute-dsl"
-            )
+            hidden_q, hidden_sf = self._quantize_activation(hidden_states)
             hidden_sf = hidden_sf.view(torch.uint8).reshape(
                 hidden_states.shape[0], self.hidden_size // _MXFP8_GROUP_SIZE
             )
@@ -1176,6 +1257,7 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
     """NVFP4 exact-forward adapter."""
 
     quantization = "nvfp4"
+    fc2_input_qdq_source_dtype = torch.bfloat16
 
     @staticmethod
     @cache
@@ -1263,6 +1345,57 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
             e4m3_max=e4m3_max,
             use_4over6=use_4over6,
         ).dequantize(dtype=dtype)
+
+    @classmethod
+    def qdq_fc2_input(cls, activation: torch.Tensor) -> torch.Tensor:
+        """QDQ the BF16 activation with FlashInfer's row-scaled NVFP4 contract."""
+
+        if activation.dtype != cls.fc2_input_qdq_source_dtype:
+            raise TypeError(
+                "FlashInfer NVFP4 FC2-input QDQ requires activation dtype "
+                f"{cls.fc2_input_qdq_source_dtype}, got {activation.dtype}"
+            )
+        with _flashinfer_nvtx_range("surrogate_fc2_input_quantize_nvfp4"):
+            data, scales, per_token_scale, e4m3_max, use_4over6 = cls._quantize_activation(
+                activation.detach()
+            )
+        with _flashinfer_nvtx_range("surrogate_fc2_input_dequantize_nvfp4"):
+            decoded = cls.dequantize_activation(
+                data,
+                scales,
+                per_token_scale,
+                dtype=torch.bfloat16,
+                e4m3_max=e4m3_max,
+                use_4over6=use_4over6,
+            )
+        return _QDQWithIdentityGradient.apply(activation, decoded)
+
+    @classmethod
+    def _quantize_activation(cls, activation: torch.Tensor):
+        """Quantize one BF16 activation with FlashInfer's row-scaled NVFP4 contract."""
+
+        if activation.ndim != 2 or activation.dtype != torch.bfloat16:
+            raise TypeError(
+                "FlashInfer NVFP4 activation quantization requires a 2D BF16 tensor, "
+                f"got shape={tuple(activation.shape)}, dtype={activation.dtype}"
+            )
+        flashinfer = _flashinfer_modules()
+        rows, columns = activation.shape
+        e4m3_max = int(cls._e4m3_max())
+        use_4over6 = os.environ.get("FLASHINFER_NVFP4_4OVER6") == "1"
+        input_global_scale = torch.full(
+            (1,), 1.0 / (e4m3_max * 6.0), dtype=torch.float32, device=activation.device
+        )
+        data, scales, per_token_scale = flashinfer.api.nvfp4_quantize(
+            activation.contiguous(),
+            input_global_scale,
+            sfLayout=flashinfer.api.SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cuda",
+        )
+        data = data.reshape(rows, columns // 2)
+        scales = scales.view(torch.float8_e4m3fn).reshape(rows, columns // _NVFP4_GROUP_SIZE)
+        return data, scales, per_token_scale, e4m3_max, use_4over6
 
     @staticmethod
     def _te_weight_e4m3_max() -> int:
@@ -1517,20 +1650,8 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
         with _flashinfer_nvtx_range("weight_prepare_nvfp4"):
             prepared = self._prepare_weights(w13_gate_up, w2, weight_key, backward_mode)
         with _flashinfer_nvtx_range("activation_quantize_nvfp4"):
-            e4m3_max = self._e4m3_max()
-            input_global_scale = torch.full(
-                (1,), 1.0 / (e4m3_max * 6.0), dtype=torch.float32, device=hidden_states.device
-            )
-            hidden_fp4, hidden_scales, per_token_scale = flashinfer.api.nvfp4_quantize(
-                hidden_states.contiguous(),
-                input_global_scale,
-                sfLayout=flashinfer.api.SfLayout.layout_linear,
-                per_token_activation=True,
-                backend="cuda",
-            )
-            hidden_fp4 = hidden_fp4.reshape(hidden_states.shape[0], self.hidden_size // 2)
-            hidden_scales = hidden_scales.view(torch.float8_e4m3fn).reshape(
-                hidden_states.shape[0], self.hidden_size // 16
+            (hidden_fp4, hidden_scales, per_token_scale, e4m3_max, use_4over6) = (
+                self._quantize_activation(hidden_states)
             )
         with _flashinfer_nvtx_range("kernel_input_pack_nvfp4"):
             packed_topk = _pack_topk_ids(topk_ids, topk_weights)
@@ -1580,8 +1701,8 @@ class _FlashInferNVFP4Runner(_FlashInferRunnerBase):
                     hidden_scales,
                     per_token_scale,
                     dtype=hidden_states.dtype,
-                    e4m3_max=int(e4m3_max),
-                    use_4over6=os.environ.get("FLASHINFER_NVFP4_4OVER6") == "1",
+                    e4m3_max=e4m3_max,
+                    use_4over6=use_4over6,
                 )
         return _FlashInferForwardResult(
             output=output,
@@ -1769,6 +1890,7 @@ class _FlashInferForwardBF16Backward(torch.autograd.Function):
                     ctx.tokens_per_expert,
                     activation_in_fp32=ctx.activation_in_fp32,
                     fused_activation=ctx.fused_activation,
+                    dequantized_backward=ctx.saved_quantized_operands,
                 )
 
         expert_weight_refs = (*w13_ref, *w2_ref)

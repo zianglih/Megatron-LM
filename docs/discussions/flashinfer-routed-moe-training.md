@@ -109,6 +109,22 @@ probabilities. The plugin converts those rows to a routed-kernel top-k of one;
 the model router can still use top-k greater than one because each assignment
 has already been expanded by the dispatcher.
 
+Set `MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT=1` when running native Megatron to use
+the same canonical output-side routing order as this replacement:
+
+```text
+router_prob * FC2(QDQ(SwiGLU(FC1(x))))
+```
+
+Megatron passes unit probabilities into the routed experts and applies the
+original probabilities once to their FC2 outputs before the normal dispatcher
+combine. FlashInfer already fuses that operation into its routed kernel, so the
+switch is only needed when running native Megatron. Leave it unset for the
+FlashInfer replacement to retain fused finalization. The model-neutral switch
+is independent of dispatcher and does not affect shared experts. It is
+incompatible with `moe_combine_in_fp32` so that only one mechanism owns final
+probability application.
+
 The replacement is deliberately routed-expert-only. The existing
 `shared_experts` spec is preserved without copying or replacement, and a
 FlashInfer grouped routed-expert module is rejected in that slot. Shared-expert
@@ -144,14 +160,26 @@ backward starts. Backward releases that forward-only mirror before the grouped
 BF16 replay, reducing its live-memory peak and ensuring optimizer updates
 through `param.data` cannot leave a stale mirror for the next forward.
 
-Both effective backward modes recompute a grouped BF16 SwiGLU expert graph and
-differentiate that surrogate:
+Both effective backward modes recompute a grouped BF16 SwiGLU expert graph,
+apply router weights after FC2 as FlashInfer does, and differentiate that
+surrogate:
 
 - `high_precision` saves references to the original BF16 activation and master
   parameters.
 - `dequantized` saves the compact forward activation payload and reuses BF16
   weights decoded from the quantized operands produced for that forward. It
+  also QDQ-replays FC2's BF16 input after SwiGLU for MXFP8 and NVFP4. The replay
   does not replace or mutate the BF16 master parameters.
+
+The distributed numerical comparison enables Megatron's output-side routing
+switch only while running the native TE reference, including for BF16.
+FlashInfer retains its fused output-side routing. For MXFP8 and NVFP4, this also
+aligns their forward FC2-input QDQ boundary; all cases replay the same routing
+selections. Router gradients still follow each backward contract: native
+Megatron differentiates its external scale using the actual expert output,
+while FlashInfer differentiates its selected BF16 surrogate. Numerical drift
+can therefore include that operand-policy difference as well as the independent
+grouped-GEMM and fused routed-kernel implementations.
 
 For BF16 routed execution, both model-wide settings use the original BF16
 operands because that forward produces no quantized payload.
