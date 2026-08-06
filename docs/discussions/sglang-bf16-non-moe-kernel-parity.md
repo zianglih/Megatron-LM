@@ -206,7 +206,7 @@ is expected.
 | --- | --- | --- |
 | Megatron image checkout | `4716f75475c78e2fc2c6f0d3af095f1681b770b4` | Exact `/root/Megatron-LM` revision in the requested image |
 | Megatron PR base | `50ac48e87b8a31da7330de4a03d8ae42b985d9d2` | `zianglih:megatron-miles`; descendant of the image checkout |
-| Megatron experiment | pending | `agent/sglang-bf16-kernel-parity` |
+| Megatron experiment | `6884ece52cb2` | `agent/sglang-bf16-kernel-parity` |
 | SGLang image base | `d218d6c7835307da50373f81704e61338b4e4847` | Exact `/sgl-workspace/sglang` revision from the requested image digest |
 | SGLang experiment | `ff3d9ca5a55c` | `agent/bf16-nonmoe-parity-debug`, based exactly on the image revision |
 | Miles image checkout | `43d38ada230a431845338ed913f6c3a1b5f8355d` | From the exact digest's prior validated run |
