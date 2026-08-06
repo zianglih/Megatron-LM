@@ -112,8 +112,15 @@ The requested validation image is:
 radixark/miles@sha256:d9e01378d8820afd88824c798ea628b3b6cb87a6c6911db5165ef9d98187db55
 ```
 
-The devbox is a bare 8xB200 c1 allocation in queue `hell`; c1 requires the
-8-GPU scheduling unit even though this harness uses only two GPUs.
+The devbox is `c1/infra/bf16-nonmoe-parity`, a bare 8xB200 c1 allocation in
+namespace `infra` on the default `earth` queue, without `--queue hell`. c1
+requires the 8-GPU scheduling unit even though this harness uses only two GPUs.
+
+B200 validation uses SGLang FlashInfer attention because the image's FA3
+backend rejects SM100. The harness sets
+`SGLANG_FLASHINFER_WORKSPACE_SIZE=4294967296`; the default 2 GiB planner
+workspace overflowed during the exact 8192-token scoring prefill. The SGLang
+experiment patch preserves this larger caller override.
 
 Run all ablations from the image Megatron checkout after syncing this branch:
 
@@ -150,10 +157,46 @@ metrics and matched intermediate reports.
 
 | Variant | Drop-ins | Context | Log-prob abs diff | Delta | Train/rollout KL | Delta | First useful divergence | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| `baseline` | none | 8192 | pending | - | pending | - | pending | queued |
-| `rmsnorm` | block + pre-MoE RMSNorm | 8192 | pending | pending | pending | pending | pending | queued |
-| `rmsnorm_qk` | previous + Q/K RMSNorm | 8192 | pending | pending | pending | pending | pending | queued |
-| `rmsnorm_qk_final` | previous + final RMSNorm | 8192 | pending | pending | pending | pending | pending | queued |
+| `baseline` | none | 8192 | 0.0223388672 | - | 0.0007065088 | - | Layer 0 Q-norm input: max 3.05e-5, relative L2 2.56e-7 | complete |
+| `rmsnorm` | block + pre-MoE RMSNorm | 8192 | 0.0230712891 | +0.0007324219 | 0.0008305465 | +0.0001240377 | Layer 0 Q-norm output: max 0.0703125, relative L2 0.00231965 | complete |
+| `rmsnorm_qk` | previous + Q/K RMSNorm | 8192 | 0.0213623047 | -0.0009765625 | 0.0007387963 | +0.0000322876 | Layer 0 attention output: max 0.000488281, relative L2 0.00116990 | complete |
+| `rmsnorm_qk_final` | previous + final RMSNorm | 8192 | 0.0219726562 | -0.0003662109 | 0.0007983116 | +0.0000918028 | Layer 0 attention output: max 0.000488281, relative L2 0.00116990 | complete |
+
+Run `20260806-infra-b200-v3` completed all four arms. Every arm produced its
+metric record and intermediate report; the comparator matched 36 tensors for
+the fused native baseline and 40 for each drop-in arm, with no canonical shape
+mismatches or missing expected output taps. Scalar reductions use FP64 because
+the 8K tensors are large enough for an FP32 cosine reduction to exceed one from
+accumulation error.
+
+The generated 8192-token sequence, response text, SGLang rollout log
+probabilities, and the full `[8191, 2, 8]` routed-expert replay tensor are
+byte-identical across all four arms. The route tensor SHA-256 is
+`5ba83c4a9ba4d3ff777cc62490eca49b7853f5ae2f9a097faa1757580a0ec044`, so the
+metric deltas are not caused by different samples or expert selections.
+
+The block/pre-MoE RMSNorm replacement makes the layer-0 input norm and Q-norm
+input exact, but native Q/K RMSNorm remains the next mismatch and both terminal
+metrics get worse. Adding Q/K RMSNorm makes the canonical Q/K values, post-RoPE
+values, and attention input exact; the first mismatch moves to the different
+attention kernels' output. This arm has the lowest log-probability absolute
+difference, while its KL remains slightly above baseline. Adding final RMSNorm
+improves its local final-norm output (relative L2 0.00834666 to 0.00819899 and
+exact fraction 25.55% to 31.01%) but does not improve either terminal metric
+over `rmsnorm_qk`. No arm improves both terminal metrics over baseline in this
+single deterministic sample. The layer-1 MoE output remains the worst relative
+L2 boundary, as expected for a declared non-goal.
+
+### Runtime attempt ledger
+
+- v1 used SGLang FA3 attention and stopped before training because that backend
+  rejects SM100.
+- v2 completed the first weight sync and the 8064-token generation prefill, then
+  the exact 8192-token scoring prefill overflowed FlashInfer's default 2 GiB
+  planner workspace.
+- v3 (`20260806-infra-b200-v3`) used FlashInfer attention with a 4 GiB planner
+  workspace and completed every arm, including generation, scoring, training,
+  final weight sync, and intermediate comparison.
 
 ## Intermediate taps
 
@@ -204,13 +247,13 @@ is expected.
 
 | Component | Revision | Notes |
 | --- | --- | --- |
-| Megatron image checkout | `4716f75475c78e2fc2c6f0d3af095f1681b770b4` | Exact `/root/Megatron-LM` revision in the requested image |
+| Megatron image base | `4716f75475c78e2fc2c6f0d3af095f1681b770b4` | Revision baked into the requested image |
 | Megatron PR base | `50ac48e87b8a31da7330de4a03d8ae42b985d9d2` | `zianglih:megatron-miles`; descendant of the image checkout |
-| Megatron experiment | `6884ece52cb2` | `agent/sglang-bf16-kernel-parity` |
-| SGLang image base | `d218d6c7835307da50373f81704e61338b4e4847` | Exact `/sgl-workspace/sglang` revision from the requested image digest |
-| SGLang experiment | `ff3d9ca5a55c` | `agent/bf16-nonmoe-parity-debug`, based exactly on the image revision |
-| Miles image checkout | `43d38ada230a431845338ed913f6c3a1b5f8355d` | From the exact digest's prior validated run |
-| Miles validation integration | `7e19132a4240` | `agent/bf16-nonmoe-parity-integration`; explicit input-norm live-sync alias only |
+| Validated Megatron experiment | `ec9c206d1f5e40dee2aa4f27c338b4d3367dcd2c` | Exact clean `/root/Megatron-LM` runtime head; later reporting-only commits do not change model execution |
+| SGLang image base | `d218d6c7835307da50373f81704e61338b4e4847` | Revision baked into `/sgl-workspace/sglang` |
+| SGLang experiment | `71f9ddd6c6242cbc5d5f119e82ad8a8efa2f451f` | `agent/bf16-nonmoe-parity-debug`, synced as a patch over the image-base checkout |
+| Miles image base | `43d38ada230a431845338ed913f6c3a1b5f8355d` | Revision baked into `/root/miles` |
+| Miles validation integration | `7e19132a4240996e52cbfa8be213a0d5946b1209` | `agent/bf16-nonmoe-parity-integration`, synced as a patch over the image base; explicit input-norm live-sync alias only |
 
 ## Known limitations
 

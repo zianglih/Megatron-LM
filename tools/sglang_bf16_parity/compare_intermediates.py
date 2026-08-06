@@ -28,7 +28,41 @@ def _layer_taps(layer: int) -> tuple[str, ...]:
 
 
 TAP_SEQUENCE = _layer_taps(0) + _layer_taps(1) + ("final_rmsnorm",)
-TAP_ORDER = {name: index for index, name in enumerate(TAP_SEQUENCE)}
+
+
+def _layer_tap_order(layer: int) -> tuple[tuple[str, str], ...]:
+    prefix = f"layer_{layer}"
+    return (
+        (f"{prefix}.layer", "input"),
+        (f"{prefix}.input_rmsnorm", "input"),
+        (f"{prefix}.input_rmsnorm", "output"),
+        (f"{prefix}.qkv", "input"),
+        (f"{prefix}.qkv", "output"),
+        (f"{prefix}.q_rmsnorm", "input"),
+        (f"{prefix}.q_rmsnorm", "output"),
+        (f"{prefix}.k_rmsnorm", "input"),
+        (f"{prefix}.k_rmsnorm", "output"),
+        (f"{prefix}.q_after_rope", "output"),
+        (f"{prefix}.k_after_rope", "output"),
+        (f"{prefix}.value", "output"),
+        (f"{prefix}.attention_core", "input"),
+        (f"{prefix}.attention_core", "output"),
+        (f"{prefix}.attention_output_projection", "input"),
+        (f"{prefix}.attention_output_projection", "output"),
+        (f"{prefix}.pre_mlp_rmsnorm", "input"),
+        (f"{prefix}.pre_mlp_rmsnorm", "output"),
+        (f"{prefix}.moe_boundary", "input"),
+        (f"{prefix}.moe_boundary", "output"),
+        (f"{prefix}.layer", "output"),
+    )
+
+
+TAP_PHASE_SEQUENCE = (
+    _layer_tap_order(0)
+    + _layer_tap_order(1)
+    + (("final_rmsnorm", "input"), ("final_rmsnorm", "output"))
+)
+TAP_ORDER = {key: index for index, key in enumerate(TAP_PHASE_SEQUENCE)}
 
 # Input RMSNorm is fused into the baseline TE QKV module, so it participates in
 # ordering whenever exposed by an ablation but is not required in every arm.
@@ -72,17 +106,24 @@ def _align(left: torch.Tensor, right: torch.Tensor) -> tuple[torch.Tensor, torch
 
 def _metrics(left: torch.Tensor, right: torch.Tensor) -> dict[str, float]:
     left, right = _align(left, right)
-    diff = right - left
-    left_norm = torch.linalg.vector_norm(left)
-    denominator = max(float(left_norm), torch.finfo(torch.float32).tiny)
-    cosine = torch.nn.functional.cosine_similarity(left.reshape(1, -1), right.reshape(1, -1))
+    # These tensors contain tens of millions of elements at 8K context. FP32
+    # reductions can accumulate enough error to report an impossible cosine
+    # above one, so use FP64 for the scalar diagnostics.
+    left64 = left.double()
+    right64 = right.double()
+    diff64 = right64 - left64
+    left_norm = float(torch.linalg.vector_norm(left64))
+    right_norm = float(torch.linalg.vector_norm(right64))
+    denominator = max(left_norm, torch.finfo(torch.float64).tiny)
+    cosine_denominator = max(left_norm * right_norm, torch.finfo(torch.float64).tiny)
+    cosine = float(torch.dot(left64.reshape(-1), right64.reshape(-1))) / cosine_denominator
     return {
-        "max_abs": float(diff.abs().max()),
-        "mean_abs": float(diff.abs().mean()),
-        "rms_abs": float(diff.square().mean().sqrt()),
-        "rel_l2": float(torch.linalg.vector_norm(diff)) / denominator,
-        "cosine": float(cosine),
-        "exact_fraction": float((left == right).float().mean()),
+        "max_abs": float(diff64.abs().max()),
+        "mean_abs": float(diff64.abs().mean()),
+        "rms_abs": float(diff64.square().mean().sqrt()),
+        "rel_l2": float(torch.linalg.vector_norm(diff64)) / denominator,
+        "cosine": min(1.0, max(-1.0, cosine)),
+        "exact_fraction": int((left == right).sum()) / left.numel(),
     }
 
 
@@ -167,9 +208,9 @@ def compare(left_root: Path, right_root: Path) -> dict:
     ordered = sorted(
         compared,
         key=lambda record: (
-            TAP_ORDER.get(record["name"], len(TAP_ORDER)),
-            0 if record["phase"] == "input" else 1,
+            TAP_ORDER.get((record["name"], record["phase"]), len(TAP_ORDER)),
             record["name"],
+            record["phase"],
         ),
     )
     nonzero = [record for record in ordered if record["max_abs"] > 0]
