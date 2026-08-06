@@ -83,7 +83,7 @@ def test_selected_specs_change_only_non_moe_norm_boundaries(enabled, monkeypatch
     Utils.fake_initialize_model_parallel()
     try:
         original = get_gpt_decoder_block_spec(
-            config, use_transformer_engine=True, normalization="RMSNorm"
+            config, use_transformer_engine=True, normalization="RMSNorm", pp_rank=0
         )
         selection = resolve_sglang_bf16_kernel_selection(enabled)
         monkeypatch.setenv("MILES_SGLANG_BF16_KERNELS", enabled)
@@ -161,20 +161,32 @@ def test_explicit_input_norm_preserves_sharded_checkpoint_keys(monkeypatch):
     Utils.initialize_model_parallel(1, 1)
     try:
         native_block = get_gpt_decoder_block_spec(
-            config, use_transformer_engine=True, normalization="RMSNorm"
+            config, use_transformer_engine=True, normalization="RMSNorm", pp_rank=0
         )
         monkeypatch.setenv("MILES_SGLANG_BF16_KERNELS", "rmsnorm")
         drop_in_block = maybe_replace_sglang_bf16_kernel_specs(config, native_block)
         native_layer = TransformerLayer(config, native_block.layer_specs[0].submodules)
         drop_in_layer = TransformerLayer(config, drop_in_block.layer_specs[0].submodules)
-        native_keys = set(native_layer.sharded_state_dict())
-        drop_in_keys = set(drop_in_layer.sharded_state_dict())
+        native_state = native_layer.sharded_state_dict()
+        drop_in_state = drop_in_layer.sharded_state_dict()
     finally:
         Utils.destroy_model_parallel()
 
+    from megatron.core.dist_checkpointing import ShardedTensor
+
+    native_keys = {
+        value.key for value in native_state.values() if isinstance(value, ShardedTensor)
+    }
+    drop_in_keys = {
+        value.key for value in drop_in_state.values() if isinstance(value, ShardedTensor)
+    }
     assert native_keys == drop_in_keys
     assert "self_attention.linear_qkv.layer_norm_weight" in drop_in_keys
     assert "input_layernorm.weight" not in drop_in_keys
+    assert (
+        drop_in_state["input_layernorm.weight"].key
+        == "self_attention.linear_qkv.layer_norm_weight"
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
