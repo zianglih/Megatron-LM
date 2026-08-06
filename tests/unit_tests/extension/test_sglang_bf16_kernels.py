@@ -69,20 +69,27 @@ def test_unset_selection_is_an_identity_without_importing_sglang(monkeypatch):
 )
 def test_selected_specs_change_only_non_moe_norm_boundaries(enabled, monkeypatch):
     pytest.importorskip("sglang.srt.batch_invariant_ops")
+    from megatron.core import parallel_state
     from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
     from miles_megatron_plugins.sglang_bf16_kernels.rms_norm import (
         SGLangBF16FinalRMSNorm,
         SGLangBF16QKRMSNorm,
         SGLangBF16RMSNorm,
     )
+    from tests.unit_tests.test_utilities import Utils
 
     config = _config()
-    original = get_gpt_decoder_block_spec(
-        config, use_transformer_engine=True, normalization="RMSNorm"
-    )
-    selection = resolve_sglang_bf16_kernel_selection(enabled)
-    monkeypatch.setenv("MILES_SGLANG_BF16_KERNELS", enabled)
-    replaced = maybe_replace_sglang_bf16_kernel_specs(config, original)
+    parallel_state.destroy_model_parallel()
+    Utils.fake_initialize_model_parallel()
+    try:
+        original = get_gpt_decoder_block_spec(
+            config, use_transformer_engine=True, normalization="RMSNorm"
+        )
+        selection = resolve_sglang_bf16_kernel_selection(enabled)
+        monkeypatch.setenv("MILES_SGLANG_BF16_KERNELS", enabled)
+        replaced = maybe_replace_sglang_bf16_kernel_specs(config, original)
+    finally:
+        parallel_state.destroy_model_parallel()
 
     assert replaced is not original
     assert len(replaced.layer_specs) == len(original.layer_specs) == 2
@@ -141,6 +148,7 @@ def test_explicit_input_norm_preserves_sharded_checkpoint_keys(monkeypatch):
         moe_ffn_hidden_size=64,
         num_moe_experts=2,
         moe_router_topk=1,
+        moe_router_pre_softmax=True,
         moe_grouped_gemm=True,
         qk_layernorm=True,
         normalization="RMSNorm",
@@ -150,14 +158,13 @@ def test_explicit_input_norm_preserves_sharded_checkpoint_keys(monkeypatch):
         use_cpu_initialization=True,
         perform_initialization=False,
     )
-    native_block = get_gpt_decoder_block_spec(
-        config, use_transformer_engine=True, normalization="RMSNorm"
-    )
-    monkeypatch.setenv("MILES_SGLANG_BF16_KERNELS", "rmsnorm")
-    drop_in_block = maybe_replace_sglang_bf16_kernel_specs(config, native_block)
-
     Utils.initialize_model_parallel(1, 1)
     try:
+        native_block = get_gpt_decoder_block_spec(
+            config, use_transformer_engine=True, normalization="RMSNorm"
+        )
+        monkeypatch.setenv("MILES_SGLANG_BF16_KERNELS", "rmsnorm")
+        drop_in_block = maybe_replace_sglang_bf16_kernel_specs(config, native_block)
         native_layer = TransformerLayer(config, native_block.layer_specs[0].submodules)
         drop_in_layer = TransformerLayer(config, drop_in_block.layer_specs[0].submodules)
         native_keys = set(native_layer.sharded_state_dict())
@@ -225,7 +232,7 @@ def test_sglang_rmsnorm_forward_and_surrogate_backward(
     actual_x_grad = x.grad.detach().clone()
     actual_weight_grad = module.weight.grad.detach().clone()
 
-    reference_x = x.detach().requires_grad_(True)
+    reference_x = x.detach().contiguous().requires_grad_(True)
     reference_weight = module.weight.detach().requires_grad_(True)
     reference = _native_sglang_rms_norm(
         reference_x,
