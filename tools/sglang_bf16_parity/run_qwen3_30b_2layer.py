@@ -19,7 +19,6 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-import miles
 import miles.utils.external_utils.command_utils as U
 from safetensors import safe_open
 from transformers import AutoTokenizer
@@ -149,9 +148,9 @@ def _preflight_sglang_source(sglang_path: Path) -> dict[str, object]:
 
 
 def _preflight_miles_source(miles_path: Path) -> dict[str, object]:
-    from miles.backends.megatron_utils.megatron_to_hf.qwen3moe import convert_qwen3moe_to_hf
+    from miles.backends.megatron_utils.megatron_to_hf import qwen3moe
 
-    source = Path(miles.__file__).resolve()
+    source = Path(qwen3moe.__file__).resolve()
     expected_root = miles_path.resolve()
     if not source.is_relative_to(expected_root):
         raise RuntimeError(
@@ -165,7 +164,7 @@ def _preflight_miles_source(miles_path: Path) -> dict[str, object]:
         raise RuntimeError(f"Miles HEAD is not based on image revision {MILES_IMAGE_REVISION}")
 
     parameter = object()
-    converted = convert_qwen3moe_to_hf(
+    converted = qwen3moe.convert_qwen3moe_to_hf(
         argparse.Namespace(hidden_size=4, kv_channels=2, num_attention_heads=2, num_query_groups=1),
         "module.module.decoder.layers.0.input_layernorm.weight",
         parameter,
