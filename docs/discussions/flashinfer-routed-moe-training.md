@@ -122,8 +122,8 @@ combine. FlashInfer already fuses that operation into its routed kernel, so the
 switch is only needed when running native Megatron. Leave it unset for the
 FlashInfer replacement to retain fused finalization. The model-neutral switch
 is independent of dispatcher and does not affect shared experts. It is
-incompatible with `moe_combine_in_fp32` so that only one mechanism owns final
-probability application.
+incompatible with `moe_combine_in_fp32` and `moe_apply_probs_on_input` so that
+only one mechanism owns probability application.
 
 The replacement is deliberately routed-expert-only. The existing
 `shared_experts` spec is preserved without copying or replacement, and a
@@ -145,7 +145,7 @@ For each local routed-expert shard, the quantized forward path:
 1. reads the existing per-expert BF16 `weightN` parameters without stacking a
    second BF16 copy;
 2. quantizes through Transformer Engine using the same rowwise contracts as
-   Miles weight sync;
+   the native Megatron/TE path;
 3. adapts gate/up order and FlashInfer's shuffled weight layouts; and
 4. invokes the explicit MXFP8 or NVFP4 TRT-LLM routed kernel.
 
@@ -192,7 +192,7 @@ or QDQ-selected per-expert weights. Transformer Engine therefore owns the
 grouped forward, dgrad, and wgrad GEMMs; there is no Python loop over experts.
 
 The FP32-activation path reuses Megatron's `_MoEActivationInFP32`, and the
-fused-activation BF16 path reuses Megatron's weighted SwiGLU helper. The replay
+fused-activation BF16 path reuses Megatron's SwiGLU helper. The replay
 does not use Transformer Engine `LayerNormMLP`: dispatched expert rows require
 only the two grouped linear operations and the intervening routed activation,
 and there is no expert-local layer normalization to reproduce.
@@ -218,6 +218,7 @@ plugin-specific profiling switch or any synchronization in production code.
 - NVIDIA Blackwell (SM100 or newer)
 - BF16 master parameters and BF16 dispatched hidden states
 - plain BF16 routed execution
+- MXFP8 routed execution
 - BF16 routed execution selected by TE for first/last layers in MXFP8 and
   NVFP4 models
 - NVFP4 row-scaled activations and rowwise 1x16 weight scaling, without RHT or
@@ -240,19 +241,23 @@ another implementation.
 ## Validation
 
 The focused tests compare the grouped surrogate with an independent BF16
-expert reference, including empty local experts, the supported activation
-paths, shared-expert preservation, TE-driven runner selection, and explicit
-acceptance and rejection of the supported NVFP4 recipe. The
-distributed numerical test exercises plain BF16, both quantizations, BF16
-boundary-layer execution, both Megatron dispatchers, and both backward operand
-settings.
+expert reference, cover the supported activation-QDQ payloads, and verify the
+opt-in expert replacement. The distributed numerical test exercises plain
+BF16, both quantizations, BF16 boundary-layer execution, both Megatron
+dispatchers, and both backward operand settings.
+
+The cleanup was validated on a bare 8xB200 devbox using
+`radixark/miles:dev-202608041247` and the image's editable
+`/root/Megatron-LM`, without installing or reinstalling packages. The focused
+suite reported `10 passed, 20 skipped`; the skipped cases require exactly eight
+torchrun ranks. The eight-rank matrix reported `20 passed`.
 
 For its 4,096-token quantized MXFP8 and NVFP4 cases, the distributed test also
 emits non-gating performance diagnostics. It routes assignments evenly across
 all experts, warms up both dispatchers, and runs six uninstrumented timed steps
 per dispatcher in alternating `allgather`/`alltoall` order. It reports every
-synchronized max-rank sample, median/min/max end-to-end forward-and-backward
-latency, cross-rank skew, global token and routed-assignment throughput, and the
+synchronized max-rank sample, median end-to-end forward-and-backward latency,
+median cross-rank skew, global token and routed-assignment throughput, and the
 direct latency ratio. One excluded replay per dispatcher then enables
 Megatron's NVTX profiling so the production ranges above can be inspected in
 Nsight without contaminating the reported timing. These diagnostics have no
@@ -273,10 +278,9 @@ python3 -m torch.distributed.run --standalone --nproc_per_node=8 \
   -k test_flashinfer_routed_forward_and_surrogate_backward
 ```
 
-`tests/manual_tests/flashinfer_moe_backward_profile.py` can measure end-to-end
-step latency and CUDA memory for the dispatcher, quantization, backward-mode,
-and outstanding-forward configuration under review. Its existing MXFP8 and
-NVFP4 cases explicitly enter Megatron's layer-scoped quantization context, so
-they measure quantized execution rather than the BF16 boundary runner. No
-single-run performance or memory result is treated as a guarantee in this
-design discussion.
+The distributed test is also the performance harness: its production NVTX
+replays expose the same fine-grained ranges as training, while the
+uninstrumented samples print end-to-end dispatcher latency and throughput. In
+this validation run, the balanced 4,096-token cases measured all-to-all
+speedups of `1.205x` for MXFP8 and `1.194x` for NVFP4. These are diagnostic
+samples, not performance guarantees.

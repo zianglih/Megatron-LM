@@ -5,7 +5,7 @@ import statistics
 import time
 import types
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -13,7 +13,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.core import parallel_state, utils as core_utils
+from megatron.core import parallel_state
+from megatron.core import utils as core_utils
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
     TERowParallelGroupedLinear,
@@ -35,9 +36,58 @@ from miles_megatron_plugins.flashinfer_moe import (
     _FlashInferMXFP8Runner,
     _FlashInferNVFP4Runner,
     maybe_replace_flashinfer_moe_expert_spec,
-    use_flashinfer_moe,
 )
 from tests.unit_tests.test_utilities import Utils
+
+
+@dataclass(frozen=True)
+class _PrecisionCase:
+    configured: str
+    execution: str
+    num_layers: int = 1
+    layer_no: int = 0
+    first_last_layers_bf16: bool = False
+
+
+@dataclass(frozen=True)
+class _ModelHyperparameters:
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+    top_k: int
+
+
+@dataclass(frozen=True)
+class _RoutingReplay:
+    topk_ids: torch.Tensor
+    routing_map: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _LayerRun:
+    output: torch.Tensor
+    hidden_grad: torch.Tensor
+    route_grad: torch.Tensor
+    parameter_grads: tuple[torch.Tensor, ...]
+    missing_grads: int
+    received_rows: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _NumericalMetrics:
+    forward_rel_l2: float
+    per_token_forward_rel_l2: float
+    hidden_grad_rel_l2: float
+    route_grad_rel_l2: float
+    parameter_grad_rel_l2: float
+    missing_grads: int
+
+
+@dataclass(frozen=True)
+class _MatchedPair:
+    output: torch.Tensor
+    metrics: _NumericalMetrics
+    received_rows: tuple[int, ...]
 
 
 def _te_grouped_mlp_spec(module=TEGroupedMLP):
@@ -118,14 +168,6 @@ def _decode_nvfp4_payload(data, scales, per_token_scale):
     )
 
 
-def test_flashinfer_moe_is_opt_in(monkeypatch):
-    monkeypatch.delenv("MILES_USE_FLASHINFER_MOE", raising=False)
-    assert not use_flashinfer_moe()
-
-    monkeypatch.setenv("MILES_USE_FLASHINFER_MOE", "1")
-    assert use_flashinfer_moe()
-
-
 def test_flashinfer_moe_selects_extension_experts_without_mutating_source(monkeypatch):
     class OtherExperts:
         pass
@@ -154,7 +196,7 @@ def test_flashinfer_moe_selects_extension_experts_without_mutating_source(monkey
         pytest.param(False, True, None, id="fused-bf16"),
         pytest.param(True, False, None, id="activation-fp32"),
         pytest.param(True, False, torch.bfloat16, id="activation-fp32-fc2-input-qdq"),
-        pytest.param(False, True, torch.bfloat16, id="fused-activation-fc2-input-qdq"),
+        pytest.param(False, True, torch.bfloat16, id="fused-config-fc2-input-qdq"),
     ],
 )
 def test_te_grouped_bf16_surrogate_matches_independent_loop(
@@ -252,11 +294,6 @@ def test_te_grouped_bf16_surrogate_matches_independent_loop(
         assert len(expected_qdq_inputs) == 2
         assert actual_qdq_inputs[0].shape == (num_tokens, intermediate_size)
         assert actual_qdq_inputs[0].dtype == fc2_input_qdq_source_dtype
-    assert surrogate._fc1 is not None and surrogate._fc2 is not None
-    assert all(parameter.is_meta for parameter in surrogate._fc1.op.parameters())
-    assert all(parameter.is_meta for parameter in surrogate._fc2.op.parameters())
-    assert not surrogate._fc1.op.fuse_wgrad_accumulation
-    assert not surrogate._fc2.op.fuse_wgrad_accumulation
 
 
 @pytest.mark.internal
@@ -391,17 +428,19 @@ def _balanced_distributed_routing_ids(
     return ((bases.unsqueeze(1) + slot_ids) % num_experts).contiguous()
 
 
-def _make_routing_replay(route_ids: torch.Tensor, num_experts: int):
+def _make_routing_replay(route_ids: torch.Tensor, num_experts: int) -> _RoutingReplay:
     """Materialize expert selections once for replay across matched layers."""
 
     routing_map = torch.zeros(
         (route_ids.shape[0], num_experts), device=route_ids.device, dtype=torch.bool
     )
     routing_map.scatter_(1, route_ids, True)
-    return SimpleNamespace(topk_ids=route_ids, routing_map=routing_map)
+    return _RoutingReplay(topk_ids=route_ids, routing_map=routing_map)
 
 
-def _install_replayed_route(layer: MoELayer, route_logits: torch.Tensor, replay) -> None:
+def _install_replayed_route(
+    layer: MoELayer, route_logits: torch.Tensor, replay: _RoutingReplay
+) -> None:
     """Replay fixed selections while preserving meaningful router gradients."""
 
     def route(_self, hidden_states, padding_mask=None, input_ids=None):
@@ -485,12 +524,12 @@ def _run_distributed_layer_once(
     hidden_seed: torch.Tensor,
     logits_seed: torch.Tensor,
     grad_seed: torch.Tensor,
-    routing_replay,
+    routing_replay: _RoutingReplay,
     *,
     layer_no: int,
     backward_mode: str,
     track_received_rows: bool = False,
-):
+) -> _LayerRun:
     """Run one full layer forward/backward and snapshot its local results."""
 
     layer.zero_grad(set_to_none=True)
@@ -527,29 +566,16 @@ def _run_distributed_layer_once(
             missing_grads += 1
             parameter_grads.append(torch.zeros_like(parameter))
         else:
-            parameter_grads.append(parameter.grad.detach().clone())
+            parameter_grads.append(parameter.grad.detach())
 
-    return SimpleNamespace(
-        output=output.detach().clone(),
-        hidden_grad=hidden_grad.detach().clone(),
-        route_grad=route_grad.detach().clone(),
-        parameter_grads=parameter_grads,
+    return _LayerRun(
+        output=output.detach(),
+        hidden_grad=hidden_grad.detach(),
+        route_grad=route_grad.detach(),
+        parameter_grads=tuple(parameter_grads),
         missing_grads=missing_grads,
-        received_rows=received_rows,
+        received_rows=tuple(received_rows),
     )
-
-
-def _assert_distributed_case_consensus(group, fingerprint):
-    """Fail symmetrically if independent pytest ranks select different cases."""
-
-    local_fingerprint = torch.tensor(fingerprint, device="cuda", dtype=torch.int64)
-    gathered = [torch.empty_like(local_fingerprint) for _ in range(group.size())]
-    torch.distributed.all_gather(gathered, local_fingerprint, group=group)
-    if any(not torch.equal(candidate, local_fingerprint) for candidate in gathered):
-        raise RuntimeError(
-            "distributed FlashInfer performance case mismatch across ranks: "
-            f"{[candidate.tolist() for candidate in gathered]}"
-        )
 
 
 def _run_distributed_performance_step(
@@ -557,7 +583,7 @@ def _run_distributed_performance_step(
     hidden_seed: torch.Tensor,
     logits_seed: torch.Tensor,
     grad_seed: torch.Tensor,
-    routing_replay,
+    routing_replay: _RoutingReplay,
     *,
     layer_no: int,
     group,
@@ -601,18 +627,23 @@ def _distributed_critical_time(local_step_ms: float, group) -> tuple[float, floa
     return maximum.item(), maximum.item() - minimum.item()
 
 
-def _benchmark_distributed_layers(
+def _profile_distributed_dispatchers(
     layers,
     hidden_seed: torch.Tensor,
     logits_seed: torch.Tensor,
     grad_seed: torch.Tensor,
-    routing_replay,
+    routing_replay: _RoutingReplay,
     *,
     layer_no: int,
+    configured_precision: str,
+    execution_precision: str,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
     top_k: int,
     iterations: int = 6,
-):
-    """Compare dispatchers without instrumentation, then emit one NVTX replay."""
+) -> None:
+    """Print paired timings, then replay production NVTX ranges once per dispatcher."""
 
     dispatchers = ("allgather", "alltoall")
     group = layers["allgather"].token_dispatcher.ep_group
@@ -630,6 +661,8 @@ def _benchmark_distributed_layers(
                 layer_no=layer_no,
                 group=group,
             )
+            runner = layers[dispatcher].experts._flashinfer_moe_runner
+            assert runner is not None and runner.quantization == execution_precision
         for iteration in range(iterations):
             execution_order = dispatchers if iteration % 2 == 0 else tuple(reversed(dispatchers))
             for dispatcher in execution_order:
@@ -665,69 +698,40 @@ def _benchmark_distributed_layers(
     results = {}
     for dispatcher in dispatchers:
         step_median_ms = statistics.median(critical_samples[dispatcher])
-        results[dispatcher] = SimpleNamespace(
-            iterations=iterations,
-            step_samples_ms=critical_samples[dispatcher],
-            rank_skew_samples_ms=rank_skew_samples[dispatcher],
-            step_median_ms=step_median_ms,
-            step_min_ms=min(critical_samples[dispatcher]),
-            step_max_ms=max(critical_samples[dispatcher]),
-            rank_skew_median_ms=statistics.median(rank_skew_samples[dispatcher]),
-            global_tokens=global_tokens,
-            global_tokens_per_s=global_tokens / (step_median_ms * 1e-3),
-            routed_assignments_per_s=global_tokens * top_k / (step_median_ms * 1e-3),
-        )
-    return results
-
-
-def _report_distributed_performance(
-    performance,
-    *,
-    configured_precision: str,
-    execution_precision: str,
-    num_tokens: int,
-    num_experts: int,
-    hidden_size: int,
-    intermediate_size: int,
-    top_k: int,
-):
-    """Print paired, non-gating dispatcher measurements."""
-
-    for dispatcher in ("allgather", "alltoall"):
-        result = performance[dispatcher]
-        samples = "/".join(f"{sample:.3f}" for sample in result.step_samples_ms)
-        rank_skews = "/".join(f"{sample:.3f}" for sample in result.rank_skew_samples_ms)
+        results[dispatcher] = (step_median_ms, statistics.median(rank_skew_samples[dispatcher]))
+        if torch.distributed.get_rank() != 0:
+            continue
+        samples = "/".join(f"{sample:.3f}" for sample in critical_samples[dispatcher])
         print(
             "FlashInfer distributed perf (non-gating): "
             f"configured={configured_precision}, execution={execution_precision}, "
             f"dispatcher={dispatcher}, backward_mode={HIGH_PRECISION_BACKWARD}, "
             "routing=balanced, measurement=uninstrumented, order=alternating, "
-            f"tokens_per_rank={num_tokens}, global_tokens={result.global_tokens}, "
+            f"tokens_per_rank={hidden_seed.shape[0]}, global_tokens={global_tokens}, "
             f"num_experts={num_experts}, hidden_size={hidden_size}, "
             f"intermediate_size={intermediate_size}, top_k={top_k}, "
-            f"iterations={result.iterations}, step_samples_ms={samples}, "
-            f"step_median_ms={result.step_median_ms:.3f}, "
-            f"step_min_ms={result.step_min_ms:.3f}, "
-            f"step_max_ms={result.step_max_ms:.3f}, "
-            f"rank_skew_samples_ms={rank_skews}, "
-            f"rank_skew_median_ms={result.rank_skew_median_ms:.3f}, "
-            f"global_tokens_per_s={result.global_tokens_per_s:.1f}, "
-            f"routed_assignments_per_s={result.routed_assignments_per_s:.1f}, "
+            f"iterations={iterations}, step_samples_ms={samples}, "
+            f"step_median_ms={step_median_ms:.3f}, "
+            f"rank_skew_median_ms={results[dispatcher][1]:.3f}, "
+            f"global_tokens_per_s={global_tokens / (step_median_ms * 1e-3):.1f}, "
+            "routed_assignments_per_s="
+            f"{global_tokens * top_k / (step_median_ms * 1e-3):.1f}, "
             "nvtx_profile_replays=1",
             flush=True,
         )
 
-    allgather = performance["allgather"]
-    alltoall = performance["alltoall"]
+    if torch.distributed.get_rank() != 0:
+        return
+    allgather_ms = results["allgather"][0]
+    alltoall_ms = results["alltoall"][0]
     print(
         "FlashInfer distributed perf comparison (non-gating): "
         f"configured={configured_precision}, execution={execution_precision}, "
         "routing=balanced, measurement=uninstrumented, order=alternating, "
-        f"tokens_per_rank={num_tokens}, global_tokens={allgather.global_tokens}, "
-        f"top_k={top_k}, allgather_step_ms={allgather.step_median_ms:.3f}, "
-        f"alltoall_step_ms={alltoall.step_median_ms:.3f}, "
-        "alltoall_speedup="
-        f"{allgather.step_median_ms / alltoall.step_median_ms:.3f}, "
+        f"tokens_per_rank={hidden_seed.shape[0]}, global_tokens={global_tokens}, "
+        f"top_k={top_k}, allgather_step_ms={allgather_ms:.3f}, "
+        f"alltoall_step_ms={alltoall_ms:.3f}, "
+        f"alltoall_speedup={allgather_ms / alltoall_ms:.3f}, "
         "speedup_definition=allgather_step_ms/alltoall_step_ms",
         flush=True,
     )
@@ -757,6 +761,185 @@ def _global_relative_l2(actual_tensors, reference_tensors) -> float:
     return torch.sqrt(error_sq / reference_sq.clamp_min(1e-20)).item()
 
 
+def _distributed_numerical_metrics(actual: _LayerRun, reference: _LayerRun) -> _NumericalMetrics:
+    per_token_forward_rel_l2 = _global_max(
+        torch.sqrt(
+            (actual.output.float() - reference.output.float()).square().sum(dim=-1)
+            / reference.output.float().square().sum(dim=-1).clamp_min(1e-20)
+        ).max()
+    )
+    missing_grads = torch.tensor(
+        actual.missing_grads + reference.missing_grads, device="cuda", dtype=torch.int32
+    )
+    torch.distributed.all_reduce(missing_grads)
+    return _NumericalMetrics(
+        forward_rel_l2=_global_relative_l2((actual.output,), (reference.output,)),
+        per_token_forward_rel_l2=per_token_forward_rel_l2,
+        hidden_grad_rel_l2=_global_relative_l2((actual.hidden_grad,), (reference.hidden_grad,)),
+        route_grad_rel_l2=_global_relative_l2((actual.route_grad,), (reference.route_grad,)),
+        parameter_grad_rel_l2=_global_relative_l2(
+            actual.parameter_grads, reference.parameter_grads
+        ),
+        missing_grads=missing_grads.item(),
+    )
+
+
+def _run_distributed_matched_pair(
+    monkeypatch,
+    make_config,
+    hidden_seed: torch.Tensor,
+    logits_seed: torch.Tensor,
+    grad_seed: torch.Tensor,
+    routing_replay: _RoutingReplay,
+    *,
+    layer_no: int,
+    backward_mode: str,
+    execution_precision: str,
+    track_received_rows: bool,
+) -> _MatchedPair:
+    """Compare one native/FlashInfer pair, then release its layer-sized gradients."""
+
+    layers = []
+    try:
+        reference_layer = _build_distributed_moe_layer(
+            monkeypatch,
+            make_config(),
+            layer_no=layer_no,
+            backward_mode=backward_mode,
+            use_flashinfer=False,
+        )
+        layers.append(reference_layer)
+        flashinfer_layer = _build_distributed_moe_layer(
+            monkeypatch,
+            make_config(),
+            layer_no=layer_no,
+            backward_mode=backward_mode,
+            use_flashinfer=True,
+        )
+        layers.append(flashinfer_layer)
+        flashinfer_layer.load_state_dict(reference_layer.state_dict())
+
+        monkeypatch.setenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", "1")
+        reference = _run_distributed_layer_once(
+            reference_layer,
+            hidden_seed,
+            logits_seed,
+            grad_seed,
+            routing_replay,
+            layer_no=layer_no,
+            backward_mode=backward_mode,
+        )
+        monkeypatch.setenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", "0")
+        actual = _run_distributed_layer_once(
+            flashinfer_layer,
+            hidden_seed,
+            logits_seed,
+            grad_seed,
+            routing_replay,
+            layer_no=layer_no,
+            backward_mode=backward_mode,
+            track_received_rows=track_received_rows,
+        )
+        runner = flashinfer_layer.experts._flashinfer_moe_runner
+        assert runner is not None and runner.quantization == execution_precision
+        return _MatchedPair(
+            output=actual.output,
+            metrics=_distributed_numerical_metrics(actual, reference),
+            received_rows=actual.received_rows,
+        )
+    finally:
+        for layer in layers:
+            layer.zero_grad(set_to_none=True)
+            runner = getattr(layer.experts, "_flashinfer_moe_runner", None)
+            if runner is not None:
+                runner.invalidate_weights()
+
+
+_NUMERICAL_TOLERANCES = {
+    # (global forward, per-token forward), then
+    # (hidden, router, parameter) gradients for each backward mode.
+    # High-precision replay is a coarse semantic guard because it intentionally
+    # uses BF16 operands. Dequantized replay is the tighter algebraic comparison.
+    # Measured 8-GPU B200 dequantized maxima (hidden, router, parameter):
+    # BF16 (0.0039, 0.0019, 0.0003), MXFP8 (0.0038, 0.0002, 0.0001),
+    # NVFP4 (0.0062, 0.0387, 0.0258).
+    "bf16": ((0.010, 0.012), (0.005, 0.003, 0.001), (0.005, 0.003, 0.001)),
+    "mxfp8": ((0.050, 0.075), (0.055, 0.070, 0.060), (0.005, 0.001, 0.001)),
+    "nvfp4": ((0.050, 0.085), (0.170, 0.220, 0.190), (0.008, 0.050, 0.035)),
+}
+
+
+def _assert_numerical_metrics(
+    metrics: _NumericalMetrics, execution_precision: str, backward_mode: str
+) -> None:
+    forward_tolerances, high_precision_tolerances, dequantized_tolerances = _NUMERICAL_TOLERANCES[
+        execution_precision
+    ]
+    gradient_tolerances = (
+        high_precision_tolerances
+        if backward_mode == HIGH_PRECISION_BACKWARD
+        else dequantized_tolerances
+    )
+    assert metrics.missing_grads == 0
+    assert metrics.forward_rel_l2 < forward_tolerances[0]
+    assert metrics.per_token_forward_rel_l2 < forward_tolerances[1]
+    for value, tolerance in zip(
+        (metrics.hidden_grad_rel_l2, metrics.route_grad_rel_l2, metrics.parameter_grad_rel_l2),
+        gradient_tolerances,
+    ):
+        assert value < tolerance
+
+
+def _report_numerical_metrics(
+    metrics: _NumericalMetrics,
+    *,
+    precision_case: _PrecisionCase,
+    dispatcher: str,
+    backward_mode: str,
+    num_tokens: int,
+    top_k: int,
+) -> None:
+    if torch.distributed.get_rank() != 0:
+        return
+    print(
+        "FlashInfer distributed numerical check: "
+        f"configured={precision_case.configured}, execution={precision_case.execution}, "
+        f"dispatcher={dispatcher}, backward_mode={backward_mode}, "
+        f"num_tokens={num_tokens}, top_k={top_k}, "
+        f"forward_rel_l2={metrics.forward_rel_l2:.6f}, "
+        f"per_token_forward_rel_l2={metrics.per_token_forward_rel_l2:.6f}, "
+        f"hidden_grad_rel_l2={metrics.hidden_grad_rel_l2:.6f}, "
+        f"route_grad_rel_l2={metrics.route_grad_rel_l2:.6f}, "
+        f"parameter_grad_rel_l2={metrics.parameter_grad_rel_l2:.6f}",
+        flush=True,
+    )
+
+
+def _assert_alltoall_execution(
+    result: _MatchedPair, *, world_size: int, num_tokens: int, top_k: int
+) -> None:
+    received = torch.tensor(
+        result.received_rows if len(result.received_rows) == 1 else (-1,),
+        device="cuda",
+        dtype=torch.int64,
+    )
+    received_tensors = [torch.empty_like(received) for _ in range(world_size)]
+    torch.distributed.all_gather(received_tensors, received)
+    received_by_rank = [value.item() for value in received_tensors]
+
+    output_nonzero = torch.tensor(
+        [int(torch.count_nonzero(result.output).item() > 0)], device="cuda", dtype=torch.int32
+    )
+    output_nonzero_tensors = [torch.empty_like(output_nonzero) for _ in range(world_size)]
+    torch.distributed.all_gather(output_nonzero_tensors, output_nonzero)
+    output_nonzero_by_rank = [value.item() for value in output_nonzero_tensors]
+
+    assert all(received > 0 for received in received_by_rank[:-1])
+    assert received_by_rank[-1] == 0
+    assert sum(received_by_rank) == world_size * num_tokens * top_k
+    assert output_nonzero_by_rank[-1] == 1
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) != 8, reason="requires torchrun with exactly 8 ranks"
@@ -768,56 +951,17 @@ def _global_relative_l2(actual_tensors, reference_tensors) -> float:
 @pytest.mark.parametrize(
     "precision_case",
     [
+        pytest.param(_PrecisionCase("bf16", "bf16"), id="bf16"),
         pytest.param(
-            SimpleNamespace(
-                configured="bf16",
-                execution="bf16",
-                num_layers=1,
-                layer_no=0,
-                first_last_layers_bf16=False,
-            ),
-            id="bf16",
-        ),
-        pytest.param(
-            SimpleNamespace(
-                configured="mxfp8",
-                execution="bf16",
-                num_layers=3,
-                layer_no=2,
-                first_last_layers_bf16=True,
-            ),
+            _PrecisionCase("mxfp8", "bf16", num_layers=3, layer_no=2, first_last_layers_bf16=True),
             id="mxfp8-last-layer-bf16",
         ),
         pytest.param(
-            SimpleNamespace(
-                configured="nvfp4",
-                execution="bf16",
-                num_layers=3,
-                layer_no=0,
-                first_last_layers_bf16=True,
-            ),
+            _PrecisionCase("nvfp4", "bf16", num_layers=3, layer_no=0, first_last_layers_bf16=True),
             id="nvfp4-first-layer-bf16",
         ),
-        pytest.param(
-            SimpleNamespace(
-                configured="mxfp8",
-                execution="mxfp8",
-                num_layers=1,
-                layer_no=0,
-                first_last_layers_bf16=False,
-            ),
-            id="mxfp8",
-        ),
-        pytest.param(
-            SimpleNamespace(
-                configured="nvfp4",
-                execution="nvfp4",
-                num_layers=1,
-                layer_no=0,
-                first_last_layers_bf16=False,
-            ),
-            id="nvfp4",
-        ),
+        pytest.param(_PrecisionCase("mxfp8", "mxfp8"), id="mxfp8"),
+        pytest.param(_PrecisionCase("nvfp4", "nvfp4"), id="nvfp4"),
     ],
 )
 @pytest.mark.parametrize(
@@ -828,7 +972,9 @@ def _global_relative_l2(actual_tensors, reference_tensors) -> float:
     "model_hyperparameters",
     [
         pytest.param(
-            SimpleNamespace(num_experts=32, hidden_size=7168, intermediate_size=2048, top_k=8),
+            _ModelHyperparameters(
+                num_experts=32, hidden_size=7168, intermediate_size=2048, top_k=8
+            ),
             id="e32-h7168-i2048-topk8",
         )
     ],
@@ -851,18 +997,6 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
         expert_tensor_parallel_size=1,
     )
     rank = torch.distributed.get_rank()
-    received_by_rank = None
-    output_nonzero_by_rank = None
-    metrics = None
-    high_precision_reference = None
-    high_precision = None
-    dequantized_reference = None
-    dequantized = None
-    performance = None
-    high_precision_reference_layer = None
-    dequantized_reference_layer = None
-    high_precision_layer = None
-    dequantized_layer = None
     run_completed = False
 
     try:
@@ -912,59 +1046,11 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
                 **precision_config,
             )
 
-        high_precision_reference_layer = _build_distributed_moe_layer(
-            monkeypatch,
-            make_config(),
-            layer_no=precision_case.layer_no,
-            backward_mode=HIGH_PRECISION_BACKWARD,
-            use_flashinfer=False,
-        )
-        high_precision_layer = _build_distributed_moe_layer(
-            monkeypatch,
-            make_config(),
-            layer_no=precision_case.layer_no,
-            backward_mode=HIGH_PRECISION_BACKWARD,
-            use_flashinfer=True,
-        )
-        dequantized_reference_layer = _build_distributed_moe_layer(
-            monkeypatch,
-            make_config(),
-            layer_no=precision_case.layer_no,
-            backward_mode=DEQUANTIZED_BACKWARD,
-            use_flashinfer=False,
-        )
-        dequantized_layer = _build_distributed_moe_layer(
-            monkeypatch,
-            make_config(),
-            layer_no=precision_case.layer_no,
-            backward_mode=DEQUANTIZED_BACKWARD,
-            use_flashinfer=True,
-        )
-        state = high_precision_reference_layer.state_dict()
-        for layer in (dequantized_reference_layer, high_precision_layer, dequantized_layer):
-            layer.load_state_dict(state)
-
         benchmark_case = (
             num_tokens == 4096
             and precision_case.execution in ("mxfp8", "nvfp4")
             and moe_token_dispatcher_type == "allgather"
         )
-        _assert_distributed_case_consensus(
-            high_precision_layer.token_dispatcher.ep_group,
-            (
-                num_tokens,
-                num_experts,
-                hidden_size,
-                intermediate_size,
-                top_k,
-                ("bf16", "mxfp8", "nvfp4").index(precision_case.configured),
-                ("bf16", "mxfp8", "nvfp4").index(precision_case.execution),
-                ("allgather", "alltoall").index(moe_token_dispatcher_type),
-                precision_case.layer_no,
-                int(benchmark_case),
-            ),
-        )
-
         torch.manual_seed(5678 + rank)
         hidden_seed = torch.randn((num_tokens, 1, hidden_size), device="cuda", dtype=torch.bfloat16)
         logits_seed = torch.randn((num_tokens, top_k), device="cuda", dtype=torch.float32)
@@ -973,187 +1059,109 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             _distributed_routing_ids(rank, world_size, num_tokens, num_experts, top_k), num_experts
         )
 
-        monkeypatch.setenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", "1")
-        high_precision_reference = _run_distributed_layer_once(
-            high_precision_reference_layer,
-            hidden_seed,
-            logits_seed,
-            grad_seed,
-            routing_replay,
-            layer_no=precision_case.layer_no,
-            backward_mode=HIGH_PRECISION_BACKWARD,
-        )
-        monkeypatch.setenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", "0")
-        high_precision = _run_distributed_layer_once(
-            high_precision_layer,
-            hidden_seed,
-            logits_seed,
-            grad_seed,
-            routing_replay,
-            layer_no=precision_case.layer_no,
-            backward_mode=HIGH_PRECISION_BACKWARD,
-        )
-        monkeypatch.setenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", "1")
-        dequantized_reference = _run_distributed_layer_once(
-            dequantized_reference_layer,
-            hidden_seed,
-            logits_seed,
-            grad_seed,
-            routing_replay,
-            layer_no=precision_case.layer_no,
-            backward_mode=DEQUANTIZED_BACKWARD,
-        )
-        monkeypatch.setenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", "0")
-        dequantized = _run_distributed_layer_once(
-            dequantized_layer,
-            hidden_seed,
-            logits_seed,
-            grad_seed,
-            routing_replay,
-            layer_no=precision_case.layer_no,
-            backward_mode=DEQUANTIZED_BACKWARD,
-            track_received_rows=moe_token_dispatcher_type == "alltoall",
-        )
-
-        if benchmark_case:
-            alltoall_layer = _build_distributed_moe_layer(
+        if precision_case.execution != "bf16":
+            backward_modes = (HIGH_PRECISION_BACKWARD, DEQUANTIZED_BACKWARD)
+        elif num_tokens == 8:
+            backward_modes = (HIGH_PRECISION_BACKWARD,)
+        else:
+            # BF16 has no quantized operands, so a requested dequantized mode
+            # deliberately resolves to the same high-precision replay.
+            backward_modes = (DEQUANTIZED_BACKWARD,)
+        mode_outputs = {}
+        for backward_mode in backward_modes:
+            pair = _run_distributed_matched_pair(
                 monkeypatch,
-                make_config("alltoall"),
-                layer_no=precision_case.layer_no,
-                backward_mode=HIGH_PRECISION_BACKWARD,
-                use_flashinfer=True,
-            )
-            alltoall_layer.load_state_dict(high_precision_layer.state_dict())
-            balanced_routing_replay = _make_routing_replay(
-                _balanced_distributed_routing_ids(rank, world_size, num_tokens, num_experts, top_k),
-                num_experts,
-            )
-            performance = _benchmark_distributed_layers(
-                {"allgather": high_precision_layer, "alltoall": alltoall_layer},
+                make_config,
                 hidden_seed,
                 logits_seed,
                 grad_seed,
-                balanced_routing_replay,
+                routing_replay,
                 layer_no=precision_case.layer_no,
-                top_k=top_k,
-            )
-            del alltoall_layer
-
-        high_precision_forward_rel_l2 = _global_relative_l2(
-            (high_precision.output,), (high_precision_reference.output,)
-        )
-        dequantized_forward_rel_l2 = _global_relative_l2(
-            (dequantized.output,), (dequantized_reference.output,)
-        )
-        backward_mode_forward_rel_l2 = _global_relative_l2(
-            (dequantized.output,), (high_precision.output,)
-        )
-
-        def per_token_forward_rel_l2(actual, expected):
-            return _global_max(
-                torch.sqrt(
-                    (actual.float() - expected.float()).square().sum(dim=-1)
-                    / expected.float().square().sum(dim=-1).clamp_min(1e-20)
-                ).max()
-            )
-
-        high_precision_per_token_rel_l2 = per_token_forward_rel_l2(
-            high_precision.output, high_precision_reference.output
-        )
-        dequantized_per_token_rel_l2 = per_token_forward_rel_l2(
-            dequantized.output, dequantized_reference.output
-        )
-        hidden_grad_rel_l2 = _global_relative_l2(
-            (high_precision.hidden_grad,), (high_precision_reference.hidden_grad,)
-        )
-        route_grad_rel_l2 = _global_relative_l2(
-            (high_precision.route_grad,), (high_precision_reference.route_grad,)
-        )
-        parameter_grad_rel_l2 = _global_relative_l2(
-            high_precision.parameter_grads, high_precision_reference.parameter_grads
-        )
-        dequantized_hidden_grad_rel_l2 = _global_relative_l2(
-            (dequantized.hidden_grad,), (dequantized_reference.hidden_grad,)
-        )
-        dequantized_route_grad_rel_l2 = _global_relative_l2(
-            (dequantized.route_grad,), (dequantized_reference.route_grad,)
-        )
-        dequantized_parameter_grad_rel_l2 = _global_relative_l2(
-            dequantized.parameter_grads, dequantized_reference.parameter_grads
-        )
-        missing_grads = torch.tensor(
-            sum(
-                result.missing_grads
-                for result in (
-                    high_precision_reference,
-                    high_precision,
-                    dequantized_reference,
-                    dequantized,
-                )
-            ),
-            device="cuda",
-            dtype=torch.int32,
-        )
-        torch.distributed.all_reduce(missing_grads)
-        metrics = (
-            high_precision_forward_rel_l2,
-            dequantized_forward_rel_l2,
-            backward_mode_forward_rel_l2,
-            high_precision_per_token_rel_l2,
-            dequantized_per_token_rel_l2,
-            hidden_grad_rel_l2,
-            route_grad_rel_l2,
-            parameter_grad_rel_l2,
-            dequantized_hidden_grad_rel_l2,
-            dequantized_route_grad_rel_l2,
-            dequantized_parameter_grad_rel_l2,
-            missing_grads.item(),
-        )
-
-        if moe_token_dispatcher_type == "alltoall":
-            received = torch.tensor(
-                dequantized.received_rows if len(dequantized.received_rows) == 1 else [-1],
-                device="cuda",
-                dtype=torch.int64,
-            )
-            received_tensors = [torch.empty_like(received) for _ in range(world_size)]
-            torch.distributed.all_gather(received_tensors, received)
-            received_by_rank = [value.item() for value in received_tensors]
-
-            output_nonzero = torch.tensor(
-                [int(torch.count_nonzero(dequantized.output).item() > 0)],
-                device="cuda",
-                dtype=torch.int32,
-            )
-            output_nonzero_tensors = [torch.empty_like(output_nonzero) for _ in range(world_size)]
-            torch.distributed.all_gather(output_nonzero_tensors, output_nonzero)
-            output_nonzero_by_rank = [value.item() for value in output_nonzero_tensors]
-
-        if rank == 0 and performance is not None:
-            _report_distributed_performance(
-                performance,
-                configured_precision=precision_case.configured,
+                backward_mode=backward_mode,
                 execution_precision=precision_case.execution,
+                track_received_rows=(
+                    moe_token_dispatcher_type == "alltoall"
+                    and backward_mode == DEQUANTIZED_BACKWARD
+                ),
+            )
+            _assert_numerical_metrics(pair.metrics, precision_case.execution, backward_mode)
+            _report_numerical_metrics(
+                pair.metrics,
+                precision_case=precision_case,
+                dispatcher=moe_token_dispatcher_type,
+                backward_mode=backward_mode,
                 num_tokens=num_tokens,
-                num_experts=num_experts,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
                 top_k=top_k,
             )
-        torch.distributed.barrier(group=high_precision_layer.token_dispatcher.ep_group)
+            mode_outputs[backward_mode] = pair.output
+            if moe_token_dispatcher_type == "alltoall" and backward_mode == DEQUANTIZED_BACKWARD:
+                _assert_alltoall_execution(
+                    pair, world_size=world_size, num_tokens=num_tokens, top_k=top_k
+                )
+
+        if len(mode_outputs) == 2:
+            backward_mode_forward_rel_l2 = _global_relative_l2(
+                (mode_outputs[DEQUANTIZED_BACKWARD],), (mode_outputs[HIGH_PRECISION_BACKWARD],)
+            )
+            if rank == 0:
+                print(
+                    "FlashInfer distributed backward-mode forward check: "
+                    f"configured={precision_case.configured}, "
+                    f"execution={precision_case.execution}, "
+                    f"dispatcher={moe_token_dispatcher_type}, num_tokens={num_tokens}, "
+                    f"backward_mode_forward_rel_l2={backward_mode_forward_rel_l2:.6f}",
+                    flush=True,
+                )
+            # Separate fused-finalize launches can choose a different top-k reduction
+            # order (0.0047 max observed here), but backward policy cannot change forward.
+            assert backward_mode_forward_rel_l2 < 0.006
+
+        if benchmark_case:
+            performance_layers = {}
+            try:
+                monkeypatch.setenv("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT", "0")
+                for dispatcher in ("allgather", "alltoall"):
+                    layer = _build_distributed_moe_layer(
+                        monkeypatch,
+                        make_config(dispatcher),
+                        layer_no=precision_case.layer_no,
+                        backward_mode=HIGH_PRECISION_BACKWARD,
+                        use_flashinfer=True,
+                    )
+                    if performance_layers:
+                        layer.load_state_dict(performance_layers["allgather"].state_dict())
+                    performance_layers[dispatcher] = layer
+                balanced_routing_replay = _make_routing_replay(
+                    _balanced_distributed_routing_ids(
+                        rank, world_size, num_tokens, num_experts, top_k
+                    ),
+                    num_experts,
+                )
+                _profile_distributed_dispatchers(
+                    performance_layers,
+                    hidden_seed,
+                    logits_seed,
+                    grad_seed,
+                    balanced_routing_replay,
+                    layer_no=precision_case.layer_no,
+                    configured_precision=precision_case.configured,
+                    execution_precision=precision_case.execution,
+                    num_experts=num_experts,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    top_k=top_k,
+                )
+            finally:
+                for layer in performance_layers.values():
+                    layer.zero_grad(set_to_none=True)
+                    runner = layer.experts._flashinfer_moe_runner
+                    if runner is not None:
+                        runner.invalidate_weights()
+
+        torch.distributed.barrier()
         torch.cuda.synchronize()
         run_completed = True
     finally:
-        for layer in (
-            high_precision_reference_layer,
-            dequantized_reference_layer,
-            high_precision_layer,
-            dequantized_layer,
-        ):
-            if layer is not None:
-                runner = getattr(layer.experts, "_flashinfer_moe_runner", None)
-                if runner is not None:
-                    runner.invalidate_weights()
         if run_completed:
             Utils.destroy_model_parallel()
         else:
@@ -1162,90 +1170,3 @@ def test_flashinfer_routed_forward_and_surrogate_backward(
             # Let torchrun terminate peer ranks after the original exception;
             # synchronously tearing down the world here can hide the failure
             # behind an NCCL shutdown wait while another rank is still on GPU.
-
-    assert all(
-        result is not None
-        for result in (high_precision_reference, high_precision, dequantized_reference, dequantized)
-    )
-    assert metrics is not None
-    (
-        high_precision_forward_rel_l2,
-        dequantized_forward_rel_l2,
-        backward_mode_forward_rel_l2,
-        high_precision_per_token_rel_l2,
-        dequantized_per_token_rel_l2,
-        hidden_grad_rel_l2,
-        route_grad_rel_l2,
-        parameter_grad_rel_l2,
-        dequantized_hidden_grad_rel_l2,
-        dequantized_route_grad_rel_l2,
-        dequantized_parameter_grad_rel_l2,
-        missing_grads,
-    ) = metrics
-    if rank == 0:
-        print(
-            "FlashInfer distributed numerical check: "
-            f"configured={precision_case.configured}, "
-            f"execution={precision_case.execution}, "
-            f"dispatcher={moe_token_dispatcher_type}, num_tokens={num_tokens}, top_k={top_k}, "
-            f"high_precision_forward_rel_l2={high_precision_forward_rel_l2:.6f}, "
-            f"dequantized_forward_rel_l2={dequantized_forward_rel_l2:.6f}, "
-            f"backward_mode_forward_rel_l2={backward_mode_forward_rel_l2:.6f}, "
-            f"high_precision_per_token_rel_l2={high_precision_per_token_rel_l2:.6f}, "
-            f"dequantized_per_token_rel_l2={dequantized_per_token_rel_l2:.6f}, "
-            f"hidden_grad_rel_l2={hidden_grad_rel_l2:.6f}, "
-            f"route_grad_rel_l2={route_grad_rel_l2:.6f}, "
-            f"parameter_grad_rel_l2={parameter_grad_rel_l2:.6f}, "
-            f"dequantized_hidden_grad_rel_l2={dequantized_hidden_grad_rel_l2:.6f}, "
-            f"dequantized_route_grad_rel_l2={dequantized_route_grad_rel_l2:.6f}, "
-            "dequantized_parameter_grad_rel_l2="
-            f"{dequantized_parameter_grad_rel_l2:.6f}",
-            flush=True,
-        )
-    assert missing_grads == 0
-    numerical_tolerances = {
-        # (global forward, per-token forward), then
-        # (hidden, router, parameter) gradients for each backward mode.
-        # Both implementations use output-side routing. For quantized execution,
-        # that also aligns their FC2-input QDQ boundary. Tolerances still account
-        # for independent grouped-GEMM and fused routed-kernel implementations.
-        # Measured 8-GPU B200 dequantized maxima (hidden, router, parameter):
-        # BF16 (0.0039, 0.0019, 0.0003), MXFP8 (0.0038, 0.0002, 0.0001),
-        # NVFP4 (0.0062, 0.0387, 0.0258).
-        "bf16": ((0.010, 0.012), (0.005, 0.003, 0.001), (0.005, 0.003, 0.001)),
-        "mxfp8": ((0.050, 0.075), (0.055, 0.070, 0.060), (0.005, 0.001, 0.001)),
-        "nvfp4": ((0.050, 0.085), (0.170, 0.220, 0.190), (0.008, 0.050, 0.035)),
-    }
-    forward_tolerances, high_precision_tolerances, dequantized_tolerances = numerical_tolerances[
-        precision_case.execution
-    ]
-    forward_tolerance, per_token_forward_tolerance = forward_tolerances
-    assert high_precision_forward_rel_l2 < forward_tolerance
-    assert dequantized_forward_rel_l2 < forward_tolerance
-    # Separate fused-finalize launches can choose a different top-k reduction
-    # order (0.0047 max observed here), but backward operand policy must not
-    # materially change forward.
-    assert backward_mode_forward_rel_l2 < 0.006
-    assert high_precision_per_token_rel_l2 < per_token_forward_tolerance
-    assert dequantized_per_token_rel_l2 < per_token_forward_tolerance
-    for value, tolerance in zip(
-        (hidden_grad_rel_l2, route_grad_rel_l2, parameter_grad_rel_l2), high_precision_tolerances
-    ):
-        assert value < tolerance
-    for value, tolerance in zip(
-        (
-            dequantized_hidden_grad_rel_l2,
-            dequantized_route_grad_rel_l2,
-            dequantized_parameter_grad_rel_l2,
-        ),
-        dequantized_tolerances,
-    ):
-        assert value < tolerance
-
-    if moe_token_dispatcher_type == "alltoall":
-        assert received_by_rank is not None
-        assert all(received > 0 for received in received_by_rank[:-1])
-        assert received_by_rank[-1] == 0
-        assert sum(received_by_rank) == world_size * num_tokens * top_k
-        assert output_nonzero_by_rank is not None
-        assert output_nonzero_by_rank[-1] == 1

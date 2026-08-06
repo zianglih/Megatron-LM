@@ -332,9 +332,10 @@ class MoELayer(BaseMoELayer):
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
         if os.environ.get("MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT") == "1":
-            if self.config.moe_combine_in_fp32:
+            if self.config.moe_combine_in_fp32 or self.config.moe_apply_probs_on_input:
                 raise ValueError(
-                    "MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT is incompatible with moe_combine_in_fp32"
+                    "MEGATRON_MOE_APPLY_PROBS_ON_OUTPUT is incompatible with "
+                    "moe_combine_in_fp32 or moe_apply_probs_on_input"
                 )
             expert_probs = torch.ones_like(permuted_probs, dtype=dispatched_input.dtype)
             expert_output, mlp_bias = self.experts(
